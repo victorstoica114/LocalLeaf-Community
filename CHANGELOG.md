@@ -2,6 +2,31 @@
 
 All notable changes to LocalLeaf will be documented in this file.
 
+## [0.1.3] - 2026-01-04
+
+### Added
+
+- Graceful handling of Overleaf cookie expiration
+  - Login status bar shows yellow warning with "(expired)" when session expires
+  - Toast notification with "Refresh Cookie" button when 403/401 errors detected
+  - "Refresh Cookie" option in status bar menu for quick re-authentication
+  - "Verify Credentials" command to manually check if session is still valid
+- New commands:
+  - `LocalLeaf: Verify Credentials` - Check if your session is still valid
+  - `LocalLeaf: Refresh Cookie` - Re-authenticate without full re-login (preserves server/email info)
+
+### Fixed
+
+- Fixed confusing "403" error messages when Overleaf cookie expires
+- Session expiration now clearly indicates the need to re-login instead of showing generic sync errors
+- Fixed folder delete not syncing to Overleaf (folders were not tracked in baseContent)
+- Fixed folder rename creating a new folder instead of renaming (delete was ignored, then create made new folder)
+- Folder paths are now properly handled with trailing slashes in delete operations
+- Fixed folder structure not being created when pushing to Overleaf ([Issue #1](https://github.com/Teddy-van-Jerry/LocalLeaf/issues/1))
+  - Files in subfolders (e.g., `tex/introduction.tex`) were incorrectly placed in root instead of their folder
+  - Parent folders are now automatically created before uploading files
+  - Folder entries are immediately tracked in the file tree after creation (no longer relies solely on socket events)
+
 ## [0.1.2] - 2025-12-21
 
 ### Fixed

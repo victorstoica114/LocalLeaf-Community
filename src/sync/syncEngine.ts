@@ -30,6 +30,7 @@ export interface SyncStatusEvent {
     status: SyncStatus;
     message?: string;
     file?: string;
+    authError?: boolean;
 }
 
 /**
@@ -88,6 +89,18 @@ function debugLog(...args: unknown[]): void {
 }
 
 /**
+ * Check if an error indicates session expiration
+ */
+function isAuthError(error: unknown): boolean {
+    if (!error) return false;
+    const errorStr = String(error).toLowerCase();
+    return errorStr.includes('session expired') ||
+           errorStr.includes('403') ||
+           errorStr.includes('401') ||
+           errorStr.includes('unauthorized');
+}
+
+/**
  * File entry in the project tree
  */
 interface FileTreeEntry {
@@ -143,9 +156,9 @@ export class SyncEngine {
     /**
      * Set status and emit event
      */
-    private setStatus(status: SyncStatus, message?: string, file?: string): void {
+    private setStatus(status: SyncStatus, message?: string, file?: string, authError: boolean = false): void {
         this._status = status;
-        this._onStatusChange.fire({ status, message, file });
+        this._onStatusChange.fire({ status, message, file, authError });
     }
 
     /**
@@ -176,7 +189,13 @@ export class SyncEngine {
             // Register socket event handlers
             this.socket.registerHandlers({
                 onConnected: () => this.setStatus('idle', 'Connected (real-time)'),
-                onDisconnected: () => this.setStatus('disconnected', 'Disconnected'),
+                onDisconnected: (isAuthError?: boolean) => {
+                    if (isAuthError) {
+                        this.setStatus('error', 'Session expired', undefined, true);
+                    } else {
+                        this.setStatus('disconnected', 'Disconnected');
+                    }
+                },
                 onFileCreated: (parentId, type, entity) => this.handleRemoteFileCreated(parentId, type, entity),
                 onFileRenamed: (entityId, newName) => this.handleRemoteFileRenamed(entityId, newName),
                 onFileRemoved: (entityId) => this.handleRemoteFileRemoved(entityId),
@@ -240,7 +259,8 @@ export class SyncEngine {
 
                 this.setStatus('idle', 'Connected (HTTP mode)');
             } catch (httpError) {
-                this.setStatus('error', `Failed to connect: ${httpError}`);
+                const authErr = isAuthError(httpError);
+                this.setStatus('error', authErr ? 'Session expired' : `Failed to connect: ${httpError}`, undefined, authErr);
                 throw httpError;
             }
         }
@@ -518,7 +538,8 @@ export class SyncEngine {
                 return;
             }
             console.error(`[LocalLeaf] Failed to sync ${relativePath}:`, error);
-            this.setStatus('error', `Failed to sync: ${error}`);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to sync: ${error}`, undefined, authErr);
         } finally {
             this.releaseLock(relativePath);
         }
@@ -608,15 +629,31 @@ export class SyncEngine {
 
             this.setStatus('pushing', `Creating ${relativePath}`, relativePath);
 
-            // Determine parent folder
-            const parentPath = relativePath.substring(0, relativePath.lastIndexOf('/') + 1) || '/';
-            const parentEntry = this.fileTreeByPath.get(parentPath);
-            const parentId = parentEntry?.id || this.project?.rootFolder[0]._id;
-
+            // Ensure parent folders exist (creates them if needed)
+            const parentId = await this.ensureParentFoldersExist(relativePath);
             const name = relativePath.split('/').pop()!;
 
             if (stat.type === vscode.FileType.Directory) {
-                await this.api.addFolder(projectSettings.projectId, parentId!, name);
+                const folderPath = relativePath + '/';
+                const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
+
+                // Add folder to file tree immediately (don't wait for socket event)
+                if (result.type === 'success' && result.folder) {
+                    const folderEntry: FileTreeEntry = {
+                        id: result.folder._id,
+                        type: 'folder',
+                        name: name,
+                        path: folderPath,
+                        parentId: parentId,
+                    };
+                    this.fileTree.set(result.folder._id, folderEntry);
+                    this.fileTreeByPath.set(folderPath, folderEntry);
+                    debugLog('Added folder to tree:', folderPath, result.folder._id);
+                }
+
+                // Track folder in baseContent so delete/rename operations work
+                this.baseContent.set(folderPath, new Uint8Array(0));
+                this.log(`Created folder on Overleaf: ${folderPath}`);
             } else {
                 // Read file content - may throw if file was deleted
                 let content: Uint8Array;
@@ -633,9 +670,9 @@ export class SyncEngine {
                 const isTextFile = this.isTextFile(name);
 
                 if (isTextFile) {
-                    await this.api.addDoc(projectSettings.projectId, parentId!, name);
+                    await this.api.addDoc(projectSettings.projectId, parentId, name);
                 } else {
-                    await this.api.uploadFile(projectSettings.projectId, parentId!, name, content);
+                    await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
                 }
 
                 this.baseContent.set(relativePath, content);
@@ -651,7 +688,8 @@ export class SyncEngine {
                 return;
             }
             console.error(`[LocalLeaf] Failed to create ${relativePath}:`, error);
-            this.setStatus('error', `Failed to create: ${error}`);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to create: ${error}`, undefined, authErr);
         } finally {
             this.releaseLock(relativePath);
         }
@@ -666,33 +704,44 @@ export class SyncEngine {
         if (!this.acquireLock(relativePath)) return;
 
         try {
-            const entry = this.fileTreeByPath.get(relativePath);
+            // Try both file path and folder path (with trailing slash)
+            let entry = this.fileTreeByPath.get(relativePath);
+            let pathToUse = relativePath;
+            if (!entry) {
+                // Maybe it's a folder - try with trailing slash
+                const folderPath = relativePath + '/';
+                entry = this.fileTreeByPath.get(folderPath);
+                if (entry) {
+                    pathToUse = folderPath;
+                }
+            }
             if (!entry) return;
 
             // Only delete from Overleaf if the file was previously synced locally.
             // If baseContent doesn't have this path, the file was never downloaded/synced,
             // so we should NOT propagate this deletion to Overleaf (prevents deleting
             // new upstream files that haven't been pulled yet).
-            if (!this.baseContent.has(relativePath)) {
-                debugLog(`Ignoring delete for never-synced file: ${relativePath}`);
+            if (!this.baseContent.has(pathToUse)) {
+                debugLog(`Ignoring delete for never-synced file: ${pathToUse}`);
                 return;
             }
 
             const projectSettings = this.settings.getSettings()!;
-            this.setStatus('pushing', `Deleting ${relativePath}`, relativePath);
+            this.setStatus('pushing', `Deleting ${pathToUse}`, pathToUse);
 
             await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
 
             this.fileTree.delete(entry.id);
-            this.fileTreeByPath.delete(relativePath);
-            this.baseContent.delete(relativePath);
-            this.fileCache.delete(relativePath);
+            this.fileTreeByPath.delete(pathToUse);
+            this.baseContent.delete(pathToUse);
+            this.fileCache.delete(pathToUse);
 
-            this.log(`Deleted from Overleaf: ${relativePath}`);
+            this.log(`Deleted from Overleaf: ${pathToUse}`);
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to delete ${relativePath}:`, error);
-            this.setStatus('error', `Failed to delete: ${error}`);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Failed to delete: ${error}`, undefined, authErr);
         } finally {
             this.releaseLock(relativePath);
         }
@@ -726,6 +775,14 @@ export class SyncEngine {
             this.fileTreeByPath.set(path, entry);
 
             const localUri = this.settings.getFilePath(path);
+
+            // Check if this is an echo of our own creation (file already in baseContent)
+            const alreadySynced = this.baseContent.has(path);
+            if (alreadySynced) {
+                debugLog(`Ignoring remote create echo for already-synced: ${path}`);
+                this.setStatus('idle');
+                return;
+            }
 
             if (type === 'folder') {
                 await vscode.workspace.fs.createDirectory(localUri);
@@ -1256,6 +1313,78 @@ export class SyncEngine {
     }
 
     /**
+     * Ensure all parent folders exist for a given file path.
+     * Creates missing folders recursively and adds them to the file tree.
+     * Returns the parent folder ID for the file.
+     */
+    private async ensureParentFoldersExist(relativePath: string): Promise<string> {
+        const projectSettings = this.settings.getSettings()!;
+        const rootFolderId = this.project?.rootFolder[0]._id;
+
+        if (!rootFolderId) {
+            throw new Error('Project root folder not found');
+        }
+
+        // Get parent path (e.g., "/tex/chapters/" from "/tex/chapters/intro.tex")
+        const parentPath = relativePath.substring(0, relativePath.lastIndexOf('/') + 1) || '/';
+
+        // If parent exists, return its ID
+        const existingParent = this.fileTreeByPath.get(parentPath);
+        if (existingParent) {
+            return existingParent.id;
+        }
+
+        // If parent is root, return root ID
+        if (parentPath === '/') {
+            return rootFolderId;
+        }
+
+        // Parse path into folder segments (e.g., ["tex", "chapters"])
+        const segments = parentPath.split('/').filter(s => s.length > 0);
+
+        let currentPath = '/';
+        let currentParentId = rootFolderId;
+
+        for (const segment of segments) {
+            const folderPath = currentPath + segment + '/';
+            const existingFolder = this.fileTreeByPath.get(folderPath);
+
+            if (existingFolder) {
+                // Folder exists, move to next level
+                currentParentId = existingFolder.id;
+                currentPath = folderPath;
+            } else {
+                // Folder doesn't exist, create it
+                debugLog('Creating missing parent folder:', folderPath);
+                const result = await this.api.addFolder(projectSettings.projectId, currentParentId, segment);
+
+                if (result.type !== 'success' || !result.folder) {
+                    throw new Error(`Failed to create folder ${folderPath}: ${result.message}`);
+                }
+
+                // Add to file tree
+                const folderEntry: FileTreeEntry = {
+                    id: result.folder._id,
+                    type: 'folder',
+                    name: segment,
+                    path: folderPath,
+                    parentId: currentParentId,
+                };
+                this.fileTree.set(result.folder._id, folderEntry);
+                this.fileTreeByPath.set(folderPath, folderEntry);
+                this.baseContent.set(folderPath, new Uint8Array(0));
+
+                this.log(`Created folder on Overleaf: ${folderPath}`);
+
+                currentParentId = result.folder._id;
+                currentPath = folderPath;
+            }
+        }
+
+        return currentParentId;
+    }
+
+    /**
      * Upload a local file to Overleaf (create new entity).
      */
     private async uploadLocalFile(relativePath: string): Promise<void> {
@@ -1263,14 +1392,8 @@ export class SyncEngine {
         const localUri = this.settings.getFilePath(relativePath);
         const content = await vscode.workspace.fs.readFile(localUri);
 
-        // Determine parent folder
-        const parentPath = relativePath.substring(0, relativePath.lastIndexOf('/') + 1) || '/';
-        const parentEntry = this.fileTreeByPath.get(parentPath);
-        const parentId = parentEntry?.id || this.project?.rootFolder[0]._id;
-
-        if (!parentId) {
-            throw new Error(`Cannot find parent folder for ${relativePath}`);
-        }
+        // Ensure all parent folders exist (creates them if needed)
+        const parentId = await this.ensureParentFoldersExist(relativePath);
 
         const name = relativePath.split('/').pop()!;
         const isTextFile = this.isTextFile(name);
@@ -1513,7 +1636,8 @@ export class SyncEngine {
             debugLog('pullAll:', message);
             this.setStatus('idle', message);
         } catch (error) {
-            this.setStatus('error', `Pull failed: ${error}`);
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Pull failed: ${error}`, undefined, authErr);
             throw error;
         }
     }

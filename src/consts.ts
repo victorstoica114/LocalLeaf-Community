@@ -66,4 +66,6 @@ export const COMMANDS = {
     SET_MAIN_DOCUMENT: 'localleaf.setMainDocument',
     CONFIGURE: 'localleaf.configure',
     JUMP_TO_COLLABORATOR: 'localleaf.jumpToCollaborator',
+    VERIFY_CREDENTIALS: 'localleaf.verifyCredentials',
+    REFRESH_COOKIE: 'localleaf.refreshCookie',
 } as const;

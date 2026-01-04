@@ -83,7 +83,7 @@ export interface SocketEventHandlers {
     onFileChanged?: (update: DocumentUpdate) => void;
     // Connection events
     onConnected?: (publicId: string) => void;
-    onDisconnected?: () => void;
+    onDisconnected?: (isAuthError?: boolean) => void;
     // Collaboration events
     onUserCursorUpdated?: (user: UserCursorUpdate) => void;
     onUserDisconnected?: (clientId: string) => void;
@@ -180,6 +180,9 @@ export class SocketIOAPI {
         this.socket.on('forceDisconnect', (message: string, delay: number = 10) => {
             log(`Force disconnected: ${message}`);
             this._connected = false;
+            // Check if force disconnect is auth-related
+            const isAuthError = this.isAuthRelatedMessage(message);
+            this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
         });
 
         this.socket.on('error', (err: any) => {
@@ -189,12 +192,15 @@ export class SocketIOAPI {
         this.socket.on('disconnect', () => {
             log('Disconnected from Overleaf');
             this._connected = false;
-            this.handlers.forEach(h => h.onDisconnected?.());
+            this.handlers.forEach(h => h.onDisconnected?.(false));
         });
 
         this.socket.on('connectionRejected', (err: any) => {
             log(`Connection rejected: ${err?.message}`);
             this._connected = false;
+            // Check if rejection is auth-related
+            const isAuthError = this.isAuthRelatedMessage(err?.message);
+            this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
         });
 
         this.socket.on('connectionAccepted', (_: any, publicId: string) => {
@@ -423,5 +429,20 @@ export class SocketIOAPI {
             log('Reconnecting...');
             this.init();
         }
+    }
+
+    /**
+     * Check if a message indicates an auth-related error
+     */
+    private isAuthRelatedMessage(message: string | undefined): boolean {
+        if (!message) return false;
+        const msg = message.toLowerCase();
+        return msg.includes('unauthorized') ||
+               msg.includes('not logged in') ||
+               msg.includes('session expired') ||
+               msg.includes('invalid session') ||
+               msg.includes('403') ||
+               msg.includes('401') ||
+               msg.includes('authentication');
     }
 }

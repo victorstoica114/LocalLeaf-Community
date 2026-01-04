@@ -14,6 +14,11 @@ import { CursorTracker, TrackedUser } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
 
 /**
+ * Auth state type
+ */
+type AuthState = 'valid' | 'expired' | 'none';
+
+/**
  * Extension state
  */
 let credentialManager: CredentialManager;
@@ -24,6 +29,7 @@ let loginStatusItem: vscode.StatusBarItem;
 let collaboratorStatusItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
+let authState: AuthState = 'none';
 
 /**
  * Extension activation
@@ -113,6 +119,8 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.SET_MAIN_DOCUMENT, cmdSetMainDocument),
         vscode.commands.registerCommand(COMMANDS.CONFIGURE, cmdConfigure),
         vscode.commands.registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
+        vscode.commands.registerCommand(COMMANDS.VERIFY_CREDENTIALS, cmdVerifyCredentials),
+        vscode.commands.registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
     );
 }
 
@@ -139,8 +147,13 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     syncEngine = new SyncEngine(api, settings, log);
 
     // Listen to status changes
-    syncEngine.onStatusChange(event => {
+    syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
+        // Handle auth errors
+        if (event.authError) {
+            await setAuthState('expired');
+            showSessionExpiredNotification();
+        }
     });
 
     // Connect
@@ -218,6 +231,14 @@ function updateStatusBar(status: SyncStatus, message?: string) {
 }
 
 /**
+ * Update auth state and refresh UI
+ */
+async function setAuthState(state: AuthState): Promise<void> {
+    authState = state;
+    await updateLoginStatus();
+}
+
+/**
  * Update login status bar
  */
 async function updateLoginStatus() {
@@ -233,7 +254,29 @@ async function updateLoginStatus() {
     const serverUrl = credentialManager.getDefaultServer();
     const credential = await credentialManager.getCredential(serverUrl);
 
-    if (credential) {
+    if (credential && authState === 'valid') {
+        // Logged in with valid session
+        loginStatusItem.text = `$(account) ${credential.userEmail}`;
+        loginStatusItem.tooltip = new vscode.MarkdownString(
+            `**Logged in to Overleaf**\n\n` +
+            `Email: ${credential.userEmail}\n\n` +
+            `Server: ${credential.serverUrl}`
+        );
+        loginStatusItem.backgroundColor = undefined;
+        loginStatusItem.command = COMMANDS.LOGOUT;
+    } else if (credential && authState === 'expired') {
+        // Session expired - show warning state
+        loginStatusItem.text = `$(warning) ${credential.userEmail} (expired)`;
+        loginStatusItem.tooltip = new vscode.MarkdownString(
+            `**Session Expired**\n\n` +
+            `Email: ${credential.userEmail}\n\n` +
+            `Server: ${credential.serverUrl}\n\n` +
+            `Click to refresh your cookie`
+        );
+        loginStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        loginStatusItem.command = COMMANDS.REFRESH_COOKIE;
+    } else if (credential) {
+        // Credential exists but auth state not confirmed yet (assume valid until proven otherwise)
         loginStatusItem.text = `$(account) ${credential.userEmail}`;
         loginStatusItem.tooltip = new vscode.MarkdownString(
             `**Logged in to Overleaf**\n\n` +
@@ -243,6 +286,8 @@ async function updateLoginStatus() {
         loginStatusItem.backgroundColor = undefined;
         loginStatusItem.command = COMMANDS.LOGOUT;
     } else {
+        // Not logged in
+        authState = 'none';
         loginStatusItem.text = '$(account) Not logged in';
         loginStatusItem.tooltip = 'Click to login to Overleaf';
         loginStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
@@ -250,6 +295,21 @@ async function updateLoginStatus() {
     }
 
     loginStatusItem.show();
+}
+
+/**
+ * Show session expired notification with action buttons
+ */
+async function showSessionExpiredNotification(): Promise<void> {
+    const action = await vscode.window.showWarningMessage(
+        'LocalLeaf: Your Overleaf session has expired.',
+        'Refresh Cookie',
+        'Dismiss'
+    );
+
+    if (action === 'Refresh Cookie') {
+        await cmdRefreshCookie();
+    }
 }
 
 /**
@@ -395,7 +455,7 @@ async function cmdLogin() {
                 identity: result.identity,
             };
             await credentialManager.storeCredential(credential);
-            await updateLoginStatus();
+            await setAuthState('valid');
             vscode.window.showInformationMessage(`LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
         } else {
             vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${result.message}`);
@@ -427,7 +487,7 @@ async function cmdLogin() {
                 identity: result.identity,
             };
             await credentialManager.storeCredential(credential);
-            await updateLoginStatus();
+            await setAuthState('valid');
             vscode.window.showInformationMessage(`LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
         } else {
             vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${result.message}`);
@@ -702,6 +762,22 @@ async function cmdShowSyncStatus() {
         });
     }
 
+    // Show refresh cookie option when auth is expired
+    if (settings && authState === 'expired') {
+        items.push({
+            label: '$(key) Refresh Cookie',
+            description: 'Session expired - click to enter new cookie',
+        });
+    }
+
+    // Show verify credentials option when connected
+    if (settings && authState !== 'expired') {
+        items.push({
+            label: '$(shield) Verify Credentials',
+            description: 'Check if your session is still valid',
+        });
+    }
+
     if (cursorTracker && cursorTracker.getUserCount() > 0) {
         items.push({
             label: '$(person) Jump to collaborator...',
@@ -724,6 +800,10 @@ async function cmdShowSyncStatus() {
         await cmdPullFromOverleaf();
     } else if (selected?.label.includes('Reconnect')) {
         await cmdReconnect();
+    } else if (selected?.label.includes('Refresh Cookie')) {
+        await cmdRefreshCookie();
+    } else if (selected?.label.includes('Verify Credentials')) {
+        await cmdVerifyCredentials();
     } else if (selected?.label.includes('Jump to collaborator')) {
         await cursorTracker?.jumpToUser();
     } else if (selected?.label.includes('Unlink folder')) {
@@ -769,8 +849,13 @@ async function cmdReconnect() {
 
     syncEngine = new SyncEngine(api, settingsManager);
 
-    syncEngine.onStatusChange(event => {
+    syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
+        // Handle auth errors
+        if (event.authError) {
+            await setAuthState('expired');
+            showSessionExpiredNotification();
+        }
     });
 
     try {
@@ -842,6 +927,118 @@ async function cmdJumpToCollaborator() {
     }
 
     await cursorTracker.jumpToUser();
+}
+
+/**
+ * Verify credentials are still valid
+ */
+async function cmdVerifyCredentials() {
+    const settingsManager = SettingsManager.getCurrentInstance();
+    if (!settingsManager || !(await settingsManager.isLinked())) {
+        vscode.window.showInformationMessage('LocalLeaf: No linked project');
+        return;
+    }
+
+    const projectSettings = settingsManager.getSettings();
+    if (!projectSettings) return;
+
+    const credential = await credentialManager.getCredential(projectSettings.serverUrl);
+    if (!credential) {
+        await setAuthState('none');
+        vscode.window.showWarningMessage('LocalLeaf: Not logged in');
+        return;
+    }
+
+    const api = new BaseAPI(projectSettings.serverUrl);
+    api.setIdentity(credential.identity);
+
+    const result = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'LocalLeaf: Verifying credentials...',
+    }, async () => {
+        return api.verifyCredentials();
+    });
+
+    if (result.type === 'success') {
+        await setAuthState('valid');
+        vscode.window.showInformationMessage('LocalLeaf: Credentials are valid');
+    } else {
+        await setAuthState('expired');
+        showSessionExpiredNotification();
+    }
+}
+
+/**
+ * Refresh cookie (re-login without clearing stored info)
+ */
+async function cmdRefreshCookie() {
+    const settingsManager = SettingsManager.getCurrentInstance();
+    if (!settingsManager || !(await settingsManager.isLinked())) {
+        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        return;
+    }
+
+    const projectSettings = settingsManager.getSettings();
+    if (!projectSettings) return;
+
+    const serverUrl = projectSettings.serverUrl;
+
+    // Get existing credential to show user info
+    const existingCredential = await credentialManager.getCredential(serverUrl);
+    const userInfo = existingCredential
+        ? `Refreshing session for ${existingCredential.userEmail}`
+        : 'Enter your Overleaf cookie';
+
+    // Show help option
+    const helpChoice = await vscode.window.showInformationMessage(
+        userInfo,
+        'How to get cookies?',
+        'Continue'
+    );
+
+    if (!helpChoice) return;
+
+    if (helpChoice === 'How to get cookies?') {
+        await vscode.env.openExternal(vscode.Uri.parse(
+            'https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies'
+        ));
+    }
+
+    const cookies = await vscode.window.showInputBox({
+        prompt: 'Paste your fresh Overleaf cookie',
+        placeHolder: 'overleaf_session2=...',
+        password: true,
+    });
+
+    if (!cookies) return;
+
+    const api = new BaseAPI(serverUrl);
+    const result = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'LocalLeaf: Validating cookie...',
+    }, async () => {
+        return api.cookiesLogin(cookies);
+    });
+
+    if (result.type === 'success' && result.userInfo && result.identity) {
+        const credential: ServerCredential = {
+            serverUrl,
+            userId: result.userInfo.userId,
+            userEmail: result.userInfo.userEmail,
+            identity: result.identity,
+        };
+        await credentialManager.storeCredential(credential);
+        await setAuthState('valid');
+
+        vscode.window.showInformationMessage(
+            `LocalLeaf: Session refreshed for ${result.userInfo.userEmail}`
+        );
+
+        // Attempt to reconnect sync engine
+        await cmdReconnect();
+    } else {
+        vscode.window.showErrorMessage(`LocalLeaf: Cookie validation failed - ${result.message}`);
+    }
 }
 
 /**

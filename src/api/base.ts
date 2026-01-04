@@ -41,9 +41,12 @@ export interface ProjectEntity {
     members: Array<{ _id: string; email: string; first_name: string; last_name?: string; privileges: string }>;
 }
 
+export type AuthErrorType = 'session_expired' | 'invalid_credentials';
+
 export interface ResponseSchema {
     type: 'success' | 'error';
     message?: string;
+    authError?: AuthErrorType;
     userInfo?: { userId: string; userEmail: string };
     identity?: Identity;
     projects?: ProjectInfo[];
@@ -273,6 +276,9 @@ export class BaseAPI {
         if (res.status === 200 || res.status === 204) {
             return { type: 'success' };
         }
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
 
@@ -349,6 +355,9 @@ export class BaseAPI {
             }));
             return { type: 'success', projects };
         }
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
 
@@ -404,6 +413,9 @@ export class BaseAPI {
         if (res.status === 200) {
             return { type: 'success' };
         }
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
 
@@ -436,13 +448,17 @@ export class BaseAPI {
         if (res.status === 200) {
             return { type: 'success' };
         }
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
 
     /**
      * Create a new folder
+     * Returns the created folder entity with _id
      */
-    async addFolder(projectId: string, parentFolderId: string, folderName: string): Promise<ResponseSchema> {
+    async addFolder(projectId: string, parentFolderId: string, folderName: string): Promise<ResponseSchema & { folder?: FileEntity }> {
         if (!this.identity) {
             return { type: 'error', message: 'Not authenticated' };
         }
@@ -466,7 +482,17 @@ export class BaseAPI {
         });
 
         if (res.status === 200) {
-            return { type: 'success' };
+            // Parse response to get folder entity with _id
+            const data = await res.json() as any;
+            const folder: FileEntity = {
+                _id: data._id || data.id,
+                _type: 'folder',
+                name: data.name || folderName,
+            };
+            return { type: 'success', folder };
+        }
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
         }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
@@ -511,6 +537,9 @@ export class BaseAPI {
         if (res.status === 200 || res.status === 204) {
             return { type: 'success' };
         }
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
 
@@ -546,6 +575,9 @@ export class BaseAPI {
 
         if (res.status === 200 || res.status === 204) {
             return { type: 'success' };
+        }
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
         }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
@@ -613,6 +645,9 @@ export class BaseAPI {
             return { type: 'success', projectData };
         }
 
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: Failed to get project details` };
     }
 
@@ -640,6 +675,9 @@ export class BaseAPI {
             return { type: 'success', entities: data.entities };
         }
 
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
     }
 
@@ -667,6 +705,31 @@ export class BaseAPI {
             return { type: 'success', lines: data.lines };
         }
 
+        if (res.status === 403 || res.status === 401) {
+            return { type: 'error', message: 'Session expired', authError: 'session_expired' };
+        }
         return { type: 'error', message: `${res.status}: ${await res.text()}` };
+    }
+
+    /**
+     * Verify that current credentials are still valid
+     */
+    async verifyCredentials(): Promise<ResponseSchema> {
+        if (!this.identity) {
+            return { type: 'error', message: 'Not authenticated', authError: 'invalid_credentials' };
+        }
+
+        const result = await this.getUserId(this.identity.cookies);
+        if (result) {
+            return {
+                type: 'success',
+                userInfo: { userId: result.userId, userEmail: result.userEmail },
+            };
+        }
+        return {
+            type: 'error',
+            message: 'Session expired or cookie invalid',
+            authError: 'session_expired',
+        };
     }
 }

@@ -18,6 +18,10 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 - **Auto-sync** on file changes
 - **Ignore patterns** support (like `.gitignore`)
 
+> **Status bar items** showing Overleaf account, sync status, real-time collaboration status.
+> Also shown on the right in this example includes VS Code's error/warning indicators and LaTeX Workshop's build status.
+> ![status bar screenshot](./images/status-bar.png)
+
 ## Getting Started
 
 1. Install the extension from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=teddy-van-jerry.localleaf)
@@ -35,6 +39,8 @@ A VS Code extension for a workaround solution to collaborate on LaTeX documents 
 |---------|-------------|
 | `LocalLeaf: Login` | Authenticate with Overleaf |
 | `LocalLeaf: Logout` | Clear stored credentials |
+| `LocalLeaf: Verify Credentials` | Check if your session is still valid |
+| `LocalLeaf: Refresh Cookie` | Re-authenticate without full re-login |
 | `LocalLeaf: Link Folder to Overleaf Project` | Connect a local folder to an Overleaf project |
 | `LocalLeaf: Unlink Folder` | Disconnect folder from Overleaf project |
 | `LocalLeaf: Sync Now` | Manually trigger two-way sync |
