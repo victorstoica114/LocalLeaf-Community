@@ -56,6 +56,7 @@ export const STATUS_BAR_PRIORITY = 100;
 export const COMMANDS = {
     LOGIN: 'localleaf.login',
     LOGOUT: 'localleaf.logout',
+    SHOW_ACCOUNT_PANEL: 'localleaf.showAccountPanel',
     LINK_FOLDER: 'localleaf.linkFolder',
     UNLINK_FOLDER: 'localleaf.unlinkFolder',
     SYNC_NOW: 'localleaf.syncNow',

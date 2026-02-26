@@ -1,142 +1,20 @@
 /**
  * LocalLeaf Sidebar Providers
  *
- * Three TreeDataProviders for the sidebar:
- * - ProjectsProvider: project list when not linked (with sort/filter)
+ * TreeDataProviders for the sidebar:
  * - ChangesProvider: grouped change tree when linked (manual mode: conflicts/incoming/outgoing/activity, realtime: activity)
  * - DetailsProvider: server/account/compiler info when linked (collapsed)
+ * - ToolsProvider: utility actions
+ *
+ * ProjectsProvider has been moved to projectsWebviewProvider.ts (WebviewViewProvider).
  */
 
 import * as vscode from 'vscode';
-import { BaseAPI, ProjectInfo } from '../api/base';
-import { CredentialManager, ServerCredential } from '../utils/credentialManager';
+import { CredentialManager } from '../utils/credentialManager';
 import { SettingsManager } from '../utils/settingsManager';
 import { COMMANDS } from '../consts';
 import { SyncStatus } from '../sync/syncEngine';
-import { ChangeTracker, PendingChange, SyncMode } from '../sync/changeTracker';
-
-// ── Projects Provider (not-linked state, with sort/filter) ──────────
-
-export type ProjectSortField = 'name' | 'lastUpdated' | 'accessLevel';
-export type SortOrder = 'asc' | 'desc';
-
-export class ProjectsProvider implements vscode.TreeDataProvider<SidebarItem> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<void>();
-    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
-
-    private sortField: ProjectSortField = 'lastUpdated';
-    private sortOrder: SortOrder = 'desc';
-    private filterText: string = '';
-
-    constructor(private credentialManager: CredentialManager) {}
-
-    refresh(): void {
-        this._onDidChangeTreeData.fire();
-    }
-
-    setFilter(text: string): void {
-        this.filterText = text;
-        this.refresh();
-    }
-
-    getFilter(): string {
-        return this.filterText;
-    }
-
-    setSortField(field: ProjectSortField): void {
-        if (this.sortField === field) {
-            // Toggle order if same field clicked again
-            this.sortOrder = this.sortOrder === 'asc' ? 'desc' : 'asc';
-        } else {
-            this.sortField = field;
-            this.sortOrder = field === 'name' ? 'asc' : 'desc';
-        }
-        this.refresh();
-    }
-
-    getSortField(): ProjectSortField {
-        return this.sortField;
-    }
-
-    getSortOrder(): SortOrder {
-        return this.sortOrder;
-    }
-
-    toggleSortOrder(): void {
-        this.sortOrder = this.sortOrder === 'asc' ? 'desc' : 'asc';
-        this.refresh();
-    }
-
-    getTreeItem(element: SidebarItem): vscode.TreeItem {
-        return element;
-    }
-
-    async getChildren(element?: SidebarItem): Promise<SidebarItem[]> {
-        if (element) { return []; }
-
-        const serverUrl = this.credentialManager.getDefaultServer();
-        const credential = await this.credentialManager.getCredential(serverUrl);
-        if (!credential) { return []; } // viewsWelcome handles this
-
-        const api = new BaseAPI(credential.serverUrl);
-        api.setIdentity(credential.identity);
-
-        const result = await api.getProjects();
-        if (result.type !== 'success' || !result.projects) {
-            return [new SidebarItem('Failed to load projects', {
-                icon: 'warning',
-                description: result.message || 'Unknown error',
-            })];
-        }
-
-        let active = result.projects.filter(p => !p.archived && !p.trashed);
-
-        // Apply filter
-        if (this.filterText) {
-            const lower = this.filterText.toLowerCase();
-            active = active.filter(p => p.name.toLowerCase().includes(lower));
-        }
-
-        if (active.length === 0) {
-            const msg = this.filterText
-                ? `No projects matching "${this.filterText}"`
-                : 'No projects found';
-            return [new SidebarItem(msg, { icon: 'info' })];
-        }
-
-        // Apply sort
-        active.sort((a, b) => {
-            let cmp = 0;
-            switch (this.sortField) {
-                case 'name':
-                    cmp = a.name.localeCompare(b.name);
-                    break;
-                case 'lastUpdated': {
-                    const ta = a.lastUpdated ? new Date(a.lastUpdated).getTime() : 0;
-                    const tb = b.lastUpdated ? new Date(b.lastUpdated).getTime() : 0;
-                    cmp = ta - tb;
-                    break;
-                }
-                case 'accessLevel': {
-                    const order: Record<string, number> = { owner: 3, collaborator: 2, readOnly: 1 };
-                    cmp = (order[a.accessLevel] || 0) - (order[b.accessLevel] || 0);
-                    break;
-                }
-            }
-            return this.sortOrder === 'asc' ? cmp : -cmp;
-        });
-
-        return active.map(p => {
-            const date = p.lastUpdated ? new Date(p.lastUpdated).toLocaleDateString() : '';
-            return new SidebarItem(p.name, {
-                icon: accessIcon(p.accessLevel),
-                description: date,
-                tooltip: `${p.name}\nAccess: ${p.accessLevel}${date ? `\nUpdated: ${date}` : ''}`,
-                command: { command: COMMANDS.OPEN_PROJECT, title: 'Open Project', arguments: [p] },
-            });
-        });
-    }
-}
+import { ChangeTracker, SyncMode } from '../sync/changeTracker';
 
 // ── Changes Provider (linked state — grouped tree) ──────────────────
 
@@ -491,15 +369,6 @@ export function syncStatusDescription(status: SyncStatus, lastSynced?: string): 
         text += ` — ${formatTimeAgo(new Date(lastSynced).getTime())}`;
     }
     return text;
-}
-
-function accessIcon(level: ProjectInfo['accessLevel']): string {
-    switch (level) {
-        case 'owner': return 'person';
-        case 'collaborator': return 'organization';
-        case 'readOnly': return 'eye';
-        default: return 'file';
-    }
 }
 
 function changeTypeIcon(type: string): string {

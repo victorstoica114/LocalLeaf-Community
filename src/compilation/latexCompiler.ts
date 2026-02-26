@@ -162,15 +162,18 @@ export class LatexCompiler implements vscode.Disposable {
                     }
                     const pdfWasUpdated = pdfExists && pdfMtimeAfter > pdfMtimeBefore;
 
+                    // Only real errors count — warnings should not cause failure
+                    const hardErrors = errors.filter(e => e.severity !== 'warning');
+
                     // Success only if the PDF was actually (re)written.
                     // MiKTeX may exit non-zero due to warnings even when compilation
                     // succeeds, so we also accept non-zero exit codes when there are
                     // no real TeX errors AND the PDF was freshly generated.
-                    const actuallySucceeded = pdfWasUpdated && (code === 0 || errors.length === 0);
+                    const actuallySucceeded = pdfWasUpdated && (code === 0 || hardErrors.length === 0);
 
                     // If the compiler ran but didn't produce / update the PDF,
                     // it's a real failure — show stderr/stdout to the user
-                    if (!actuallySucceeded && errors.length === 0) {
+                    if (!actuallySucceeded && hardErrors.length === 0) {
                         const output = (stderr || stdout).trim();
                         if (output) {
                             const lastLines = output.split('\n').filter(l => l.trim()).slice(-5).join('\n');
@@ -217,9 +220,6 @@ export class LatexCompiler implements vscode.Disposable {
 
                     // Update VS Code diagnostics — always show all errors + warnings
                     this.updateDiagnostics(errors, workspaceFolder);
-
-                    // Only report hard errors (not warnings) as compilation errors
-                    const hardErrors = errors.filter(e => e.severity !== 'warning');
 
                     resolve({
                         success: actuallySucceeded,

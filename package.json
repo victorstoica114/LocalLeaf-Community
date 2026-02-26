@@ -45,6 +45,7 @@
         {
           "id": "localleaf.projectsView",
           "name": "Projects",
+          "type": "webview",
           "when": "!localleaf.isLinked"
         },
         {
@@ -68,11 +69,6 @@
     },
     "viewsWelcome": [
       {
-        "view": "localleaf.projectsView",
-        "contents": "Login to Overleaf to see your projects.\n[Login to Overleaf](command:localleaf.login)",
-        "when": "!localleaf.loggedIn"
-      },
-      {
         "view": "localleaf.changesView",
         "contents": "No file changes yet.\nChanges will appear here as files are synced.",
         "when": "localleaf.isLinked"
@@ -87,6 +83,10 @@
         "command": "localleaf.logout",
         "title": "LocalLeaf: Logout",
         "icon": "$(sign-out)"
+      },
+      {
+        "command": "localleaf.showAccountPanel",
+        "title": "LocalLeaf: Account"
       },
       {
         "command": "localleaf.linkFolder",
