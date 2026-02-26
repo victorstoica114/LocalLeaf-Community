@@ -70,4 +70,22 @@ export const COMMANDS = {
     REFRESH_COOKIE: 'localleaf.refreshCookie',
     OPEN_PROJECT: 'localleaf.openProject',
     REMOVE_COMMENTS: 'localleaf.removeComments',
+    // Sync mode
+    TOGGLE_SYNC_MODE: 'localleaf.toggleSyncMode',
+    // Project sorting & filtering
+    FILTER_PROJECTS: 'localleaf.filterProjects',
+    SORT_PROJECTS_BY_NAME: 'localleaf.sortProjectsByName',
+    SORT_PROJECTS_BY_DATE: 'localleaf.sortProjectsByDate',
+    SORT_PROJECTS_BY_ACCESS: 'localleaf.sortProjectsByAccess',
+    // Compilation & PDF preview
+    COMPILE_LATEX: 'localleaf.compileLaTeX',
+    SHOW_PDF_PREVIEW: 'localleaf.showPdfPreview',
+    SELECT_COMPILER: 'localleaf.selectCompiler',
+    TOGGLE_AUTO_COMPILE: 'localleaf.toggleAutoCompile',
+    CANCEL_COMPILATION: 'localleaf.cancelCompilation',
+    // Changes view context actions
+    RESOLVE_CONFLICT_REMOTE: 'localleaf.resolveConflictRemote',
+    RESOLVE_CONFLICT_LOCAL: 'localleaf.resolveConflictLocal',
+    VIEW_DIFF: 'localleaf.viewDiff',
+    DISCARD_CHANGE: 'localleaf.discardChange',
 } as const;

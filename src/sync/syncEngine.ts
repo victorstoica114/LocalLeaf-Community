@@ -8,6 +8,7 @@ import { BaseAPI, ProjectEntity, FileEntity, FolderEntity } from '../api/base';
 import { SocketIOAPI, DocumentUpdate } from '../api/socketio';
 import { SettingsManager, ProjectSettings } from '../utils/settingsManager';
 import { IgnoreParser } from './ignoreParser';
+import { ChangeTracker, PendingChange, SyncMode } from './changeTracker';
 import { DEBOUNCE_DELAY } from '../consts';
 
 /**
@@ -130,6 +131,11 @@ export class SyncEngine {
     private joinedDocs: Set<string> = new Set();
     private logFn?: (message: string) => void;
 
+    /** Change tracker for manual sync mode */
+    private _changeTracker: ChangeTracker = new ChangeTracker();
+    /** Current sync mode */
+    private _syncMode: SyncMode = 'manual';
+
     readonly onStatusChange = this._onStatusChange.event;
 
     constructor(
@@ -140,6 +146,12 @@ export class SyncEngine {
         const workspaceFolder = settings.getWorkspaceFolder();
         this.ignoreParser = new IgnoreParser(workspaceFolder, settings.getSettings());
         this.logFn = logFn;
+
+        // Initialize sync mode from settings
+        const projectSettings = settings.getSettings();
+        if (projectSettings?.syncMode) {
+            this._syncMode = projectSettings.syncMode;
+        }
     }
 
     private log(message: string): void {
@@ -159,6 +171,61 @@ export class SyncEngine {
     private setStatus(status: SyncStatus, message?: string, file?: string, authError: boolean = false): void {
         this._status = status;
         this._onStatusChange.fire({ status, message, file, authError });
+    }
+
+    /**
+     * Get the change tracker instance
+     */
+    get changeTracker(): ChangeTracker {
+        return this._changeTracker;
+    }
+
+    /**
+     * Get current sync mode
+     */
+    get syncMode(): SyncMode {
+        return this._syncMode;
+    }
+
+    /**
+     * Set sync mode with transition logic
+     */
+    async setSyncMode(mode: SyncMode): Promise<void> {
+        if (this._syncMode === mode) return;
+
+        const oldMode = this._syncMode;
+        this._syncMode = mode;
+        this.log(`Sync mode changed: ${oldMode} → ${mode}`);
+
+        if (mode === 'realtime') {
+            // Switching to realtime: apply any pending changes first
+            const hasLocal = this._changeTracker.getLocalChangeCount() > 0;
+            const hasRemote = this._changeTracker.getRemoteChangeCount() > 0;
+
+            if (hasLocal || hasRemote) {
+                const choice = await vscode.window.showWarningMessage(
+                    `You have pending changes. Apply them before switching to real-time mode?`,
+                    'Apply & Switch',
+                    'Discard & Switch',
+                    'Cancel'
+                );
+
+                if (choice === 'Cancel') {
+                    this._syncMode = oldMode;
+                    return;
+                }
+
+                if (choice === 'Apply & Switch') {
+                    if (hasRemote) await this.pullChanges();
+                    if (hasLocal) await this.pushChanges();
+                } else {
+                    this._changeTracker.clearAll();
+                }
+            }
+        }
+
+        // Save to settings
+        await this.settings.update({ syncMode: mode });
     }
 
     /**
@@ -483,6 +550,21 @@ export class SyncEngine {
     private async handleLocalFileChange(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
+
+        // Manual mode: record change instead of pushing immediately
+        if (this._syncMode === 'manual') {
+            const entry = this.fileTreeByPath.get(relativePath);
+            this._changeTracker.addLocalChange({
+                path: relativePath,
+                type: 'modified',
+                source: 'local',
+                timestamp: Date.now(),
+                entityId: entry?.id,
+                entityType: entry?.type,
+            });
+            return;
+        }
+
         if (!this.acquireLock(relativePath)) return;
 
         try {
@@ -610,6 +692,18 @@ export class SyncEngine {
     private async handleLocalFileCreate(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
+
+        // Manual mode: record change instead of pushing immediately
+        if (this._syncMode === 'manual') {
+            this._changeTracker.addLocalChange({
+                path: relativePath,
+                type: 'created',
+                source: 'local',
+                timestamp: Date.now(),
+            });
+            return;
+        }
+
         if (!this.acquireLock(relativePath)) return;
 
         try {
@@ -701,6 +795,25 @@ export class SyncEngine {
     private async handleLocalFileDelete(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
+
+        // Manual mode: record change instead of deleting immediately
+        if (this._syncMode === 'manual') {
+            const entry = this.fileTreeByPath.get(relativePath) || this.fileTreeByPath.get(relativePath + '/');
+            if (!entry) return;
+            // Only track if file was previously synced
+            const pathToUse = entry.path;
+            if (!this.baseContent.has(pathToUse)) return;
+            this._changeTracker.addLocalChange({
+                path: pathToUse,
+                type: 'deleted',
+                source: 'local',
+                timestamp: Date.now(),
+                entityId: entry.id,
+                entityType: entry.type,
+            });
+            return;
+        }
+
         if (!this.acquireLock(relativePath)) return;
 
         try {
@@ -758,21 +871,35 @@ export class SyncEngine {
         const path = type === 'folder' ? parentPath + entity.name + '/' : parentPath + entity.name;
 
         if (!this.shouldSync(path)) return;
+
+        // Always update the file tree (keeps remote state accurate)
+        const treeEntry: FileTreeEntry = {
+            id: entity._id,
+            type,
+            name: entity.name,
+            path,
+            parentId,
+        };
+        this.fileTree.set(entity._id, treeEntry);
+        this.fileTreeByPath.set(path, treeEntry);
+
+        // Manual mode: record change instead of applying immediately
+        if (this._syncMode === 'manual') {
+            this._changeTracker.addRemoteChange({
+                path,
+                type: 'created',
+                source: 'remote',
+                timestamp: Date.now(),
+                entityId: entity._id,
+                entityType: type,
+            });
+            return;
+        }
+
         if (!this.acquireLock(path)) return;
 
         try {
             this.setStatus('pulling', `Downloading ${path}`, path);
-
-            // Add to tree
-            const entry: FileTreeEntry = {
-                id: entity._id,
-                type,
-                name: entity.name,
-                path,
-                parentId,
-            };
-            this.fileTree.set(entity._id, entry);
-            this.fileTreeByPath.set(path, entry);
 
             const localUri = this.settings.getFilePath(path);
 
@@ -853,16 +980,30 @@ export class SyncEngine {
         const parentPath = oldPath.substring(0, oldPath.lastIndexOf('/') + 1);
         const newPath = entry.type === 'folder' ? parentPath + newName + '/' : parentPath + newName;
 
+        // Always update file tree
+        entry.name = newName;
+        entry.path = newPath;
+        this.fileTreeByPath.delete(oldPath);
+        this.fileTreeByPath.set(newPath, entry);
+
+        // Manual mode: record change
+        if (this._syncMode === 'manual') {
+            this._changeTracker.addRemoteChange({
+                path: newPath,
+                type: 'renamed',
+                source: 'remote',
+                timestamp: Date.now(),
+                entityId,
+                entityType: entry.type,
+                oldPath,
+            });
+            return;
+        }
+
         if (!this.acquireLock(oldPath)) return;
 
         try {
             this.setStatus('pulling', `Renaming ${oldPath} to ${newPath}`, oldPath);
-
-            // Update tree
-            entry.name = newName;
-            entry.path = newPath;
-            this.fileTreeByPath.delete(oldPath);
-            this.fileTreeByPath.set(newPath, entry);
 
             // Rename local file
             const oldUri = this.settings.getFilePath(oldPath);
@@ -897,13 +1038,34 @@ export class SyncEngine {
         if (!entry) return;
 
         if (!this.shouldSync(entry.path)) return;
-        if (!this.acquireLock(entry.path)) return;
+
+        const entryPath = entry.path;
+        const entryType = entry.type;
+
+        // Always update file tree
+        this.fileTree.delete(entityId);
+        this.fileTreeByPath.delete(entryPath);
+
+        // Manual mode: record change
+        if (this._syncMode === 'manual') {
+            this._changeTracker.addRemoteChange({
+                path: entryPath,
+                type: 'deleted',
+                source: 'remote',
+                timestamp: Date.now(),
+                entityId,
+                entityType: entryType,
+            });
+            return;
+        }
+
+        if (!this.acquireLock(entryPath)) return;
 
         try {
-            this.setStatus('pulling', `Deleting ${entry.path}`, entry.path);
+            this.setStatus('pulling', `Deleting ${entryPath}`, entryPath);
 
             // Leave doc if joined
-            if (entry.type === 'doc' && this.joinedDocs.has(entityId)) {
+            if (entryType === 'doc' && this.joinedDocs.has(entityId)) {
                 try {
                     await this.socket?.leaveDoc(entityId);
                 } catch {
@@ -912,22 +1074,18 @@ export class SyncEngine {
                 this.joinedDocs.delete(entityId);
             }
 
-            // Remove from tree
-            this.fileTree.delete(entityId);
-            this.fileTreeByPath.delete(entry.path);
-
             // Delete local file
-            const localUri = this.settings.getFilePath(entry.path);
+            const localUri = this.settings.getFilePath(entryPath);
             await vscode.workspace.fs.delete(localUri, { recursive: true });
 
-            this.baseContent.delete(entry.path);
-            this.fileCache.delete(entry.path);
+            this.baseContent.delete(entryPath);
+            this.fileCache.delete(entryPath);
 
             this.setStatus('idle');
         } catch (error) {
             console.error(`[LocalLeaf] Failed to sync remote delete:`, error);
         } finally {
-            this.releaseLock(entry.path);
+            this.releaseLock(entryPath);
         }
     }
 
@@ -944,16 +1102,31 @@ export class SyncEngine {
             ? newParent.path + entry.name + '/'
             : newParent.path + entry.name;
 
+        // Always update file tree
+        entry.path = newPath;
+        entry.parentId = newParentId;
+        this.fileTreeByPath.delete(oldPath);
+        this.fileTreeByPath.set(newPath, entry);
+
+        // Manual mode: record change
+        if (this._syncMode === 'manual') {
+            this._changeTracker.addRemoteChange({
+                path: newPath,
+                type: 'moved',
+                source: 'remote',
+                timestamp: Date.now(),
+                entityId,
+                entityType: entry.type,
+                oldPath,
+                newParentId,
+            });
+            return;
+        }
+
         if (!this.acquireLock(oldPath)) return;
 
         try {
             this.setStatus('pulling', `Moving ${oldPath} to ${newPath}`, oldPath);
-
-            // Update tree
-            entry.path = newPath;
-            entry.parentId = newParentId;
-            this.fileTreeByPath.delete(oldPath);
-            this.fileTreeByPath.set(newPath, entry);
 
             // Move local file
             const oldUri = this.settings.getFilePath(oldPath);
@@ -978,6 +1151,20 @@ export class SyncEngine {
         }
 
         if (!this.shouldSync(entry.path)) return;
+
+        // Manual mode: record change but don't modify local files
+        if (this._syncMode === 'manual') {
+            this._changeTracker.addRemoteChange({
+                path: entry.path,
+                type: 'modified',
+                source: 'remote',
+                timestamp: Date.now(),
+                entityId: update.doc,
+                entityType: 'doc',
+            });
+            return;
+        }
+
         if (!this.acquireLock(entry.path)) return;
 
         try {
@@ -1656,6 +1843,373 @@ export class SyncEngine {
     }
 
     /**
+     * Pull buffered remote changes in manual mode.
+     * Uses three-way conflict detection: local vs remote vs base.
+     */
+    async pullChanges(): Promise<void> {
+        if (!this.project) {
+            throw new Error('Not connected');
+        }
+
+        const remoteChanges = this._changeTracker.getRemoteChanges();
+        if (remoteChanges.length === 0) {
+            this.log('Pull: No remote changes to apply');
+            return;
+        }
+
+        // Reset conflict resolution state
+        this.conflictResolution = 'ask';
+        this.applyToAll = false;
+
+        this.setStatus('pulling', `Applying ${remoteChanges.length} remote changes...`);
+        const projectSettings = this.settings.getSettings()!;
+
+        let appliedCount = 0;
+        let conflictCount = 0;
+        let skippedCount = 0;
+
+        try {
+            for (const change of remoteChanges) {
+                switch (change.type) {
+                    case 'created': {
+                        const entry = this.fileTree.get(change.entityId || '');
+                        if (!entry) { skippedCount++; break; }
+
+                        const localUri = this.settings.getFilePath(change.path);
+
+                        if (entry.type === 'folder') {
+                            await vscode.workspace.fs.createDirectory(localUri);
+                            this.baseContent.set(change.path, new Uint8Array(0));
+                        } else {
+                            // Download content
+                            let remoteContent: Uint8Array | undefined;
+                            if (entry.type === 'doc') {
+                                if (this.socket) {
+                                    try {
+                                        const { lines } = await this.socket.joinDoc(entry.id);
+                                        remoteContent = new TextEncoder().encode(lines.join('\n'));
+                                        await this.socket.leaveDoc(entry.id);
+                                    } catch { /* fallthrough to HTTP */ }
+                                }
+                                if (!remoteContent) {
+                                    const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
+                                    if (result.type === 'success' && result.lines) {
+                                        remoteContent = new TextEncoder().encode(result.lines.join('\n'));
+                                    }
+                                }
+                            } else {
+                                const result = await this.api.getFile(projectSettings.projectId, entry.id);
+                                if (result.type === 'success' && result.content) {
+                                    remoteContent = result.content;
+                                }
+                            }
+
+                            if (remoteContent) {
+                                // Check if local file already exists (potential conflict)
+                                const exists = await this.localFileExists(localUri);
+                                if (exists) {
+                                    const hasConflict = await this.hasConflict(localUri, remoteContent);
+                                    if (hasConflict) {
+                                        conflictCount++;
+                                        const resolution = await this.askConflictResolution(change.path, localUri, remoteContent);
+                                        if (resolution === 'skip') { skippedCount++; break; }
+                                        if (resolution === 'useLocal') { break; }
+                                    }
+                                }
+
+                                await vscode.workspace.fs.writeFile(localUri, remoteContent);
+                                this.baseContent.set(change.path, remoteContent);
+                                this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                            }
+                        }
+                        appliedCount++;
+                        break;
+                    }
+
+                    case 'modified': {
+                        const entry = this.fileTree.get(change.entityId || '') || this.fileTreeByPath.get(change.path);
+                        if (!entry) { skippedCount++; break; }
+
+                        // Download latest remote content
+                        let remoteContent: Uint8Array | undefined;
+                        if (entry.type === 'doc') {
+                            if (this.socket) {
+                                try {
+                                    const { lines } = await this.socket.joinDoc(entry.id);
+                                    remoteContent = new TextEncoder().encode(lines.join('\n'));
+                                    await this.socket.leaveDoc(entry.id);
+                                } catch { /* fallthrough to HTTP */ }
+                            }
+                            if (!remoteContent) {
+                                const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
+                                if (result.type === 'success' && result.lines) {
+                                    remoteContent = new TextEncoder().encode(result.lines.join('\n'));
+                                }
+                            }
+                        } else {
+                            const result = await this.api.getFile(projectSettings.projectId, entry.id);
+                            if (result.type === 'success' && result.content) {
+                                remoteContent = result.content;
+                            }
+                        }
+
+                        if (!remoteContent) { skippedCount++; break; }
+
+                        const localUri = this.settings.getFilePath(change.path);
+                        const base = this.baseContent.get(change.path);
+
+                        // Three-way comparison
+                        let localContent: Uint8Array | undefined;
+                        try {
+                            localContent = await vscode.workspace.fs.readFile(localUri);
+                        } catch {
+                            localContent = undefined;
+                        }
+
+                        const localChanged = localContent && base ? !contentEquals(localContent, base) : false;
+                        const remoteChanged = base ? !contentEquals(remoteContent, base) : true;
+
+                        if (!localChanged && !remoteChanged) {
+                            // No changes — skip
+                        } else if (!localChanged && remoteChanged) {
+                            // Only remote changed — safe to pull
+                            await vscode.workspace.fs.writeFile(localUri, remoteContent);
+                            this.baseContent.set(change.path, remoteContent);
+                            this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                            appliedCount++;
+                        } else if (localChanged && !remoteChanged) {
+                            // Only local changed — nothing to pull
+                            skippedCount++;
+                        } else if (localContent && contentEquals(localContent, remoteContent)) {
+                            // Both changed to same content — update base
+                            this.baseContent.set(change.path, remoteContent);
+                            this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                        } else {
+                            // True conflict
+                            conflictCount++;
+                            const resolution = await this.askConflictResolution(change.path, localUri, remoteContent);
+                            if (resolution === 'useRemote') {
+                                await vscode.workspace.fs.writeFile(localUri, remoteContent);
+                                this.baseContent.set(change.path, remoteContent);
+                                this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                                appliedCount++;
+                            } else if (resolution === 'useLocal') {
+                                // Keep local — base stays as-is, user will push
+                            } else {
+                                skippedCount++;
+                            }
+                        }
+                        break;
+                    }
+
+                    case 'deleted': {
+                        const localUri = this.settings.getFilePath(change.path);
+                        try {
+                            await vscode.workspace.fs.delete(localUri, { recursive: true });
+                        } catch {
+                            // File may already be gone
+                        }
+                        this.baseContent.delete(change.path);
+                        this.fileCache.delete(change.path);
+                        appliedCount++;
+                        break;
+                    }
+
+                    case 'renamed': {
+                        if (change.oldPath) {
+                            const oldUri = this.settings.getFilePath(change.oldPath);
+                            const newUri = this.settings.getFilePath(change.path);
+                            try {
+                                await vscode.workspace.fs.rename(oldUri, newUri);
+                            } catch {
+                                // May fail if old path doesn't exist locally
+                            }
+                            // Update caches
+                            const content = this.baseContent.get(change.oldPath);
+                            if (content) {
+                                this.baseContent.delete(change.oldPath);
+                                this.baseContent.set(change.path, content);
+                            }
+                        }
+                        appliedCount++;
+                        break;
+                    }
+
+                    case 'moved': {
+                        if (change.oldPath) {
+                            const oldUri = this.settings.getFilePath(change.oldPath);
+                            const newUri = this.settings.getFilePath(change.path);
+                            try {
+                                await vscode.workspace.fs.rename(oldUri, newUri);
+                            } catch {
+                                // May fail if old path doesn't exist locally
+                            }
+                        }
+                        appliedCount++;
+                        break;
+                    }
+                }
+
+                // Clear processed change
+                this._changeTracker.clearRemote(change.path);
+            }
+
+            await this.settings.updateLastSynced();
+            const message = `Pull complete: ${appliedCount} applied, ${skippedCount} skipped, ${conflictCount} conflicts`;
+            this.log(message);
+            this.setStatus('idle', message);
+        } catch (error) {
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Pull failed: ${error}`, undefined, authErr);
+            throw error;
+        }
+    }
+
+    /**
+     * Push buffered local changes in manual mode.
+     */
+    async pushChanges(): Promise<void> {
+        if (!this.project) {
+            throw new Error('Not connected');
+        }
+
+        const localChanges = this._changeTracker.getLocalChanges();
+        if (localChanges.length === 0) {
+            this.log('Push: No local changes to push');
+            return;
+        }
+
+        // Check for conflicts before pushing
+        const conflicts = this._changeTracker.getConflicts();
+        if (conflicts.length > 0) {
+            const choice = await vscode.window.showWarningMessage(
+                `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
+                'Pull First',
+                'Force Push'
+            );
+            if (choice === 'Pull First') {
+                await this.pullChanges();
+                return;
+            }
+            if (choice !== 'Force Push') {
+                return;
+            }
+        }
+
+        this.setStatus('pushing', `Pushing ${localChanges.length} local changes...`);
+        const projectSettings = this.settings.getSettings()!;
+
+        let pushedCount = 0;
+
+        try {
+            for (const change of localChanges) {
+                switch (change.type) {
+                    case 'modified': {
+                        const entry = this.fileTreeByPath.get(change.path);
+                        if (!entry) break;
+
+                        const localUri = this.settings.getFilePath(change.path);
+                        let content: Uint8Array;
+                        try {
+                            content = await vscode.workspace.fs.readFile(localUri);
+                        } catch {
+                            break; // File no longer exists
+                        }
+
+                        this.setStatus('pushing', `Uploading ${change.path}`, change.path);
+
+                        if (entry.type === 'doc' && this.socket) {
+                            await this.pushDocumentChanges(entry.id, change.path, content);
+                        } else {
+                            await this.api.uploadFile(
+                                projectSettings.projectId,
+                                entry.parentId!,
+                                entry.name,
+                                content
+                            );
+                        }
+
+                        this.baseContent.set(change.path, content);
+                        this.fileCache.set(change.path, { hash: hashContent(content), timestamp: Date.now() });
+                        pushedCount++;
+                        break;
+                    }
+
+                    case 'created': {
+                        const localUri = this.settings.getFilePath(change.path);
+                        let stat: vscode.FileStat;
+                        try {
+                            stat = await vscode.workspace.fs.stat(localUri);
+                        } catch {
+                            break; // File no longer exists
+                        }
+
+                        this.setStatus('pushing', `Creating ${change.path}`, change.path);
+                        const parentId = await this.ensureParentFoldersExist(change.path);
+                        const name = change.path.split('/').pop()!;
+
+                        if (stat.type === vscode.FileType.Directory) {
+                            const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
+                            if (result.type === 'success' && result.folder) {
+                                const folderEntry: FileTreeEntry = {
+                                    id: result.folder._id,
+                                    type: 'folder',
+                                    name,
+                                    path: change.path + '/',
+                                    parentId,
+                                };
+                                this.fileTree.set(result.folder._id, folderEntry);
+                                this.fileTreeByPath.set(change.path + '/', folderEntry);
+                            }
+                        } else {
+                            const content = await vscode.workspace.fs.readFile(localUri);
+                            const isTextFile = this.isTextFile(name);
+
+                            if (isTextFile) {
+                                await this.api.addDoc(projectSettings.projectId, parentId, name);
+                            } else {
+                                await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
+                            }
+
+                            this.baseContent.set(change.path, content);
+                            this.fileCache.set(change.path, { hash: hashContent(content), timestamp: Date.now() });
+                        }
+                        pushedCount++;
+                        break;
+                    }
+
+                    case 'deleted': {
+                        const entry = change.entityId ? this.fileTree.get(change.entityId) : this.fileTreeByPath.get(change.path);
+                        if (!entry) break;
+
+                        this.setStatus('pushing', `Deleting ${change.path}`, change.path);
+                        await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
+
+                        this.fileTree.delete(entry.id);
+                        this.fileTreeByPath.delete(change.path);
+                        this.baseContent.delete(change.path);
+                        this.fileCache.delete(change.path);
+                        pushedCount++;
+                        break;
+                    }
+                }
+
+                // Clear processed change
+                this._changeTracker.clearLocal(change.path);
+            }
+
+            await this.settings.updateLastSynced();
+            const message = `Push complete: ${pushedCount} files pushed`;
+            this.log(message);
+            this.setStatus('idle', message);
+        } catch (error) {
+            const authErr = isAuthError(error);
+            this.setStatus('error', authErr ? 'Session expired' : `Push failed: ${error}`, undefined, authErr);
+            throw error;
+        }
+    }
+
+    /**
      * Get the socket instance
      */
     getSocket(): SocketIOAPI | undefined {
@@ -1666,6 +2220,7 @@ export class SyncEngine {
      * Disconnect and cleanup
      */
     disconnect(): void {
+        this._changeTracker.dispose();
         this.socket?.disconnect();
         this.socket = undefined;
         this.disposables.forEach(d => d.dispose());

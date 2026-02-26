@@ -10,9 +10,14 @@ import { SettingsManager, createSettingsWatcher } from './utils/settingsManager'
 import { BaseAPI, ProjectInfo } from './api/base';
 import { SyncEngine, SyncStatus } from './sync/syncEngine';
 import { IgnoreParser } from './sync/ignoreParser';
+import { SyncMode } from './sync/changeTracker';
 import { CursorTracker, TrackedUser } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
 import { ProjectsProvider, ChangesProvider, DetailsProvider, syncStatusDescription } from './views/sidebarProvider';
+import { LatexCompiler, CompilerType, CompilationResult } from './compilation/latexCompiler';
+import * as path from 'path';
+import { AutoCompiler } from './compilation/autoCompiler';
+import { PdfPreviewPanel } from './views/pdfPreviewPanel';
 
 /**
  * Auth state type
@@ -35,12 +40,17 @@ let projectsProvider: ProjectsProvider;
 let changesProvider: ChangesProvider;
 let detailsProvider: DetailsProvider;
 let changesTreeView: vscode.TreeView<any>;
+let latexCompiler: LatexCompiler | undefined;
+let autoCompiler: AutoCompiler | undefined;
+let extensionContext: vscode.ExtensionContext;
 
 /**
  * Extension activation
  */
 export async function activate(context: vscode.ExtensionContext) {
     try {
+
+    extensionContext = context;
 
     // Initialize output channel
     outputChannel = vscode.window.createOutputChannel(EXTENSION_NAME);
@@ -153,6 +163,24 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
         vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: ProjectInfo) => cmdOpenProject(context, project)),
         vscode.commands.registerCommand(COMMANDS.REMOVE_COMMENTS, cmdRemoveComments),
+        // Sync mode
+        vscode.commands.registerCommand(COMMANDS.TOGGLE_SYNC_MODE, cmdToggleSyncMode),
+        // Project sorting & filtering
+        vscode.commands.registerCommand(COMMANDS.FILTER_PROJECTS, cmdFilterProjects),
+        vscode.commands.registerCommand(COMMANDS.SORT_PROJECTS_BY_NAME, () => cmdSortProjects('name')),
+        vscode.commands.registerCommand(COMMANDS.SORT_PROJECTS_BY_DATE, () => cmdSortProjects('lastUpdated')),
+        vscode.commands.registerCommand(COMMANDS.SORT_PROJECTS_BY_ACCESS, () => cmdSortProjects('accessLevel')),
+        // Compilation & PDF preview
+        vscode.commands.registerCommand(COMMANDS.COMPILE_LATEX, cmdCompileLaTeX),
+        vscode.commands.registerCommand(COMMANDS.SHOW_PDF_PREVIEW, cmdShowPdfPreview),
+        vscode.commands.registerCommand(COMMANDS.SELECT_COMPILER, cmdSelectCompiler),
+        vscode.commands.registerCommand(COMMANDS.TOGGLE_AUTO_COMPILE, cmdToggleAutoCompile),
+        vscode.commands.registerCommand(COMMANDS.CANCEL_COMPILATION, cmdCancelCompilation),
+        // Changes view context actions
+        vscode.commands.registerCommand(COMMANDS.VIEW_DIFF, (path: string) => cmdViewDiff(path)),
+        vscode.commands.registerCommand(COMMANDS.DISCARD_CHANGE, (path: string) => cmdDiscardChange(path)),
+        vscode.commands.registerCommand(COMMANDS.RESOLVE_CONFLICT_REMOTE, (path: string) => cmdResolveConflict(path, 'remote')),
+        vscode.commands.registerCommand(COMMANDS.RESOLVE_CONFLICT_LOCAL, (path: string) => cmdResolveConflict(path, 'local')),
     );
 }
 
@@ -192,6 +220,15 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         }
     });
 
+    // Wire up change tracker to changes view
+    changesProvider.setChangeTracker(syncEngine.changeTracker);
+
+    // Read sync mode from settings and apply
+    const syncMode: SyncMode = projectSettings.syncMode === 'realtime' ? 'realtime' : 'manual';
+    changesProvider.setSyncMode(syncMode);
+    await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', syncMode);
+    updateSyncModeStatusBar(syncMode);
+
     // Connect
     try {
         await syncEngine.connect();
@@ -227,6 +264,38 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
             log(`Auto-pull failed: ${pullError}`);
             // Don't show error for auto-pull, user can manually pull
         }
+
+        // Initialize LaTeX compiler
+        latexCompiler = new LatexCompiler();
+        context.subscriptions.push(latexCompiler);
+
+        autoCompiler = new AutoCompiler(latexCompiler);
+        context.subscriptions.push(autoCompiler);
+
+        // Auto-compile on save if enabled
+        if (projectSettings.compileOnSave) {
+            const mainTex = projectSettings.mainTex || 'main.tex';
+            const delay = vscode.workspace.getConfiguration('localleaf').get<number>('compileDelay', 1500);
+            autoCompiler.enable(settings.getWorkspaceFolder(), mainTex, delay);
+            autoCompiler.onDidCompile(result => handleCompilationResult(result));
+        }
+
+        // Auto-compile and open PDF preview on project load
+        const mainTex = projectSettings.mainTex || 'main.tex';
+        let compiler: CompilerType | undefined;
+        if (projectSettings.compiler && projectSettings.compiler !== 'auto') {
+            compiler = projectSettings.compiler as CompilerType;
+        }
+        const workspaceFolder = settings.getWorkspaceFolder();
+        log('Auto-compiling on project load...');
+        latexCompiler.compile(workspaceFolder.fsPath, mainTex, compiler).then(result => {
+            if (result.success && result.pdfPath) {
+                log(`Auto-compile succeeded (${result.duration}ms), opening PDF preview`);
+                PdfPreviewPanel.createOrShow(context.extensionUri, result.pdfPath);
+            } else {
+                log(`Auto-compile failed: ${result.errors.map(e => e.message).join('; ')}`);
+            }
+        });
     } catch (error) {
         log(`Failed to connect: ${error}`);
         vscode.window.showErrorMessage(`LocalLeaf: Failed to connect - ${error}`);
@@ -256,8 +325,9 @@ function updateStatusBar(status: SyncStatus, message?: string) {
         disconnected: '$(cloud-offline)',
     };
 
-    statusBarItem.text = `${icons[status]} LocalLeaf`;
-    statusBarItem.tooltip = new vscode.MarkdownString(`**LocalLeaf** - ${message || status}`);
+    const modeLabel = syncEngine?.syncMode === 'realtime' ? 'Live' : 'Manual';
+    statusBarItem.text = `${icons[status]} LocalLeaf [${modeLabel}]`;
+    statusBarItem.tooltip = new vscode.MarkdownString(`**LocalLeaf** [${modeLabel}] - ${message || status}`);
     statusBarItem.command = COMMANDS.SHOW_SYNC_STATUS;
 
     if (status === 'error') {
@@ -707,8 +777,21 @@ async function cmdSyncNow() {
         return;
     }
 
-    // For now, just pull
-    await cmdPullFromOverleaf();
+    if (syncEngine.syncMode === 'manual') {
+        // In manual mode: pull then push
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'LocalLeaf: Syncing...',
+            cancellable: false,
+        }, async () => {
+            await syncEngine!.pullChanges();
+            await syncEngine!.pushChanges();
+        });
+        vscode.window.showInformationMessage('LocalLeaf: Sync complete');
+    } else {
+        // In realtime mode: do a full pull to catch up
+        await cmdPullFromOverleaf();
+    }
 }
 
 /**
@@ -726,7 +809,11 @@ async function cmdPullFromOverleaf() {
             title: 'LocalLeaf: Pulling from Overleaf...',
             cancellable: false,
         }, async () => {
-            await syncEngine!.pullAll();
+            if (syncEngine!.syncMode === 'manual') {
+                await syncEngine!.pullChanges();
+            } else {
+                await syncEngine!.pullAll();
+            }
         });
         vscode.window.showInformationMessage('LocalLeaf: Pull complete');
     } catch (error) {
@@ -743,7 +830,22 @@ async function cmdPushToOverleaf() {
         return;
     }
 
-    vscode.window.showInformationMessage('LocalLeaf: Push is automatic via real-time sync');
+    if (syncEngine.syncMode === 'manual') {
+        try {
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'LocalLeaf: Pushing to Overleaf...',
+                cancellable: false,
+            }, async () => {
+                await syncEngine!.pushChanges();
+            });
+            vscode.window.showInformationMessage('LocalLeaf: Push complete');
+        } catch (error) {
+            vscode.window.showErrorMessage(`LocalLeaf: Push failed - ${error}`);
+        }
+    } else {
+        vscode.window.showInformationMessage('LocalLeaf: Push is automatic in real-time mode');
+    }
 }
 
 /**
@@ -913,7 +1015,13 @@ async function cmdReconnect() {
     const api = new BaseAPI(projectSettings.serverUrl);
     api.setIdentity(credential.identity);
 
-    syncEngine = new SyncEngine(api, settingsManager);
+    syncEngine = new SyncEngine(api, settingsManager, log);
+
+    // Wire up change tracker
+    changesProvider.setChangeTracker(syncEngine.changeTracker);
+    const syncMode: SyncMode = projectSettings.syncMode === 'realtime' ? 'realtime' : 'manual';
+    changesProvider.setSyncMode(syncMode);
+    await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', syncMode);
 
     syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
@@ -1265,6 +1373,265 @@ function removeLatexComments(content: string): string {
     return cleaned.join('\n') + '\n';
 }
 
+// === Sync Mode Commands ===
+
+/**
+ * Toggle between manual and realtime sync modes
+ */
+async function cmdToggleSyncMode() {
+    if (!syncEngine) {
+        vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
+        return;
+    }
+
+    const currentMode = syncEngine.syncMode;
+    const newMode: SyncMode = currentMode === 'manual' ? 'realtime' : 'manual';
+
+    await syncEngine.setSyncMode(newMode);
+    changesProvider.setSyncMode(newMode);
+    await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', newMode);
+    updateSyncModeStatusBar(newMode);
+    refreshSidebar();
+
+    const label = newMode === 'manual' ? 'Manual' : 'Real-time';
+    vscode.window.showInformationMessage(`LocalLeaf: Sync mode set to ${label}`);
+}
+
+/**
+ * Update status bar to reflect current sync mode
+ */
+function updateSyncModeStatusBar(mode: SyncMode) {
+    // The status bar text is updated in updateStatusBar, which reads syncEngine.syncMode
+    // Just trigger a refresh
+    if (syncEngine) {
+        updateStatusBar(syncEngine.status);
+    }
+}
+
+// === Project Sorting & Filtering Commands ===
+
+async function cmdFilterProjects() {
+    const current = projectsProvider.getFilter();
+    const text = await vscode.window.showInputBox({
+        prompt: 'Filter projects by name',
+        value: current,
+        placeHolder: 'Type to filter...',
+    });
+
+    if (text !== undefined) {
+        projectsProvider.setFilter(text);
+    }
+}
+
+function cmdSortProjects(field: 'name' | 'lastUpdated' | 'accessLevel') {
+    projectsProvider.setSortField(field);
+}
+
+// === Compilation Commands ===
+
+async function cmdCompileLaTeX() {
+    const settingsManager = SettingsManager.getCurrentInstance();
+    const settings = settingsManager?.getSettings();
+    if (!settingsManager || !settings) {
+        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        return;
+    }
+
+    if (!latexCompiler) {
+        latexCompiler = new LatexCompiler();
+    }
+
+    const mainTex = settings.mainTex || 'main.tex';
+    const workspaceFolder = settingsManager.getWorkspaceFolder();
+
+    // Determine compiler to use
+    let compiler: CompilerType | undefined;
+    if (settings.compiler && settings.compiler !== 'auto') {
+        compiler = settings.compiler as CompilerType;
+    }
+
+    await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: `LocalLeaf: Compiling ${mainTex}...`,
+        cancellable: true,
+    }, async (progress, token) => {
+        token.onCancellationRequested(() => {
+            latexCompiler?.cancel();
+        });
+
+        const result = await latexCompiler!.compile(workspaceFolder.fsPath, mainTex, compiler);
+        handleCompilationResult(result);
+    });
+}
+
+function handleCompilationResult(result: CompilationResult) {
+    if (result.success) {
+        const duration = (result.duration / 1000).toFixed(1);
+        vscode.window.showInformationMessage(`LocalLeaf: Compilation successful (${duration}s)`);
+
+        // Auto-open / refresh PDF preview
+        if (result.pdfPath) {
+            PdfPreviewPanel.createOrShow(extensionContext.extensionUri, result.pdfPath);
+        }
+    } else {
+        const errorCount = result.errors.length;
+        const warningCount = result.warnings.length;
+        vscode.window.showErrorMessage(
+            `LocalLeaf: Compilation failed (${errorCount} error(s), ${warningCount} warning(s))`,
+            'Show Problems'
+        ).then(choice => {
+            if (choice === 'Show Problems') {
+                vscode.commands.executeCommand('workbench.action.problems.focus');
+            }
+        });
+    }
+
+    log(`Compilation ${result.success ? 'succeeded' : 'failed'} in ${result.duration}ms`);
+}
+
+async function cmdShowPdfPreview() {
+    const settingsManager = SettingsManager.getCurrentInstance();
+    const settings = settingsManager?.getSettings();
+    if (!settingsManager || !settings) {
+        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        return;
+    }
+
+    const mainPdf = settings.mainPdf || settings.mainTex?.replace(/\.tex$/, '.pdf') || 'main.pdf';
+    const workspaceFolder = settingsManager.getWorkspaceFolder();
+    const pdfPath = path.join(LatexCompiler.getBuildDir(workspaceFolder.fsPath), mainPdf);
+
+    try {
+        await vscode.workspace.fs.stat(vscode.Uri.file(pdfPath));
+        PdfPreviewPanel.createOrShow(extensionContext.extensionUri, pdfPath);
+    } catch {
+        // PDF not found — compile automatically then show preview
+        await cmdCompileLaTeX();
+    }
+}
+
+async function cmdSelectCompiler() {
+    if (!latexCompiler) {
+        latexCompiler = new LatexCompiler();
+    }
+
+    const available = await latexCompiler.detectCompilers();
+
+    if (available.length === 0) {
+        vscode.window.showErrorMessage('LocalLeaf: No LaTeX compilers found. Please install TeX Live or MiKTeX.');
+        return;
+    }
+
+    const items: vscode.QuickPickItem[] = [
+        { label: 'auto', description: 'Auto-detect (prefer latexmk)' },
+        ...available.map(c => ({
+            label: c,
+            description: c === 'latexmk' ? 'Recommended (auto multi-pass)' : '',
+        })),
+    ];
+
+    const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select LaTeX compiler',
+    });
+
+    if (selected) {
+        const settingsManager = SettingsManager.getCurrentInstance();
+        await settingsManager?.update({ compiler: selected.label as any });
+        detailsProvider.refresh();
+        vscode.window.showInformationMessage(`LocalLeaf: Compiler set to ${selected.label}`);
+    }
+}
+
+async function cmdToggleAutoCompile() {
+    const settingsManager = SettingsManager.getCurrentInstance();
+    const settings = settingsManager?.getSettings();
+    if (!settingsManager || !settings) {
+        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        return;
+    }
+
+    const newState = !settings.compileOnSave;
+    await settingsManager.update({ compileOnSave: newState });
+
+    if (newState) {
+        if (!latexCompiler) {
+            latexCompiler = new LatexCompiler();
+        }
+        if (!autoCompiler) {
+            autoCompiler = new AutoCompiler(latexCompiler);
+        }
+        const mainTex = settings.mainTex || 'main.tex';
+        const delay = vscode.workspace.getConfiguration('localleaf').get<number>('compileDelay', 1500);
+        autoCompiler.enable(settingsManager.getWorkspaceFolder(), mainTex, delay);
+        autoCompiler.onDidCompile(result => handleCompilationResult(result));
+        vscode.window.showInformationMessage('LocalLeaf: Auto-compile enabled');
+    } else {
+        autoCompiler?.disable();
+        vscode.window.showInformationMessage('LocalLeaf: Auto-compile disabled');
+    }
+
+    detailsProvider.refresh();
+}
+
+function cmdCancelCompilation() {
+    if (latexCompiler?.isCompiling) {
+        latexCompiler.cancel();
+        vscode.window.showInformationMessage('LocalLeaf: Compilation cancelled');
+    } else {
+        vscode.window.showInformationMessage('LocalLeaf: No compilation in progress');
+    }
+}
+
+// === Changes View Context Actions ===
+
+async function cmdViewDiff(filePath: string) {
+    if (!syncEngine || !filePath) return;
+
+    const settingsManager = SettingsManager.getCurrentInstance();
+    if (!settingsManager) return;
+
+    const localUri = settingsManager.getFilePath(filePath);
+    const remoteUri = vscode.Uri.parse(`localleaf-remote:${filePath}`);
+
+    await vscode.commands.executeCommand('vscode.diff',
+        localUri,
+        remoteUri,
+        `${filePath} (Local ↔ Remote)`
+    );
+}
+
+async function cmdResolveConflict(filePath: string, resolution: 'remote' | 'local') {
+    if (!syncEngine || !filePath) return;
+
+    const tracker = syncEngine.changeTracker;
+
+    if (resolution === 'remote') {
+        // Clear local change, keep remote
+        tracker.clearLocal(filePath);
+    } else {
+        // Clear remote change, keep local
+        tracker.clearRemote(filePath);
+    }
+
+    const label = resolution === 'remote' ? 'remote' : 'local';
+    vscode.window.showInformationMessage(`LocalLeaf: Resolved "${filePath}" using ${label} version`);
+}
+
+async function cmdDiscardChange(filePath: string) {
+    if (!syncEngine || !filePath) return;
+
+    const tracker = syncEngine.changeTracker;
+    const hasLocal = tracker.hasLocalChange(filePath);
+    const hasRemote = tracker.hasRemoteChange(filePath);
+
+    if (hasLocal) {
+        tracker.clearLocal(filePath);
+    }
+    if (hasRemote) {
+        tracker.clearRemote(filePath);
+    }
+}
+
 /**
  * Open a project from the sidebar (link + download)
  */
@@ -1311,6 +1678,12 @@ async function cmdOpenProject(context: vscode.ExtensionContext, project: Project
 export function deactivate() {
     stopStatusUpdates();
 
+    if (autoCompiler) {
+        autoCompiler.dispose();
+    }
+    if (latexCompiler) {
+        latexCompiler.dispose();
+    }
     if (syncEngine) {
         syncEngine.disconnect();
     }

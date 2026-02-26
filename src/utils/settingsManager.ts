@@ -17,7 +17,10 @@ export interface ProjectSettings {
     mainTex?: string;
     mainPdf?: string;
     autoSync: boolean;
+    syncMode?: 'manual' | 'realtime';
     lastSynced?: string;
+    compiler?: 'auto' | 'latexmk' | 'pdflatex' | 'xelatex' | 'lualatex';
+    compileOnSave?: boolean;
 }
 
 /**
@@ -159,6 +162,7 @@ export class SettingsManager {
             mainTex: 'main.tex',
             mainPdf: 'main.pdf',
             autoSync: true,
+            syncMode: 'manual',
         };
     }
 
