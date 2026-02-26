@@ -1325,11 +1325,29 @@ export class SyncEngine {
      * Ask user how to resolve conflict
      */
     private async askConflictResolution(filePath: string, localUri: vscode.Uri, remoteContent: Uint8Array): Promise<'useRemote' | 'useLocal' | 'skip'> {
+        // In manual mode, never block — record conflict and skip
+        if (this._syncMode === 'manual') {
+            this._changeTracker.addLocalChange({
+                path: filePath,
+                type: 'modified',
+                source: 'local',
+                timestamp: Date.now(),
+            });
+            this._changeTracker.addRemoteChange({
+                path: filePath,
+                type: 'modified',
+                source: 'remote',
+                timestamp: Date.now(),
+            });
+            debugLog('askConflictResolution: manual mode — recorded conflict for', filePath);
+            return 'skip';
+        }
+
         if (this.applyToAll && this.conflictResolution !== 'ask') {
             return this.conflictResolution as 'useRemote' | 'useLocal' | 'skip';
         }
 
-        // First ask: show diff or choose action?
+        // Realtime mode: show interactive dialog
         const firstChoice = await vscode.window.showWarningMessage(
             `Conflict: "${filePath}"`,
             'Diff',
@@ -1383,120 +1401,58 @@ export class SyncEngine {
     }
 
     /**
-     * Ask user how to handle a new file from Overleaf that doesn't exist locally
+     * Handle a new file from Overleaf that doesn't exist locally.
+     * Auto-downloads without prompting.
      */
-    private async askNewRemoteFileResolution(filePath: string, remoteContent: Uint8Array): Promise<'useRemote' | 'skip'> {
-        if (this.applyToAll && this.conflictResolution !== 'ask') {
-            return this.conflictResolution === 'useRemote' ? 'useRemote' : 'skip';
-        }
-
-        const sizeStr = remoteContent.length < 1024
-            ? `${remoteContent.length} bytes`
-            : `${(remoteContent.length / 1024).toFixed(1)} KB`;
-
-        const choice = await vscode.window.showInformationMessage(
-            `New file on Overleaf: "${filePath}" (${sizeStr})`,
-            'Download',
-            'Skip',
-            'Download All New',
-            'Skip All New'
-        );
-
-        switch (choice) {
-            case 'Download':
-                return 'useRemote';
-            case 'Download All New':
-                this.conflictResolution = 'useRemote';
-                this.applyToAll = true;
-                return 'useRemote';
-            case 'Skip All New':
-                this.conflictResolution = 'skip';
-                this.applyToAll = true;
-                return 'skip';
-            default:
-                return 'skip';
-        }
+    private async askNewRemoteFileResolution(_filePath: string, _remoteContent: Uint8Array): Promise<'useRemote' | 'skip'> {
+        return 'useRemote';
     }
 
     /**
      * Handle local files that were deleted on Overleaf.
-     * These are files that exist locally, were previously synced (in baseContent),
-     * but no longer exist on Overleaf.
+     * Auto-keeps locally — the user can resolve via the Changes panel.
      */
     private async handleOrphanedLocalFiles(orphanedPaths: string[]): Promise<void> {
         if (orphanedPaths.length === 0) return;
 
-        const fileList = orphanedPaths.length <= 5
-            ? orphanedPaths.join(', ')
-            : `${orphanedPaths.slice(0, 5).join(', ')}... and ${orphanedPaths.length - 5} more`;
-
-        const choice = await vscode.window.showWarningMessage(
-            `${orphanedPaths.length} file(s) were deleted on Overleaf but exist locally: ${fileList}`,
-            { modal: false },
-            'Delete Locally',
-            'Keep Locally',
-            'Re-upload'
-        );
-
-        if (choice === 'Delete Locally') {
-            for (const path of orphanedPaths) {
-                try {
-                    const localUri = this.settings.getFilePath(path);
-                    await vscode.workspace.fs.delete(localUri, { recursive: false });
-                    this.baseContent.delete(path);
-                    this.fileCache.delete(path);
-                    this.log(`Deleted local file (removed from Overleaf): ${path}`);
-                } catch (error) {
-                    console.error(`[LocalLeaf] Failed to delete local file: ${path}`, error);
-                }
-            }
-        } else if (choice === 'Re-upload') {
-            for (const path of orphanedPaths) {
-                try {
-                    await this.uploadLocalFile(path);
-                    this.log(`Re-uploaded to Overleaf: ${path}`);
-                } catch (error) {
-                    console.error(`[LocalLeaf] Failed to re-upload: ${path}`, error);
-                }
-            }
-        } else {
-            // Keep Locally - clear from baseContent so it's not tracked as synced
-            for (const path of orphanedPaths) {
-                this.baseContent.delete(path);
-                debugLog(`Keeping local file, removed from sync tracking: ${path}`);
-            }
+        // Auto-keep: just clear from sync tracking so they aren't flagged again
+        for (const p of orphanedPaths) {
+            this.baseContent.delete(p);
+            debugLog(`Keeping local file (deleted on Overleaf): ${p}`);
         }
+        this.log(`${orphanedPaths.length} file(s) deleted on Overleaf, kept locally`);
     }
 
     /**
      * Handle files that exist only locally (not on Overleaf, never synced).
-     * These could be new files the user wants to upload or files to ignore.
+     * Records them as outgoing changes so the user can push when ready.
      */
     private async handleLocalOnlyFiles(localOnlyPaths: string[]): Promise<void> {
         if (localOnlyPaths.length === 0) return;
 
-        const fileList = localOnlyPaths.length <= 5
-            ? localOnlyPaths.join(', ')
-            : `${localOnlyPaths.slice(0, 5).join(', ')}... and ${localOnlyPaths.length - 5} more`;
+        // In manual mode, record as outgoing changes
+        if (this._syncMode === 'manual') {
+            for (const p of localOnlyPaths) {
+                this._changeTracker.addLocalChange({
+                    path: p,
+                    type: 'created',
+                    source: 'local',
+                    timestamp: Date.now(),
+                });
+            }
+            this.log(`${localOnlyPaths.length} local-only file(s) marked as outgoing`);
+            return;
+        }
 
-        const choice = await vscode.window.showInformationMessage(
-            `${localOnlyPaths.length} local file(s) not on Overleaf: ${fileList}`,
-            { modal: false },
-            'Upload All',
-            'Ignore'
-        );
-
-        if (choice === 'Upload All') {
-            for (const path of localOnlyPaths) {
-                try {
-                    await this.uploadLocalFile(path);
-                    this.log(`Uploaded new file: ${path}`);
-                } catch (error) {
-                    console.error(`[LocalLeaf] Failed to upload: ${path}`, error);
-                }
+        // In realtime mode, auto-upload
+        for (const p of localOnlyPaths) {
+            try {
+                await this.uploadLocalFile(p);
+                this.log(`Uploaded new file: ${p}`);
+            } catch (error) {
+                console.error(`[LocalLeaf] Failed to upload: ${p}`, error);
             }
         }
-        // 'Ignore' - do nothing, files stay local only
     }
 
     /**
@@ -1818,6 +1774,12 @@ export class SyncEngine {
             }
 
             await this.settings.updateLastSynced();
+
+            // In manual mode, don't clear tracker — conflicts and outgoing changes are still pending.
+            // In realtime mode, everything was applied, so clear all.
+            if (this._syncMode !== 'manual') {
+                this._changeTracker.clearAll();
+            }
 
             const message = `Pull complete: ${downloadedCount} downloaded, ${skippedCount} skipped, ${conflictCount} conflicts`;
             debugLog('pullAll:', message);

@@ -28,6 +28,9 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configurationDefaults": {
+      "workbench.view.alwaysShowHeaderActions": true
+    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -48,6 +51,12 @@
           "id": "localleaf.changesView",
           "name": "Changes",
           "when": "localleaf.isLinked"
+        },
+        {
+          "id": "localleaf.toolsView",
+          "name": "Tools",
+          "when": "localleaf.isLinked",
+          "visibility": "collapsed"
         },
         {
           "id": "localleaf.detailsView",
@@ -292,11 +301,6 @@
           "command": "localleaf.sortProjectsByAccess",
           "when": "view == localleaf.projectsView && localleaf.loggedIn",
           "group": "1_sort@3"
-        },
-        {
-          "command": "localleaf.removeComments",
-          "when": "view == localleaf.detailsView",
-          "group": "navigation@1"
         }
       ],
       "view/item/context": [

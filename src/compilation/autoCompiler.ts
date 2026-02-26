@@ -19,6 +19,9 @@ export class AutoCompiler implements vscode.Disposable {
     private _onDidCompile = new vscode.EventEmitter<CompilationResult>();
     readonly onDidCompile = this._onDidCompile.event;
 
+    private _onWillCompile = new vscode.EventEmitter<void>();
+    readonly onWillCompile = this._onWillCompile.event;
+
     constructor(private compiler: LatexCompiler) {}
 
     /**
@@ -92,6 +95,7 @@ export class AutoCompiler implements vscode.Disposable {
         }
 
         this.isCompiling = true;
+        this._onWillCompile.fire();
 
         try {
             const result = await this.compiler.compile(
@@ -113,5 +117,6 @@ export class AutoCompiler implements vscode.Disposable {
     dispose(): void {
         this.disable();
         this._onDidCompile.dispose();
+        this._onWillCompile.dispose();
     }
 }

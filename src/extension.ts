@@ -13,7 +13,7 @@ import { IgnoreParser } from './sync/ignoreParser';
 import { SyncMode } from './sync/changeTracker';
 import { CursorTracker, TrackedUser } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
-import { ProjectsProvider, ChangesProvider, DetailsProvider, syncStatusDescription } from './views/sidebarProvider';
+import { ProjectsProvider, ChangesProvider, DetailsProvider, ToolsProvider, syncStatusDescription } from './views/sidebarProvider';
 import { LatexCompiler, CompilerType, CompilationResult } from './compilation/latexCompiler';
 import * as path from 'path';
 import { AutoCompiler } from './compilation/autoCompiler';
@@ -66,6 +66,7 @@ export async function activate(context: vscode.ExtensionContext) {
     projectsProvider = new ProjectsProvider(credentialManager);
     changesProvider = new ChangesProvider();
     detailsProvider = new DetailsProvider(credentialManager);
+    const toolsProvider = new ToolsProvider();
 
     const projectsTreeView = vscode.window.createTreeView('localleaf.projectsView', {
         treeDataProvider: projectsProvider,
@@ -73,10 +74,13 @@ export async function activate(context: vscode.ExtensionContext) {
     changesTreeView = vscode.window.createTreeView('localleaf.changesView', {
         treeDataProvider: changesProvider,
     });
+    const toolsTreeView = vscode.window.createTreeView('localleaf.toolsView', {
+        treeDataProvider: toolsProvider,
+    });
     const detailsTreeView = vscode.window.createTreeView('localleaf.detailsView', {
         treeDataProvider: detailsProvider,
     });
-    context.subscriptions.push(projectsTreeView, changesTreeView, detailsTreeView);
+    context.subscriptions.push(projectsTreeView, changesTreeView, toolsTreeView, detailsTreeView);
 
     // Set context for viewsWelcome / toolbar conditionals
     const serverUrl = credentialManager.getDefaultServer();
@@ -209,10 +213,6 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     // Listen to status changes
     syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
-        // Track per-file changes in the sidebar
-        if (event.file && (event.status === 'pushing' || event.status === 'pulling')) {
-            changesProvider.addFileChange(event.file, event.status === 'pushing' ? 'push' : 'pull');
-        }
         // Handle auth errors
         if (event.authError) {
             await setAuthState('expired');
@@ -249,20 +249,23 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         // Auto-detect main document from project settings
         await syncEngine.detectMainDocument();
 
-        // Auto-pull on project load
+        // On project load: pull only in realtime mode; manual mode waits for explicit user action
         try {
-            log('Auto-pulling files from Overleaf...');
-            await syncEngine.pullAll();
-            log('Auto-pull complete');
+            if (syncMode === 'realtime') {
+                log('Auto-pulling files from Overleaf (realtime mode)...');
+                await syncEngine.pullAll();
+                log('Auto-pull complete');
+            } else {
+                log('Manual mode — skipping auto-pull (use Pull to sync)');
+            }
 
-            // Join all docs to receive real-time OT updates
+            // Join all docs to receive real-time OT updates (both modes need this for change tracking)
             await syncEngine.joinAllDocsForWatching();
             log('Watching for remote changes');
 
-            vscode.window.showInformationMessage(`LocalLeaf: Synced with "${projectSettings.projectName}"`);
+            log(`Connected to "${projectSettings.projectName}"`);
         } catch (pullError) {
-            log(`Auto-pull failed: ${pullError}`);
-            // Don't show error for auto-pull, user can manually pull
+            log(`Startup sync failed: ${pullError}`);
         }
 
         // Initialize LaTeX compiler
@@ -279,6 +282,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
             const compileOnSave = vscode.workspace.getConfiguration('localleaf').get<boolean>('compileOnSave', true);
             if (compileOnSave) {
                 autoCompiler.enable(settings.getWorkspaceFolder(), mainTex, delay);
+                autoCompiler.onWillCompile(() => handleCompilationStarted());
                 autoCompiler.onDidCompile(result => handleCompilationResult(result));
             }
         }
@@ -781,13 +785,13 @@ async function cmdSyncNow() {
     }
 
     if (syncEngine.syncMode === 'manual') {
-        // In manual mode: pull then push
+        // In manual mode: full pull (non-blocking conflicts) then push
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: 'LocalLeaf: Syncing...',
             cancellable: false,
         }, async () => {
-            await syncEngine!.pullChanges();
+            await syncEngine!.pullAll();
             await syncEngine!.pushChanges();
         });
         vscode.window.showInformationMessage('LocalLeaf: Sync complete');
@@ -812,11 +816,10 @@ async function cmdPullFromOverleaf() {
             title: 'LocalLeaf: Pulling from Overleaf...',
             cancellable: false,
         }, async () => {
-            if (syncEngine!.syncMode === 'manual') {
-                await syncEngine!.pullChanges();
-            } else {
-                await syncEngine!.pullAll();
-            }
+            // Always use pullAll for full reconciliation.
+            // In manual mode, conflicts are auto-skipped and recorded
+            // in the change tracker (no blocking popups).
+            await syncEngine!.pullAll();
         });
         vscode.window.showInformationMessage('LocalLeaf: Pull complete');
     } catch (error) {
@@ -1028,10 +1031,6 @@ async function cmdReconnect() {
 
     syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
-        // Track per-file changes in the sidebar
-        if (event.file && (event.status === 'pushing' || event.status === 'pulling')) {
-            changesProvider.addFileChange(event.file, event.status === 'pushing' ? 'push' : 'pull');
-        }
         // Handle auth errors
         if (event.authError) {
             await setAuthState('expired');
@@ -1052,7 +1051,11 @@ async function cmdReconnect() {
         startStatusUpdates();
         log('Reconnected to Overleaf');
 
-        await syncEngine.pullAll();
+        // Only auto-pull in realtime mode; manual mode waits for explicit user action
+        if (syncMode === 'realtime') {
+            await syncEngine.pullAll();
+        }
+        await syncEngine.joinAllDocsForWatching();
         vscode.window.showInformationMessage(`LocalLeaf: Reconnected to "${projectSettings.projectName}"`);
     } catch (error) {
         log(`Failed to reconnect: ${error}`);
@@ -1467,10 +1470,32 @@ async function cmdCompileLaTeX() {
     });
 }
 
+/** Resolve function for the current compilation progress notification */
+let compilingProgressResolve: (() => void) | undefined;
+
+function handleCompilationStarted() {
+    // If a previous progress notification is still open, close it
+    compilingProgressResolve?.();
+    compilingProgressResolve = undefined;
+
+    // Show bottom-right progress notification
+    vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'LaTeX: Compiling...',
+        cancellable: false,
+    }, () => new Promise<void>(resolve => {
+        compilingProgressResolve = resolve;
+    }));
+}
+
 function handleCompilationResult(result: CompilationResult) {
+    // Close the "Compiling..." progress notification
+    compilingProgressResolve?.();
+    compilingProgressResolve = undefined;
+
     if (result.success) {
         const duration = (result.duration / 1000).toFixed(1);
-        vscode.window.showInformationMessage(`LocalLeaf: Compilation successful (${duration}s)`);
+        vscode.window.showInformationMessage(`LaTeX: Compiled successfully (${duration}s)`);
 
         // Auto-open / refresh PDF preview
         if (result.pdfPath) {
@@ -1479,14 +1504,9 @@ function handleCompilationResult(result: CompilationResult) {
     } else {
         const errorCount = result.errors.length;
         const warningCount = result.warnings.length;
-        vscode.window.showErrorMessage(
-            `LocalLeaf: Compilation failed (${errorCount} error(s), ${warningCount} warning(s))`,
-            'Show Problems'
-        ).then(choice => {
-            if (choice === 'Show Problems') {
-                vscode.commands.executeCommand('workbench.action.problems.focus');
-            }
-        });
+        vscode.window.showWarningMessage(
+            `LaTeX: Compilation failed (${errorCount} error(s), ${warningCount} warning(s))`
+        );
     }
 
     log(`Compilation ${result.success ? 'succeeded' : 'failed'} in ${result.duration}ms`);
@@ -1568,11 +1588,12 @@ async function cmdToggleAutoCompile() {
         const mainTex = settings.mainTex || 'main.tex';
         const delay = config.get<number>('compileDelay', 1500);
         autoCompiler.enable(settingsManager.getWorkspaceFolder(), mainTex, delay);
+        autoCompiler.onWillCompile(() => handleCompilationStarted());
         autoCompiler.onDidCompile(result => handleCompilationResult(result));
-        vscode.window.showInformationMessage('LocalLeaf: Auto-compile enabled');
+        vscode.window.setStatusBarMessage('$(check) Auto-compile enabled', 3000);
     } else {
         autoCompiler?.disable();
-        vscode.window.showInformationMessage('LocalLeaf: Auto-compile disabled');
+        vscode.window.setStatusBarMessage('$(x) Auto-compile disabled', 3000);
     }
 
     detailsProvider.refresh();

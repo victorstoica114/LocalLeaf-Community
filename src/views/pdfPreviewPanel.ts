@@ -184,12 +184,13 @@ export class PdfPreviewPanel {
             const uri = vscode.Uri.file(filePath);
             const doc = await vscode.workspace.openTextDocument(uri);
             const pos = new vscode.Position(Math.max(0, line - 1), column);
+            // preserveFocus: true keeps the PDF panel focused so
+            // subsequent double-clicks continue to work immediately
             const editor = await vscode.window.showTextDocument(doc, {
                 viewColumn: vscode.ViewColumn.One,
                 selection: new vscode.Range(pos, pos),
-                preserveFocus: false,
+                preserveFocus: true,
             });
-            // Reveal the line at centre of editor
             editor.revealRange(
                 new vscode.Range(pos, pos),
                 vscode.TextEditorRevealType.InCenter

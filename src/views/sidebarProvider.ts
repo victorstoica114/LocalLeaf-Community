@@ -15,16 +15,6 @@ import { COMMANDS } from '../consts';
 import { SyncStatus } from '../sync/syncEngine';
 import { ChangeTracker, PendingChange, SyncMode } from '../sync/changeTracker';
 
-// ── Changed file tracking ──────────────────────────────────────────
-
-export type ChangeDirection = 'push' | 'pull';
-
-export interface FileChange {
-    path: string;
-    direction: ChangeDirection;
-    timestamp: number;
-}
-
 // ── Projects Provider (not-linked state, with sort/filter) ──────────
 
 export type ProjectSortField = 'name' | 'lastUpdated' | 'accessLevel';
@@ -150,20 +140,20 @@ export class ProjectsProvider implements vscode.TreeDataProvider<SidebarItem> {
 
 // ── Changes Provider (linked state — grouped tree) ──────────────────
 
-const MAX_RECENT_CHANGES = 50;
-
 /** Group node IDs for the tree */
-type GroupId = 'conflicts' | 'incoming' | 'outgoing' | 'activity' | 'realtime-status';
+type GroupId = 'conflicts' | 'incoming' | 'outgoing' | 'alerts';
 
 export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
     private _onDidChangeTreeData = new vscode.EventEmitter<void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-    private recentChanges: FileChange[] = [];
     private syncStatus: SyncStatus = 'disconnected';
     private changeTracker?: ChangeTracker;
     private syncMode: SyncMode = 'manual';
     private trackerDisposable?: vscode.Disposable;
+
+    /** Non-blocking alert messages (shown in the sidebar instead of popups) */
+    private alerts: { message: string; icon: string }[] = [];
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -183,23 +173,21 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
         this.refresh();
     }
 
-    /** Record a file that was just pushed or pulled (for activity log). */
-    addFileChange(path: string, direction: ChangeDirection): void {
-        const existing = this.recentChanges.findIndex(
-            c => c.path === path && c.direction === direction,
-        );
-        if (existing !== -1) {
-            this.recentChanges.splice(existing, 1);
+    /** Show an alert in the sidebar panel instead of a popup */
+    addAlert(message: string, icon: string = 'info'): void {
+        // Avoid duplicates
+        if (!this.alerts.some(a => a.message === message)) {
+            this.alerts.push({ message, icon });
+            this.refresh();
         }
-        this.recentChanges.unshift({ path, direction, timestamp: Date.now() });
-        if (this.recentChanges.length > MAX_RECENT_CHANGES) {
-            this.recentChanges.length = MAX_RECENT_CHANGES;
-        }
+    }
+
+    clearAlerts(): void {
+        this.alerts = [];
         this.refresh();
     }
 
     clearChanges(): void {
-        this.recentChanges = [];
         this.changeTracker?.clearAll();
         this.refresh();
     }
@@ -213,12 +201,10 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
     }
 
     async getChildren(element?: SidebarItem): Promise<SidebarItem[]> {
-        // Root level: return group nodes
         if (!element) {
             return this.getRootNodes();
         }
 
-        // Child level: return items for the group
         const groupId = element.groupId as GroupId;
         if (!groupId) return [];
 
@@ -229,8 +215,8 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
                 return this.getIncomingItems();
             case 'outgoing':
                 return this.getOutgoingItems();
-            case 'activity':
-                return this.getActivityItems();
+            case 'alerts':
+                return this.getAlertItems();
             default:
                 return [];
         }
@@ -240,26 +226,15 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
         const nodes: SidebarItem[] = [];
 
         if (this.syncMode === 'realtime') {
-            // Realtime mode: show status + activity
             nodes.push(new SidebarItem('Real-time sync active', {
                 icon: 'zap',
                 description: '',
                 collapsibleState: vscode.TreeItemCollapsibleState.None,
             }));
-
-            if (this.recentChanges.length > 0) {
-                const activityNode = new SidebarItem(`Recent Activity (${this.recentChanges.length})`, {
-                    icon: 'history',
-                    collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
-                });
-                activityNode.groupId = 'activity';
-                nodes.push(activityNode);
-            }
-
             return nodes;
         }
 
-        // Manual mode: show conflicts, incoming, outgoing, activity
+        // Manual mode: show conflicts, incoming, outgoing
         if (this.changeTracker) {
             const conflictCount = this.changeTracker.getConflictCount();
             const remoteCount = this.changeTracker.getRemoteChangeCount() - conflictCount;
@@ -275,7 +250,7 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
             }
 
             if (remoteCount > 0) {
-                const incomingNode = new SidebarItem(`Incoming Changes (${remoteCount})`, {
+                const incomingNode = new SidebarItem(`Remote Changes (${remoteCount})`, {
                     icon: 'cloud-download',
                     collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
                 });
@@ -284,7 +259,7 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
             }
 
             if (localCount > 0) {
-                const outgoingNode = new SidebarItem(`Outgoing Changes (${localCount})`, {
+                const outgoingNode = new SidebarItem(`Local Changes (${localCount})`, {
                     icon: 'cloud-upload',
                     collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
                 });
@@ -293,16 +268,14 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
             }
         }
 
-        if (this.recentChanges.length > 0) {
-            const hasChanges = nodes.length > 0;
-            const activityNode = new SidebarItem(`Recent Activity (${this.recentChanges.length})`, {
-                icon: 'history',
-                collapsibleState: hasChanges
-                    ? vscode.TreeItemCollapsibleState.Collapsed
-                    : vscode.TreeItemCollapsibleState.Expanded,
+        // Alerts section (replaces right-bottom popups)
+        if (this.alerts.length > 0) {
+            const alertNode = new SidebarItem(`Alerts (${this.alerts.length})`, {
+                icon: 'bell',
+                collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
             });
-            activityNode.groupId = 'activity';
-            nodes.push(activityNode);
+            alertNode.groupId = 'alerts';
+            nodes.push(alertNode);
         }
 
         return nodes;
@@ -374,22 +347,11 @@ export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
             });
     }
 
-    private getActivityItems(): SidebarItem[] {
-        return this.recentChanges.map(c => {
-            const isPush = c.direction === 'push';
-            const icon = isPush ? 'cloud-upload' : 'cloud-download';
-            const dirLabel = isPush ? 'pushed' : 'pulled';
-            const ago = formatTimeAgo(c.timestamp);
-
-            return new SidebarItem(displayPath(c.path), {
-                icon,
-                description: ago,
-                tooltip: `${c.path}\n${dirLabel} ${ago}`,
-                command: {
-                    command: 'vscode.open',
-                    title: 'Open File',
-                    arguments: [fileUri(c.path)],
-                },
+    private getAlertItems(): SidebarItem[] {
+        return this.alerts.map(a => {
+            return new SidebarItem(a.message, {
+                icon: a.icon,
+                collapsibleState: vscode.TreeItemCollapsibleState.None,
             });
         });
     }
@@ -471,6 +433,36 @@ export class DetailsProvider implements vscode.TreeDataProvider<SidebarItem> {
         }
 
         return items;
+    }
+}
+
+// ── Tools Provider ────────────────────────────────────────────────
+
+export class ToolsProvider implements vscode.TreeDataProvider<SidebarItem> {
+    private _onDidChangeTreeData = new vscode.EventEmitter<void>();
+    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+    refresh(): void {
+        this._onDidChangeTreeData.fire();
+    }
+
+    getTreeItem(element: SidebarItem): vscode.TreeItem {
+        return element;
+    }
+
+    async getChildren(element?: SidebarItem): Promise<SidebarItem[]> {
+        if (element) { return []; }
+
+        return [
+            new SidebarItem('Remove LaTeX Comments', {
+                icon: 'comment-unresolved',
+                description: 'Strip % comments from .tex files',
+                command: {
+                    command: COMMANDS.REMOVE_COMMENTS,
+                    title: 'Remove LaTeX Comments',
+                },
+            }),
+        ];
     }
 }
 

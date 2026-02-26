@@ -6,7 +6,8 @@
       "Bash(git status:*)",
       "Bash(npm install:*)",
       "Bash(where synctex:*)",
-      "Bash(synctex help:*)"
+      "Bash(synctex help:*)",
+      "Bash(node:*)"
     ]
   }
 }
