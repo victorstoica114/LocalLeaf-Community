@@ -1505,7 +1505,8 @@ function handleCompilationResult(result: CompilationResult) {
 
         // Auto-open / refresh PDF preview
         if (result.pdfPath) {
-            PdfPreviewPanel.createOrShow(extensionContext.extensionUri, result.pdfPath);
+            const workspacePath = SettingsManager.getCurrentInstance()?.getWorkspaceFolder().fsPath;
+            PdfPreviewPanel.createOrShow(extensionContext.extensionUri, result.pdfPath, workspacePath);
         }
     } else {
         const errorCount = result.errors.length;

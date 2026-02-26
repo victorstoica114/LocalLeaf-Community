@@ -180,7 +180,13 @@ document.getElementById('fit-width').addEventListener('click', async function ()
 // ─── Double-click → SyncTeX inverse search ───────────────────────
 
 viewer.addEventListener('dblclick', function (e) {
-    var pageDiv = e.target.closest('.pdf-page');
+    var target = e.target;
+    var targetElement = target instanceof Element
+        ? target
+        : (target instanceof Node ? target.parentElement : null);
+    if (!targetElement) return;
+
+    var pageDiv = targetElement.closest('.pdf-page');
     if (!pageDiv) return;
 
     var pageNumber = parseInt(pageDiv.dataset.pageNum, 10);

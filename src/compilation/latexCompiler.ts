@@ -27,6 +27,7 @@ export interface CompilationError {
     file: string;
     line: number;
     message: string;
+    severity?: 'error' | 'warning';
 }
 
 export class LatexCompiler implements vscode.Disposable {
@@ -214,13 +215,16 @@ export class LatexCompiler implements vscode.Disposable {
                         return;
                     }
 
-                    // Update VS Code diagnostics
-                    this.updateDiagnostics(actuallySucceeded ? [] : errors, workspaceFolder);
+                    // Update VS Code diagnostics — always show all errors + warnings
+                    this.updateDiagnostics(errors, workspaceFolder);
+
+                    // Only report hard errors (not warnings) as compilation errors
+                    const hardErrors = errors.filter(e => e.severity !== 'warning');
 
                     resolve({
                         success: actuallySucceeded,
                         pdfPath: pdfExists ? pdfPath : undefined,
-                        errors: actuallySucceeded ? [] : errors,
+                        errors: actuallySucceeded ? [] : hardErrors,
                         warnings,
                         duration,
                     });
@@ -299,14 +303,13 @@ export class LatexCompiler implements vscode.Disposable {
                 const fileLineMatch = line.match(/^\.\/(.+?):(\d+):\s*(.+)/);
                 if (fileLineMatch) {
                     const [, file, lineStr, message] = fileLineMatch;
+                    const resolvedFile = path.isAbsolute(file) ? path.relative(workspaceFolder, file) : file;
+                    const lineNum = parseInt(lineStr, 10);
                     if (message.toLowerCase().startsWith('warning')) {
                         warnings.push(`${file}:${lineStr}: ${message}`);
+                        errors.push({ file: resolvedFile, line: lineNum, message: message.trim(), severity: 'warning' });
                     } else {
-                        errors.push({
-                            file: path.isAbsolute(file) ? path.relative(workspaceFolder, file) : file,
-                            line: parseInt(lineStr, 10),
-                            message: message.trim(),
-                        });
+                        errors.push({ file: resolvedFile, line: lineNum, message: message.trim(), severity: 'error' });
                     }
                     continue;
                 }
@@ -324,24 +327,37 @@ export class LatexCompiler implements vscode.Disposable {
                             break;
                         }
                     }
-                    errors.push({
-                        file: currentFile || 'unknown',
-                        line: errorLine,
-                        message: message.trim(),
-                    });
+                    errors.push({ file: currentFile || 'unknown', line: errorLine, message: message.trim(), severity: 'error' });
                     continue;
                 }
 
-                // Match LaTeX/Package Warning patterns
-                const warningMatch = line.match(/^(?:LaTeX|Package \w+) Warning:\s*(.+)/);
+                // Match LaTeX/Package Warning with line number: "on input line 42"
+                const warningMatch = line.match(/^((?:LaTeX|Package \w+) Warning:\s*.+)/);
                 if (warningMatch) {
-                    warnings.push(warningMatch[1]);
+                    let warnMsg = warningMatch[1];
+                    // Collect continuation lines (indented or starting with whitespace)
+                    for (let j = i + 1; j < lines.length; j++) {
+                        if (lines[j].match(/^\s+\S/) || lines[j].match(/^\(/) ) {
+                            warnMsg += ' ' + lines[j].trim();
+                        } else {
+                            break;
+                        }
+                    }
+                    const lineNumMatch = warnMsg.match(/on input line (\d+)/);
+                    const warnLine = lineNumMatch ? parseInt(lineNumMatch[1], 10) : 0;
+                    warnings.push(warnMsg);
+                    errors.push({ file: currentFile || 'unknown', line: warnLine, message: warnMsg.trim(), severity: 'warning' });
+                    continue;
                 }
 
-                // Match Overfull/Underfull box warnings
+                // Match Overfull/Underfull box warnings (with optional line number)
                 const boxMatch = line.match(/^((?:Over|Under)full \\[hv]box .+)/);
                 if (boxMatch) {
-                    warnings.push(boxMatch[1]);
+                    const boxMsg = boxMatch[1];
+                    const boxLineMatch = boxMsg.match(/at lines? (\d+)/);
+                    const boxLine = boxLineMatch ? parseInt(boxLineMatch[1], 10) : 0;
+                    warnings.push(boxMsg);
+                    errors.push({ file: currentFile || 'unknown', line: boxLine, message: boxMsg.trim(), severity: 'warning' });
                 }
             }
         } catch {
@@ -368,7 +384,10 @@ export class LatexCompiler implements vscode.Disposable {
 
             const line = Math.max(0, error.line - 1);
             const range = new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER);
-            const diagnostic = new vscode.Diagnostic(range, error.message, vscode.DiagnosticSeverity.Error);
+            const severity = error.severity === 'warning'
+                ? vscode.DiagnosticSeverity.Warning
+                : vscode.DiagnosticSeverity.Error;
+            const diagnostic = new vscode.Diagnostic(range, error.message, severity);
             diagnostic.source = 'LocalLeaf LaTeX';
             diagnosticMap.get(uri)!.push(diagnostic);
         }

@@ -163,13 +163,21 @@ export class PdfPreviewPanel {
             if (l.startsWith('Input:')) {
                 file = l.substring('Input:'.length);
             } else if (l.startsWith('Line:')) {
-                line = parseInt(l.substring('Line:'.length), 10) || 0;
+                const parsedLine = parseInt(l.substring('Line:'.length), 10);
+                if (!Number.isNaN(parsedLine)) {
+                    line = parsedLine;
+                }
             } else if (l.startsWith('Column:')) {
-                column = parseInt(l.substring('Column:'.length), 10) || 0;
+                const parsedColumn = parseInt(l.substring('Column:'.length), 10);
+                if (!Number.isNaN(parsedColumn)) {
+                    column = parsedColumn;
+                }
             }
         }
 
         if (!file || line <= 0) return null;
+        file = file.trim().replace(/^"(.*)"$/, '$1');
+        column = Math.max(0, column);
 
         // Resolve relative paths against workspace
         if (!path.isAbsolute(file)) {
@@ -183,7 +191,10 @@ export class PdfPreviewPanel {
         try {
             const uri = vscode.Uri.file(filePath);
             const doc = await vscode.workspace.openTextDocument(uri);
-            const pos = new vscode.Position(Math.max(0, line - 1), column);
+            const safeLine = Math.max(0, line - 1);
+            // SyncTeX may return -1 when a precise column is unavailable.
+            const safeColumn = Math.max(0, column);
+            const pos = new vscode.Position(safeLine, safeColumn);
             // preserveFocus: true keeps the PDF panel focused so
             // subsequent double-clicks continue to work immediately
             const editor = await vscode.window.showTextDocument(doc, {
