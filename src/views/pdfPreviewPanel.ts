@@ -270,6 +270,14 @@ export class PdfPreviewPanel {
 </html>`;
     }
 
+    /**
+     * Show/hide compiling indicator on the tab title
+     */
+    static setCompiling(compiling: boolean): void {
+        if (!PdfPreviewPanel.instance) return;
+        PdfPreviewPanel.instance.panel.title = compiling ? '⟳ Compiling...' : 'PDF Preview';
+    }
+
     dispose(): void {
         PdfPreviewPanel.instance = undefined;
         this.panel.dispose();

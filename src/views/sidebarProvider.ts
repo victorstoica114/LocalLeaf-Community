@@ -471,12 +471,12 @@ export class ToolsProvider implements vscode.TreeDataProvider<SidebarItem> {
 /** Build a sync-status description string for the view title. */
 export function syncStatusDescription(status: SyncStatus, lastSynced?: string): string {
     const icon: Record<SyncStatus, string> = {
-        idle: '$(check)',
-        syncing: '$(sync~spin)',
-        pulling: '$(cloud-download)',
-        pushing: '$(cloud-upload)',
-        error: '$(warning)',
-        disconnected: '$(cloud-offline)',
+        idle: '✓',
+        syncing: '⟳',
+        pulling: '↓',
+        pushing: '↑',
+        error: '⚠',
+        disconnected: '✕',
     };
     const label: Record<SyncStatus, string> = {
         idle: 'Up to date',

@@ -1478,6 +1478,9 @@ function handleCompilationStarted() {
     compilingProgressResolve?.();
     compilingProgressResolve = undefined;
 
+    // Update PDF preview tab title
+    PdfPreviewPanel.setCompiling(true);
+
     // Show bottom-right progress notification
     vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
@@ -1492,6 +1495,9 @@ function handleCompilationResult(result: CompilationResult) {
     // Close the "Compiling..." progress notification
     compilingProgressResolve?.();
     compilingProgressResolve = undefined;
+
+    // Restore PDF preview tab title
+    PdfPreviewPanel.setCompiling(false);
 
     if (result.success) {
         const duration = (result.duration / 1000).toFixed(1);
