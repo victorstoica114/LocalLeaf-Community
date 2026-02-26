@@ -68,4 +68,5 @@ export const COMMANDS = {
     JUMP_TO_COLLABORATOR: 'localleaf.jumpToCollaborator',
     VERIFY_CREDENTIALS: 'localleaf.verifyCredentials',
     REFRESH_COOKIE: 'localleaf.refreshCookie',
+    OPEN_PROJECT: 'localleaf.openProject',
 } as const;

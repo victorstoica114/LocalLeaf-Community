@@ -12,6 +12,7 @@ import { SyncEngine, SyncStatus } from './sync/syncEngine';
 import { IgnoreParser } from './sync/ignoreParser';
 import { CursorTracker, TrackedUser } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
+import { ProjectsProvider, ChangesProvider, DetailsProvider, syncStatusDescription } from './views/sidebarProvider';
 
 /**
  * Auth state type
@@ -30,6 +31,10 @@ let collaboratorStatusItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
 let authState: AuthState = 'none';
+let projectsProvider: ProjectsProvider;
+let changesProvider: ChangesProvider;
+let detailsProvider: DetailsProvider;
+let changesTreeView: vscode.TreeView<any>;
 
 /**
  * Extension activation
@@ -46,6 +51,31 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize credential manager
     credentialManager = CredentialManager.initialize(context);
+
+    // Initialize sidebar providers
+    projectsProvider = new ProjectsProvider(credentialManager);
+    changesProvider = new ChangesProvider();
+    detailsProvider = new DetailsProvider(credentialManager);
+
+    const projectsTreeView = vscode.window.createTreeView('localleaf.projectsView', {
+        treeDataProvider: projectsProvider,
+    });
+    changesTreeView = vscode.window.createTreeView('localleaf.changesView', {
+        treeDataProvider: changesProvider,
+    });
+    const detailsTreeView = vscode.window.createTreeView('localleaf.detailsView', {
+        treeDataProvider: detailsProvider,
+    });
+    context.subscriptions.push(projectsTreeView, changesTreeView, detailsTreeView);
+
+    // Set context for viewsWelcome / toolbar conditionals
+    const serverUrl = credentialManager.getDefaultServer();
+    const hasCredential = !!(await credentialManager.getCredential(serverUrl));
+    await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', hasCredential);
+
+    const initSettingsManager = SettingsManager.getCurrentInstance();
+    const isInitLinked = initSettingsManager && await initSettingsManager.isLinked();
+    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', !!isInitLinked);
 
     // Create status bar items
     // Sync status (left side)
@@ -121,6 +151,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
         vscode.commands.registerCommand(COMMANDS.VERIFY_CREDENTIALS, cmdVerifyCredentials),
         vscode.commands.registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
+        vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: ProjectInfo) => cmdOpenProject(context, project)),
     );
 }
 
@@ -149,6 +180,10 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     // Listen to status changes
     syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
+        // Track per-file changes in the sidebar
+        if (event.file && (event.status === 'pushing' || event.status === 'pulling')) {
+            changesProvider.addFileChange(event.file, event.status === 'pushing' ? 'push' : 'pull');
+        }
         // Handle auth errors
         if (event.authError) {
             await setAuthState('expired');
@@ -201,6 +236,16 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
  * Update sync status bar
  */
 function updateStatusBar(status: SyncStatus, message?: string) {
+    if (changesProvider) {
+        changesProvider.setSyncStatus(status);
+    }
+    // Update changes view title with sync status
+    if (changesTreeView) {
+        const settingsManager = SettingsManager.getCurrentInstance();
+        const lastSynced = settingsManager?.getSettings()?.lastSynced;
+        changesTreeView.description = syncStatusDescription(status, lastSynced);
+    }
+
     const icons: Record<SyncStatus, string> = {
         idle: '$(cloud)',
         syncing: '$(sync~spin)',
@@ -404,6 +449,15 @@ function log(message: string) {
     outputChannel.appendLine(`[${timestamp}] ${message}`);
 }
 
+/**
+ * Refresh all sidebar providers
+ */
+function refreshSidebar(): void {
+    projectsProvider.refresh();
+    changesProvider.refresh();
+    detailsProvider.refresh();
+}
+
 // === Command Implementations ===
 
 /**
@@ -456,6 +510,8 @@ async function cmdLogin() {
             };
             await credentialManager.storeCredential(credential);
             await setAuthState('valid');
+            await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', true);
+            refreshSidebar();
             vscode.window.showInformationMessage(`LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
         } else {
             vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${result.message}`);
@@ -488,6 +544,8 @@ async function cmdLogin() {
             };
             await credentialManager.storeCredential(credential);
             await setAuthState('valid');
+            await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', true);
+            refreshSidebar();
             vscode.window.showInformationMessage(`LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
         } else {
             vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${result.message}`);
@@ -523,6 +581,8 @@ async function cmdLogout() {
 
     updateStatusBar('disconnected', 'Logged out');
     await updateLoginStatus();
+    await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', false);
+    refreshSidebar();
     vscode.window.showInformationMessage('LocalLeaf: Logged out');
 }
 
@@ -591,6 +651,8 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
     // Show status bars now that we're linked
     statusBarItem.show();
     await updateLoginStatus();
+    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
+    refreshSidebar();
 
     // Initialize sync (this will auto-pull)
     await initializeSync(context, settingsManager);
@@ -629,6 +691,9 @@ async function cmdUnlinkFolder() {
     await settingsManager.delete();
 
     updateStatusBar('disconnected');
+    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', false);
+    changesProvider.clearChanges();
+    refreshSidebar();
     vscode.window.showInformationMessage('LocalLeaf: Folder unlinked');
 }
 
@@ -851,6 +916,10 @@ async function cmdReconnect() {
 
     syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
+        // Track per-file changes in the sidebar
+        if (event.file && (event.status === 'pushing' || event.status === 'pulling')) {
+            changesProvider.addFileChange(event.file, event.status === 'pushing' ? 'push' : 'pull');
+        }
         // Handle auth errors
         if (event.authError) {
             await setAuthState('expired');
@@ -1029,6 +1098,8 @@ async function cmdRefreshCookie() {
         };
         await credentialManager.storeCredential(credential);
         await setAuthState('valid');
+        await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', true);
+        refreshSidebar();
 
         vscode.window.showInformationMessage(
             `LocalLeaf: Session refreshed for ${result.userInfo.userEmail}`
@@ -1039,6 +1110,46 @@ async function cmdRefreshCookie() {
     } else {
         vscode.window.showErrorMessage(`LocalLeaf: Cookie validation failed - ${result.message}`);
     }
+}
+
+/**
+ * Open a project from the sidebar (link + download)
+ */
+async function cmdOpenProject(context: vscode.ExtensionContext, project: ProjectInfo) {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!workspaceFolder) {
+        vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+        return;
+    }
+
+    const serverUrl = credentialManager.getDefaultServer();
+    const credential = await credentialManager.getCredential(serverUrl);
+    if (!credential) {
+        vscode.window.showWarningMessage('LocalLeaf: Please login first');
+        return;
+    }
+
+    // Create settings
+    const settingsManager = SettingsManager.getInstance(workspaceFolder);
+    const settings = SettingsManager.createDefaultSettings(serverUrl, project.id, project.name);
+    await settingsManager.save(settings);
+
+    // Create default .leafignore
+    const ignoreParser = new IgnoreParser(workspaceFolder);
+    if (!(await ignoreParser.exists())) {
+        await ignoreParser.createDefault();
+    }
+
+    vscode.window.showInformationMessage(`LocalLeaf: Linked to "${project.name}"`);
+
+    // Show status bars now that we're linked
+    statusBarItem.show();
+    await updateLoginStatus();
+    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
+    refreshSidebar();
+
+    // Initialize sync (this will auto-pull)
+    await initializeSync(context, settingsManager);
 }
 
 /**

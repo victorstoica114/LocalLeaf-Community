@@ -23,10 +23,52 @@
     "tex"
   ],
   "activationEvents": [
-    "workspaceContains:.localleaf"
+    "workspaceContains:.localleaf",
+    "onView:localleaf.projectsView"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localleaf",
+          "title": "LocalLeaf",
+          "icon": "images/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "localleaf": [
+        {
+          "id": "localleaf.projectsView",
+          "name": "Projects",
+          "when": "!localleaf.isLinked"
+        },
+        {
+          "id": "localleaf.changesView",
+          "name": "Changes",
+          "when": "localleaf.isLinked"
+        },
+        {
+          "id": "localleaf.detailsView",
+          "name": "Details",
+          "when": "localleaf.isLinked",
+          "visibility": "collapsed"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "localleaf.projectsView",
+        "contents": "Login to Overleaf to see your projects.\n[Login to Overleaf](command:localleaf.login)",
+        "when": "!localleaf.loggedIn"
+      },
+      {
+        "view": "localleaf.changesView",
+        "contents": "No file changes yet.\nChanges will appear here as files are synced.",
+        "when": "localleaf.isLinked"
+      }
+    ],
     "commands": [
       {
         "command": "localleaf.login",
@@ -34,7 +76,8 @@
       },
       {
         "command": "localleaf.logout",
-        "title": "LocalLeaf: Logout"
+        "title": "LocalLeaf: Logout",
+        "icon": "$(sign-out)"
       },
       {
         "command": "localleaf.linkFolder",
@@ -42,23 +85,28 @@
       },
       {
         "command": "localleaf.unlinkFolder",
-        "title": "LocalLeaf: Unlink Folder"
+        "title": "LocalLeaf: Unlink Folder",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "localleaf.syncNow",
-        "title": "LocalLeaf: Sync Now"
+        "title": "LocalLeaf: Sync Now",
+        "icon": "$(sync)"
       },
       {
         "command": "localleaf.pullFromOverleaf",
-        "title": "LocalLeaf: Pull from Overleaf"
+        "title": "LocalLeaf: Pull from Overleaf",
+        "icon": "$(cloud-download)"
       },
       {
         "command": "localleaf.pushToOverleaf",
-        "title": "LocalLeaf: Push to Overleaf"
+        "title": "LocalLeaf: Push to Overleaf",
+        "icon": "$(cloud-upload)"
       },
       {
         "command": "localleaf.editIgnorePatterns",
-        "title": "LocalLeaf: Edit Ignore Patterns"
+        "title": "LocalLeaf: Edit Ignore Patterns",
+        "icon": "$(list-filter)"
       },
       {
         "command": "localleaf.showSyncStatus",
@@ -83,8 +131,51 @@
       {
         "command": "localleaf.refreshCookie",
         "title": "LocalLeaf: Refresh Cookie"
+      },
+      {
+        "command": "localleaf.openProject",
+        "title": "LocalLeaf: Open Project"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "localleaf.syncNow",
+          "when": "view == localleaf.changesView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "localleaf.pullFromOverleaf",
+          "when": "view == localleaf.changesView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "localleaf.pushToOverleaf",
+          "when": "view == localleaf.changesView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "localleaf.editIgnorePatterns",
+          "when": "view == localleaf.changesView",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "localleaf.unlinkFolder",
+          "when": "view == localleaf.changesView",
+          "group": "2_manage@1"
+        },
+        {
+          "command": "localleaf.logout",
+          "when": "view == localleaf.changesView && localleaf.loggedIn",
+          "group": "2_manage@2"
+        },
+        {
+          "command": "localleaf.logout",
+          "when": "view == localleaf.projectsView && localleaf.loggedIn",
+          "group": "2_manage@1"
+        }
+      ]
+    },
     "configuration": {
       "title": "LocalLeaf",
       "properties": {
