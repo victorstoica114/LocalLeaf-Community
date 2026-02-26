@@ -152,6 +152,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.VERIFY_CREDENTIALS, cmdVerifyCredentials),
         vscode.commands.registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
         vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: ProjectInfo) => cmdOpenProject(context, project)),
+        vscode.commands.registerCommand(COMMANDS.REMOVE_COMMENTS, cmdRemoveComments),
     );
 }
 
@@ -1110,6 +1111,158 @@ async function cmdRefreshCookie() {
     } else {
         vscode.window.showErrorMessage(`LocalLeaf: Cookie validation failed - ${result.message}`);
     }
+}
+
+/**
+ * Remove LaTeX comments from all .tex files in the workspace
+ */
+async function cmdRemoveComments() {
+    try {
+        log('Remove Comments: starting...');
+
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+            return;
+        }
+
+        // Find all .tex files
+        log('Remove Comments: scanning for .tex files...');
+        const texFiles = await vscode.workspace.findFiles(
+            new vscode.RelativePattern(workspaceFolder, '**/*.tex'),
+            new vscode.RelativePattern(workspaceFolder, '.localleaf/**'),
+        );
+        log(`Remove Comments: found ${texFiles.length} .tex files`);
+
+        if (texFiles.length === 0) {
+            vscode.window.showInformationMessage('LocalLeaf: No .tex files found in workspace');
+            return;
+        }
+
+        // Dry-run: count how many comment lines would be removed
+        let totalCommentLines = 0;
+        const fileSummaries: { uri: vscode.Uri; name: string; commentLines: number }[] = [];
+
+        for (const uri of texFiles) {
+            const bytes = await vscode.workspace.fs.readFile(uri);
+            const content = new TextDecoder().decode(bytes);
+            const commentLines = countCommentLines(content);
+            if (commentLines > 0) {
+                const relativePath = vscode.workspace.asRelativePath(uri);
+                fileSummaries.push({ uri, name: relativePath, commentLines });
+                totalCommentLines += commentLines;
+            }
+        }
+
+        log(`Remove Comments: ${totalCommentLines} comment lines in ${fileSummaries.length} files`);
+
+        if (totalCommentLines === 0) {
+            vscode.window.showInformationMessage('LocalLeaf: No comments found in any .tex files');
+            return;
+        }
+
+        // Confirmation dialog
+        const fileList = fileSummaries.map(f => `${f.name}: ${f.commentLines} lines`).join('\n');
+        const confirm = await vscode.window.showWarningMessage(
+            `Remove ${totalCommentLines} comment lines from ${fileSummaries.length} file(s)?`,
+            { modal: true, detail: `This cannot be undone (except via sync/git).\n\n${fileList}` },
+            'Remove All Comments'
+        );
+
+        if (confirm !== 'Remove All Comments') { return; }
+
+        // Process each file
+        let totalRemoved = 0;
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'LocalLeaf: Removing comments...',
+            cancellable: false,
+        }, async (progress) => {
+            for (let i = 0; i < fileSummaries.length; i++) {
+                const f = fileSummaries[i];
+                progress.report({ message: f.name, increment: (100 / fileSummaries.length) });
+
+                const bytes = await vscode.workspace.fs.readFile(f.uri);
+                const original = new TextDecoder().decode(bytes);
+                const cleaned = removeLatexComments(original);
+
+                const origLines = original.split('\n').length;
+                const cleanLines = cleaned.split('\n').length;
+                totalRemoved += origLines - cleanLines;
+
+                await vscode.workspace.fs.writeFile(f.uri, new TextEncoder().encode(cleaned));
+            }
+        });
+
+        vscode.window.showInformationMessage(
+            `LocalLeaf: Removed ${totalRemoved} comment lines from ${fileSummaries.length} file(s)`
+        );
+    } catch (error) {
+        log(`Remove Comments error: ${error}`);
+        vscode.window.showErrorMessage(`LocalLeaf: Remove comments failed — ${error}`);
+    }
+}
+
+/**
+ * Count comment lines in LaTeX content (for preview)
+ */
+function countCommentLines(content: string): number {
+    const lines = content.split('\n');
+    let count = 0;
+    let inBlock = false;
+
+    for (const line of lines) {
+        const stripped = line.trim();
+        if (stripped === '\\begin{comment}') { inBlock = true; count++; continue; }
+        if (stripped === '\\end{comment}') { inBlock = false; count++; continue; }
+        if (inBlock) { count++; continue; }
+        if (/^\s*%/.test(line) && !/^\s*\\%/.test(line)) { count++; }
+    }
+    return count;
+}
+
+/**
+ * Remove LaTeX comments from content
+ * - Removes \begin{comment}...\end{comment} blocks
+ * - Removes lines starting with % (but not \%)
+ * - Collapses consecutive blank lines
+ * - Strips trailing blank lines
+ */
+function removeLatexComments(content: string): string {
+    const lines = content.split('\n');
+    const result: string[] = [];
+    let inBlock = false;
+
+    for (const line of lines) {
+        const stripped = line.trim();
+
+        // Handle \begin{comment} ... \end{comment} blocks
+        if (stripped === '\\begin{comment}') { inBlock = true; continue; }
+        if (stripped === '\\end{comment}') { inBlock = false; continue; }
+        if (inBlock) { continue; }
+
+        // Remove lines starting with % (but not \%)
+        if (/^\s*%/.test(line) && !/^\s*\\%/.test(line)) { continue; }
+
+        result.push(line);
+    }
+
+    // Collapse consecutive blank lines into at most one
+    const cleaned: string[] = [];
+    for (const line of result) {
+        const isBlank = line.trim() === '';
+        if (isBlank && cleaned.length > 0 && cleaned[cleaned.length - 1].trim() === '') {
+            continue;
+        }
+        cleaned.push(line);
+    }
+
+    // Strip trailing blank lines
+    while (cleaned.length > 0 && cleaned[cleaned.length - 1].trim() === '') {
+        cleaned.pop();
+    }
+
+    return cleaned.join('\n') + '\n';
 }
 
 /**

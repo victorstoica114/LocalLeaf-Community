@@ -69,4 +69,5 @@ export const COMMANDS = {
     VERIFY_CREDENTIALS: 'localleaf.verifyCredentials',
     REFRESH_COOKIE: 'localleaf.refreshCookie',
     OPEN_PROJECT: 'localleaf.openProject',
+    REMOVE_COMMENTS: 'localleaf.removeComments',
 } as const;
