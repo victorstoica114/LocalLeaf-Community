@@ -19,6 +19,8 @@ body {
     flex-direction: column;
 }
 
+/* ─── Toolbar ─────────────────────────────────────────────────── */
+
 #toolbar {
     display: flex;
     align-items: center;
@@ -59,6 +61,8 @@ body {
     text-align: center;
 }
 
+/* ─── Viewer container ────────────────────────────────────────── */
+
 #viewer-container {
     flex: 1;
     overflow: auto;
@@ -75,7 +79,10 @@ body {
     gap: 10px;
 }
 
+/* ─── PDF page (canvas + text layer) ──────────────────────────── */
+
 .pdf-page {
+    position: relative;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
     background: white;
 }
@@ -83,6 +90,46 @@ body {
 .pdf-page canvas {
     display: block;
 }
+
+/* ─── Text layer (transparent selectable text over canvas) ────── */
+
+.textLayer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
+    opacity: 0.25;
+    line-height: 1.0;
+    text-size-adjust: none;
+    forced-color-adjust: none;
+    transform-origin: 0 0;
+    z-index: 2;
+}
+
+.textLayer :is(span, br) {
+    color: transparent;
+    position: absolute;
+    white-space: pre;
+    cursor: text;
+    transform-origin: 0% 0%;
+}
+
+.textLayer .markedContent {
+    top: 0;
+    height: 0;
+}
+
+.textLayer ::selection {
+    background: rgba(0, 100, 200, 0.35);
+}
+
+.textLayer br::selection {
+    background: transparent;
+}
+
+/* ─── Error state ─────────────────────────────────────────────── */
 
 .error-message {
     padding: 20px;

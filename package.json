@@ -394,7 +394,7 @@
         },
         "localleaf.compileOnSave": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Automatically compile LaTeX when saving .tex files"
         },
         "localleaf.compileDelay": {

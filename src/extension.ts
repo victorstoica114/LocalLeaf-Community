@@ -272,12 +272,15 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         autoCompiler = new AutoCompiler(latexCompiler);
         context.subscriptions.push(autoCompiler);
 
-        // Auto-compile on save if enabled
-        if (projectSettings.compileOnSave) {
+        // Auto-compile on save (always enabled — use setting to opt out)
+        {
             const mainTex = projectSettings.mainTex || 'main.tex';
             const delay = vscode.workspace.getConfiguration('localleaf').get<number>('compileDelay', 1500);
-            autoCompiler.enable(settings.getWorkspaceFolder(), mainTex, delay);
-            autoCompiler.onDidCompile(result => handleCompilationResult(result));
+            const compileOnSave = vscode.workspace.getConfiguration('localleaf').get<boolean>('compileOnSave', true);
+            if (compileOnSave) {
+                autoCompiler.enable(settings.getWorkspaceFolder(), mainTex, delay);
+                autoCompiler.onDidCompile(result => handleCompilationResult(result));
+            }
         }
 
         // Auto-compile and open PDF preview on project load
@@ -291,7 +294,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         latexCompiler.compile(workspaceFolder.fsPath, mainTex, compiler).then(result => {
             if (result.success && result.pdfPath) {
                 log(`Auto-compile succeeded (${result.duration}ms), opening PDF preview`);
-                PdfPreviewPanel.createOrShow(context.extensionUri, result.pdfPath);
+                PdfPreviewPanel.createOrShow(context.extensionUri, result.pdfPath, workspaceFolder.fsPath);
             } else {
                 log(`Auto-compile failed: ${result.errors.map(e => e.message).join('; ')}`);
             }
@@ -1503,7 +1506,7 @@ async function cmdShowPdfPreview() {
 
     try {
         await vscode.workspace.fs.stat(vscode.Uri.file(pdfPath));
-        PdfPreviewPanel.createOrShow(extensionContext.extensionUri, pdfPath);
+        PdfPreviewPanel.createOrShow(extensionContext.extensionUri, pdfPath, workspaceFolder.fsPath);
     } catch {
         // PDF not found — compile automatically then show preview
         await cmdCompileLaTeX();
@@ -1550,8 +1553,10 @@ async function cmdToggleAutoCompile() {
         return;
     }
 
-    const newState = !settings.compileOnSave;
-    await settingsManager.update({ compileOnSave: newState });
+    const config = vscode.workspace.getConfiguration('localleaf');
+    const current = config.get<boolean>('compileOnSave', true);
+    const newState = !current;
+    await config.update('compileOnSave', newState, vscode.ConfigurationTarget.Global);
 
     if (newState) {
         if (!latexCompiler) {
@@ -1561,7 +1566,7 @@ async function cmdToggleAutoCompile() {
             autoCompiler = new AutoCompiler(latexCompiler);
         }
         const mainTex = settings.mainTex || 'main.tex';
-        const delay = vscode.workspace.getConfiguration('localleaf').get<number>('compileDelay', 1500);
+        const delay = config.get<number>('compileDelay', 1500);
         autoCompiler.enable(settingsManager.getWorkspaceFolder(), mainTex, delay);
         autoCompiler.onDidCompile(result => handleCompilationResult(result));
         vscode.window.showInformationMessage('LocalLeaf: Auto-compile enabled');

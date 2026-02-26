@@ -1,6 +1,7 @@
 /**
  * LocalLeaf PDF Viewer Script
- * Uses pdf.js to render PDF pages in a VS Code webview
+ * Uses pdf.js to render PDF pages in a VS Code webview.
+ * Features: text selection, Ctrl+wheel zoom, Ctrl+click SyncTeX inverse search.
  */
 
 /* global pdfjsLib */
@@ -10,7 +11,7 @@ let currentPage = 1;
 let totalPages = 0;
 let zoomLevel = 1.0;
 let rendering = false;
-let pendingPage = null;
+let pendingRender = false;
 let scrollPosition = 0;
 
 const viewer = document.getElementById('viewer');
@@ -19,188 +20,186 @@ const pageNum = document.getElementById('page-num');
 const pageCount = document.getElementById('page-count');
 const zoomDisplay = document.getElementById('zoom-level');
 
-// VS Code API for messaging
 const vscode = acquireVsCodeApi();
 
-/**
- * Initialize the PDF viewer with a URL
- */
+// ─── Initialisation ──────────────────────────────────────────────
+
 function initViewer(url) {
     loadPdf(url);
 }
 
-/**
- * Load a PDF from a URL
- */
 async function loadPdf(url) {
     try {
-        // Save current scroll position
         scrollPosition = viewerContainer.scrollTop;
 
-        const loadingTask = pdfjsLib.getDocument(url);
-        pdfDoc = await loadingTask.promise;
+        // Fetch raw bytes with cache: 'no-store' to bypass browser / webview
+        // resource-server caching, then hand the ArrayBuffer to pdf.js.
+        var resp = await fetch(url, { cache: 'no-store' });
+        var data = await resp.arrayBuffer();
+
+        // Destroy previous document to free memory
+        if (pdfDoc) {
+            try { pdfDoc.destroy(); } catch (_) {}
+        }
+
+        pdfDoc = await pdfjsLib.getDocument({ data: data }).promise;
         totalPages = pdfDoc.numPages;
         pageCount.textContent = totalPages;
 
-        // Render all visible pages
         await renderAllPages();
-
-        // Restore scroll position
         viewerContainer.scrollTop = scrollPosition;
     } catch (error) {
         viewer.innerHTML = '<div class="error-message">Failed to load PDF: ' + error.message + '</div>';
     }
 }
 
-/**
- * Render all pages (continuous scroll mode)
- */
+// ─── Rendering (canvas + text layer) ─────────────────────────────
+
 async function renderAllPages() {
+    if (rendering) { pendingRender = true; return; }
+    rendering = true;
     viewer.innerHTML = '';
 
-    for (let i = 1; i <= totalPages; i++) {
-        const page = await pdfDoc.getPage(i);
-        const viewport = page.getViewport({ scale: zoomLevel });
+    for (var i = 1; i <= totalPages; i++) {
+        var page = await pdfDoc.getPage(i);
+        var viewport = page.getViewport({ scale: zoomLevel });
 
-        const pageDiv = document.createElement('div');
+        // Wrapper (relative position so text layer overlaps canvas)
+        var pageDiv = document.createElement('div');
         pageDiv.className = 'pdf-page';
         pageDiv.dataset.pageNum = i;
+        pageDiv.style.width = viewport.width + 'px';
+        pageDiv.style.height = viewport.height + 'px';
 
-        const canvas = document.createElement('canvas');
-        const context = canvas.getContext('2d');
-
-        // Handle high DPI displays
-        const dpr = window.devicePixelRatio || 1;
+        // Canvas
+        var canvas = document.createElement('canvas');
+        var ctx = canvas.getContext('2d');
+        var dpr = window.devicePixelRatio || 1;
         canvas.width = viewport.width * dpr;
         canvas.height = viewport.height * dpr;
         canvas.style.width = viewport.width + 'px';
         canvas.style.height = viewport.height + 'px';
-        context.scale(dpr, dpr);
-
+        ctx.scale(dpr, dpr);
         pageDiv.appendChild(canvas);
+
+        // Text layer (transparent text for selection)
+        var textLayerDiv = document.createElement('div');
+        textLayerDiv.className = 'textLayer';
+        pageDiv.appendChild(textLayerDiv);
+
         viewer.appendChild(pageDiv);
 
-        await page.render({
-            canvasContext: context,
-            viewport: viewport,
-        }).promise;
+        // Render canvas
+        await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+        // Render text layer
+        try {
+            var textContent = await page.getTextContent();
+            pdfjsLib.renderTextLayer({
+                textContent: textContent,
+                container: textLayerDiv,
+                viewport: viewport,
+                textDivs: [],
+            });
+        } catch (_) {
+            // text layer not critical — ignore if unavailable
+        }
     }
 
     updatePageIndicator();
-}
-
-/**
- * Render a single page (for page navigation mode)
- */
-async function renderPage(num) {
-    if (rendering) {
-        pendingPage = num;
-        return;
-    }
-
-    rendering = true;
-    currentPage = num;
-    pageNum.textContent = num;
-
-    const page = await pdfDoc.getPage(num);
-    const viewport = page.getViewport({ scale: zoomLevel });
-
-    viewer.innerHTML = '';
-    const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d');
-
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = viewport.width * dpr;
-    canvas.height = viewport.height * dpr;
-    canvas.style.width = viewport.width + 'px';
-    canvas.style.height = viewport.height + 'px';
-    context.scale(dpr, dpr);
-
-    viewer.appendChild(canvas);
-
-    await page.render({
-        canvasContext: context,
-        viewport: viewport,
-    }).promise;
-
     rendering = false;
-    if (pendingPage !== null) {
-        const next = pendingPage;
-        pendingPage = null;
-        renderPage(next);
-    }
+    if (pendingRender) { pendingRender = false; renderAllPages(); }
 }
 
-/**
- * Update page indicator based on scroll position
- */
+// ─── Page indicator ──────────────────────────────────────────────
+
 function updatePageIndicator() {
-    const pages = viewer.querySelectorAll('.pdf-page');
-    const containerTop = viewerContainer.scrollTop;
-    const containerCenter = containerTop + viewerContainer.clientHeight / 2;
-
-    for (const page of pages) {
-        const pageTop = page.offsetTop;
-        const pageBottom = pageTop + page.offsetHeight;
-
-        if (containerCenter >= pageTop && containerCenter <= pageBottom) {
-            currentPage = parseInt(page.dataset.pageNum, 10);
+    var pages = viewer.querySelectorAll('.pdf-page');
+    var top = viewerContainer.scrollTop;
+    var center = top + viewerContainer.clientHeight / 2;
+    for (var i = 0; i < pages.length; i++) {
+        var p = pages[i];
+        if (center >= p.offsetTop && center <= p.offsetTop + p.offsetHeight) {
+            currentPage = parseInt(p.dataset.pageNum, 10);
             pageNum.textContent = currentPage;
             break;
         }
     }
 }
 
-// Scroll listener for page indicator
-viewerContainer.addEventListener('scroll', () => {
-    updatePageIndicator();
-});
+viewerContainer.addEventListener('scroll', updatePageIndicator);
 
-// Toolbar buttons
-document.getElementById('prev-page').addEventListener('click', () => {
+// ─── Zoom helpers ────────────────────────────────────────────────
+
+function applyZoom(newZoom) {
+    newZoom = Math.min(Math.max(newZoom, 0.1), 10.0);
+    if (Math.abs(newZoom - zoomLevel) < 0.001) return;
+
+    var ratio = viewerContainer.scrollHeight > 0
+        ? viewerContainer.scrollTop / viewerContainer.scrollHeight : 0;
+
+    zoomLevel = newZoom;
+    zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
+    renderAllPages().then(function () {
+        viewerContainer.scrollTop = ratio * viewerContainer.scrollHeight;
+    });
+}
+
+// Ctrl + scroll-wheel zoom
+viewerContainer.addEventListener('wheel', function (e) {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    var delta = e.deltaY > 0 ? -0.1 : 0.1;
+    applyZoom(zoomLevel + delta);
+}, { passive: false });
+
+// ─── Toolbar buttons ─────────────────────────────────────────────
+
+document.getElementById('prev-page').addEventListener('click', function () {
     if (currentPage <= 1) return;
-    const pages = viewer.querySelectorAll('.pdf-page');
-    const targetPage = pages[currentPage - 2];
-    if (targetPage) {
-        targetPage.scrollIntoView({ behavior: 'smooth' });
-    }
+    var t = viewer.querySelectorAll('.pdf-page')[currentPage - 2];
+    if (t) t.scrollIntoView({ behavior: 'smooth' });
 });
-
-document.getElementById('next-page').addEventListener('click', () => {
+document.getElementById('next-page').addEventListener('click', function () {
     if (currentPage >= totalPages) return;
-    const pages = viewer.querySelectorAll('.pdf-page');
-    const targetPage = pages[currentPage];
-    if (targetPage) {
-        targetPage.scrollIntoView({ behavior: 'smooth' });
-    }
+    var t = viewer.querySelectorAll('.pdf-page')[currentPage];
+    if (t) t.scrollIntoView({ behavior: 'smooth' });
 });
-
-document.getElementById('zoom-in').addEventListener('click', () => {
-    zoomLevel = Math.min(zoomLevel + 0.25, 5.0);
-    zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
-    renderAllPages();
+document.getElementById('zoom-in').addEventListener('click', function () {
+    applyZoom(zoomLevel + 0.25);
 });
-
-document.getElementById('zoom-out').addEventListener('click', () => {
-    zoomLevel = Math.max(zoomLevel - 0.25, 0.25);
-    zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
-    renderAllPages();
+document.getElementById('zoom-out').addEventListener('click', function () {
+    applyZoom(zoomLevel - 0.25);
 });
-
-document.getElementById('fit-width').addEventListener('click', async () => {
+document.getElementById('fit-width').addEventListener('click', async function () {
     if (!pdfDoc) return;
-    const page = await pdfDoc.getPage(1);
-    const viewport = page.getViewport({ scale: 1.0 });
-    const containerWidth = viewerContainer.clientWidth - 20; // 20px padding
-    zoomLevel = containerWidth / viewport.width;
-    zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
-    renderAllPages();
+    var vp = (await pdfDoc.getPage(1)).getViewport({ scale: 1.0 });
+    applyZoom((viewerContainer.clientWidth - 20) / vp.width);
 });
 
-// Listen for messages from the extension
-window.addEventListener('message', (event) => {
-    const message = event.data;
-    if (message.type === 'updatePdf') {
-        loadPdf(message.pdfUrl);
+// ─── Double-click → SyncTeX inverse search ───────────────────────
+
+viewer.addEventListener('dblclick', function (e) {
+    var pageDiv = e.target.closest('.pdf-page');
+    if (!pageDiv) return;
+
+    var pageNumber = parseInt(pageDiv.dataset.pageNum, 10);
+    var rect = pageDiv.getBoundingClientRect();
+    var clickX = e.clientX - rect.left;
+    var clickY = e.clientY - rect.top;
+
+    // Convert CSS pixels → PDF points (scale-1 units ≈ 1/72 inch)
+    var pdfX = clickX / zoomLevel;
+    var pdfY = clickY / zoomLevel;
+
+    vscode.postMessage({ type: 'synctexClick', page: pageNumber, x: pdfX, y: pdfY });
+});
+
+// ─── Messages from extension ─────────────────────────────────────
+
+window.addEventListener('message', function (event) {
+    var msg = event.data;
+    if (msg.type === 'updatePdf') {
+        loadPdf(msg.pdfUrl);
     }
 });

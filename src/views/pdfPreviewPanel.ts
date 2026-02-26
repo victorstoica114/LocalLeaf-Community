@@ -1,9 +1,13 @@
 /**
  * LocalLeaf PDF Preview Panel
- * Displays compiled PDF using pdf.js in a webview panel
+ * Displays compiled PDF using pdf.js in a webview panel.
+ * Supports SyncTeX inverse search (double-click → jump to source).
  */
 
 import * as vscode from 'vscode';
+import * as path from 'path';
+import { spawn } from 'child_process';
+import { LatexCompiler } from '../compilation/latexCompiler';
 
 export class PdfPreviewPanel {
     static readonly viewType = 'localleaf.pdfPreview';
@@ -11,11 +15,15 @@ export class PdfPreviewPanel {
     private panel: vscode.WebviewPanel;
     private extensionUri: vscode.Uri;
     private currentPdfPath?: string;
+    private workspaceFolder: string;
     private disposables: vscode.Disposable[] = [];
 
-    private constructor(extensionUri: vscode.Uri, pdfPath: string) {
+    private constructor(extensionUri: vscode.Uri, pdfPath: string, workspaceFolder: string) {
         this.extensionUri = extensionUri;
         this.currentPdfPath = pdfPath;
+        this.workspaceFolder = workspaceFolder;
+
+        const buildDir = LatexCompiler.getBuildDir(workspaceFolder);
 
         this.panel = vscode.window.createWebviewPanel(
             PdfPreviewPanel.viewType,
@@ -26,18 +34,23 @@ export class PdfPreviewPanel {
                 retainContextWhenHidden: true,
                 localResourceRoots: [
                     vscode.Uri.joinPath(extensionUri, 'media'),
-                    // Allow loading PDF from workspace
+                    vscode.Uri.file(buildDir),
                     ...(vscode.workspace.workspaceFolders?.map(f => f.uri) || []),
                 ],
             }
         );
 
-        // Panel icon (use extension icon path instead of ThemeIcon which isn't supported for panels)
-
         this.panel.onDidDispose(() => {
             PdfPreviewPanel.instance = undefined;
             this.disposables.forEach(d => d.dispose());
         }, null, this.disposables);
+
+        // Listen for messages from the webview (synctex clicks)
+        this.panel.webview.onDidReceiveMessage(
+            msg => this.handleWebviewMessage(msg),
+            null,
+            this.disposables
+        );
 
         this.panel.webview.html = this.getWebviewContent(this.panel.webview, pdfPath);
     }
@@ -45,14 +58,19 @@ export class PdfPreviewPanel {
     /**
      * Create or show the PDF preview panel (singleton)
      */
-    static createOrShow(extensionUri: vscode.Uri, pdfPath: string): PdfPreviewPanel {
+    static createOrShow(extensionUri: vscode.Uri, pdfPath: string, workspaceFolder?: string): PdfPreviewPanel {
+        const wsFolder = workspaceFolder
+            || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+            || path.dirname(pdfPath);
+
         if (PdfPreviewPanel.instance) {
+            PdfPreviewPanel.instance.workspaceFolder = wsFolder;
             PdfPreviewPanel.instance.panel.reveal(vscode.ViewColumn.Beside);
             PdfPreviewPanel.instance.updatePdf(pdfPath);
             return PdfPreviewPanel.instance;
         }
 
-        PdfPreviewPanel.instance = new PdfPreviewPanel(extensionUri, pdfPath);
+        PdfPreviewPanel.instance = new PdfPreviewPanel(extensionUri, pdfPath, wsFolder);
         return PdfPreviewPanel.instance;
     }
 
@@ -62,19 +80,130 @@ export class PdfPreviewPanel {
     updatePdf(pdfPath: string): void {
         this.currentPdfPath = pdfPath;
         const pdfUri = this.panel.webview.asWebviewUri(vscode.Uri.file(pdfPath));
-
-        // Send message to webview to reload PDF (preserving scroll position)
+        // Append cache-busting query param so pdf.js re-fetches the file
         this.panel.webview.postMessage({
             type: 'updatePdf',
-            pdfUrl: pdfUri.toString(),
-            timestamp: Date.now(),
+            pdfUrl: pdfUri.toString() + '?t=' + Date.now(),
         });
     }
+
+    // ─── Webview message handler ─────────────────────────────────
+
+    private handleWebviewMessage(msg: { type: string; page?: number; x?: number; y?: number }) {
+        if (msg.type === 'synctexClick' && msg.page && msg.x !== undefined && msg.y !== undefined) {
+            this.synctexInverseSearch(msg.page, msg.x, msg.y);
+        }
+    }
+
+    // ─── SyncTeX inverse search ──────────────────────────────────
+
+    private synctexInverseSearch(page: number, x: number, y: number) {
+        if (!this.currentPdfPath) return;
+
+        // Use path relative to workspace to avoid Windows drive-letter colon
+        // conflicting with the page:x:y:file format
+        const relPdf = path.relative(this.workspaceFolder, this.currentPdfPath);
+
+        const args = [
+            'edit',
+            '-o',
+            `${page}:${x.toFixed(2)}:${y.toFixed(2)}:${relPdf}`,
+        ];
+
+        console.log('[LocalLeaf] synctex', args.join(' '));
+
+        const proc = spawn('synctex', args, {
+            cwd: this.workspaceFolder,
+            shell: true,
+            stdio: 'pipe',
+        });
+
+        let stdout = '';
+        let stderr = '';
+        proc.stdout?.on('data', (data: Buffer) => { stdout += data.toString(); });
+        proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
+
+        proc.on('close', (code) => {
+            console.log('[LocalLeaf] synctex exit', code, 'stdout:', stdout.substring(0, 300));
+            if (stderr) {
+                console.log('[LocalLeaf] synctex stderr:', stderr.substring(0, 300));
+            }
+
+            const result = this.parseSynctexOutput(stdout);
+            if (result) {
+                this.openSourceLocation(result.file, result.line, result.column);
+            } else if (code !== 0) {
+                vscode.window.showWarningMessage(
+                    'LocalLeaf: SyncTeX inverse search failed. Make sure synctex is installed (comes with TeX Live / MiKTeX).'
+                );
+            }
+        });
+
+        proc.on('error', (err) => {
+            console.log('[LocalLeaf] synctex spawn error:', err.message);
+            vscode.window.showWarningMessage(
+                'LocalLeaf: Could not run synctex command. Make sure a TeX distribution (TeX Live / MiKTeX) is installed.'
+            );
+        });
+    }
+
+    private parseSynctexOutput(output: string): { file: string; line: number; column: number } | null {
+        // synctex edit output looks like:
+        //   Output:...
+        //   Input:./main.tex
+        //   Line:42
+        //   Column:0
+        //   ...
+        let file = '';
+        let line = 0;
+        let column = 0;
+
+        for (const raw of output.split('\n')) {
+            const l = raw.trim();
+            if (l.startsWith('Input:')) {
+                file = l.substring('Input:'.length);
+            } else if (l.startsWith('Line:')) {
+                line = parseInt(l.substring('Line:'.length), 10) || 0;
+            } else if (l.startsWith('Column:')) {
+                column = parseInt(l.substring('Column:'.length), 10) || 0;
+            }
+        }
+
+        if (!file || line <= 0) return null;
+
+        // Resolve relative paths against workspace
+        if (!path.isAbsolute(file)) {
+            file = path.join(this.workspaceFolder, file);
+        }
+
+        return { file, line, column };
+    }
+
+    private async openSourceLocation(filePath: string, line: number, column: number) {
+        try {
+            const uri = vscode.Uri.file(filePath);
+            const doc = await vscode.workspace.openTextDocument(uri);
+            const pos = new vscode.Position(Math.max(0, line - 1), column);
+            const editor = await vscode.window.showTextDocument(doc, {
+                viewColumn: vscode.ViewColumn.One,
+                selection: new vscode.Range(pos, pos),
+                preserveFocus: false,
+            });
+            // Reveal the line at centre of editor
+            editor.revealRange(
+                new vscode.Range(pos, pos),
+                vscode.TextEditorRevealType.InCenter
+            );
+        } catch {
+            // File may not exist — ignore
+        }
+    }
+
+    // ─── Webview HTML ────────────────────────────────────────────
 
     private getWebviewContent(webview: vscode.Webview, pdfPath: string): string {
         const pdfUri = webview.asWebviewUri(vscode.Uri.file(pdfPath));
 
-        // Load pdf.js from media directory
         const pdfJsUri = webview.asWebviewUri(
             vscode.Uri.joinPath(this.extensionUri, 'media', 'pdf.min.js')
         );
@@ -112,7 +241,7 @@ export class PdfPreviewPanel {
         <span id="page-info">Page <span id="page-num">1</span> / <span id="page-count">-</span></span>
         <button id="next-page" title="Next Page">&#9654;</button>
         <span class="separator">|</span>
-        <button id="zoom-out" title="Zoom Out">-</button>
+        <button id="zoom-out" title="Zoom Out">&#8722;</button>
         <span id="zoom-level">100%</span>
         <button id="zoom-in" title="Zoom In">+</button>
         <button id="fit-width" title="Fit Width">&#8596;</button>
@@ -124,14 +253,11 @@ export class PdfPreviewPanel {
     <script nonce="${nonce}" src="${pdfJsUri}"></script>
     <script nonce="${nonce}" src="${viewerJsUri}"></script>
     <script nonce="${nonce}">
-        // Fetch the worker script and create a blob URL so pdf.js can
-        // spawn a Web Worker (vscode-resource:// URLs can't be used directly).
         fetch('${pdfWorkerUri}')
             .then(function(r) { return r.text(); })
             .then(function(code) {
                 var blob = new Blob([code], { type: 'application/javascript' });
                 pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(blob);
-                // Initialize viewer only after worker is ready
                 initViewer('${pdfUri}');
             })
             .catch(function(err) {

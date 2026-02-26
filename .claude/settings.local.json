@@ -4,7 +4,9 @@
       "Bash(npm run:*)",
       "Bash(npx tsc:*)",
       "Bash(git status:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(where synctex:*)",
+      "Bash(synctex help:*)"
     ]
   }
 }

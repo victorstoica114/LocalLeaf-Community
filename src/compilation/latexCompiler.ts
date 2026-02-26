@@ -112,6 +112,17 @@ export class LatexCompiler implements vscode.Disposable {
         // Build command arguments (with output directory)
         const args = this.buildArgs(selectedCompiler, mainTex, buildDir);
 
+        // Record PDF modification time before compilation so we can tell
+        // whether the compiler actually produced new output
+        const pdfFile = mainTex.replace(/\.tex$/, '.pdf');
+        const pdfPath = path.join(buildDir, pdfFile);
+        let pdfMtimeBefore = 0;
+        try {
+            pdfMtimeBefore = fs.statSync(pdfPath).mtimeMs;
+        } catch {
+            // PDF doesn't exist yet — fine
+        }
+
         return new Promise((resolve) => {
             let stdout = '';
             let stderr = '';
@@ -140,18 +151,24 @@ export class LatexCompiler implements vscode.Disposable {
                 const logFile = mainTex.replace(/\.tex$/, '.log');
                 const logPath = path.join(buildDir, logFile);
                 this.parseLogFile(logPath, workspaceFolder).then(({ errors, warnings }) => {
-                    // The PDF will be in the build directory
-                    const pdfFile = mainTex.replace(/\.tex$/, '.pdf');
-                    const pdfPath = path.join(buildDir, pdfFile);
-
-                    // Check if PDF was actually generated —
-                    // some compilers (e.g. MiKTeX) exit with non-zero code
-                    // due to warnings even when compilation succeeds
+                    // Check if PDF exists and was actually written during THIS compilation
                     const pdfExists = fs.existsSync(pdfPath);
-                    const actuallySucceeded = pdfExists && (code === 0 || errors.length === 0);
+                    let pdfMtimeAfter = 0;
+                    try {
+                        pdfMtimeAfter = fs.statSync(pdfPath).mtimeMs;
+                    } catch {
+                        // PDF doesn't exist
+                    }
+                    const pdfWasUpdated = pdfExists && pdfMtimeAfter > pdfMtimeBefore;
 
-                    // If the process failed and we found no errors in the log,
-                    // include stderr/stdout so the user can see what went wrong
+                    // Success only if the PDF was actually (re)written.
+                    // MiKTeX may exit non-zero due to warnings even when compilation
+                    // succeeds, so we also accept non-zero exit codes when there are
+                    // no real TeX errors AND the PDF was freshly generated.
+                    const actuallySucceeded = pdfWasUpdated && (code === 0 || errors.length === 0);
+
+                    // If the compiler ran but didn't produce / update the PDF,
+                    // it's a real failure — show stderr/stdout to the user
                     if (!actuallySucceeded && errors.length === 0) {
                         const output = (stderr || stdout).trim();
                         if (output) {
@@ -161,6 +178,12 @@ export class LatexCompiler implements vscode.Disposable {
                                 line: 0,
                                 message: lastLines,
                             });
+                        } else if (pdfExists && !pdfWasUpdated) {
+                            errors.push({
+                                file: mainTex,
+                                line: 0,
+                                message: `Compiler exited with code ${code} and PDF was not updated. Try a different compiler (LocalLeaf: Select Compiler).`,
+                            });
                         } else {
                             errors.push({
                                 file: mainTex,
@@ -168,6 +191,27 @@ export class LatexCompiler implements vscode.Disposable {
                                 message: `Compiler exited with code ${code}`,
                             });
                         }
+                    }
+
+                    // If the chosen compiler failed to update the PDF, try falling
+                    // back to pdflatex (common when latexmk can't find Perl)
+                    if (!pdfWasUpdated && selectedCompiler !== 'pdflatex' && !compiler) {
+                        this.isAvailable('pdflatex').then(hasPdflatex => {
+                            if (hasPdflatex) {
+                                // Retry with pdflatex
+                                this.compile(workspaceFolder, mainTex, 'pdflatex').then(resolve);
+                            } else {
+                                this.updateDiagnostics(errors, workspaceFolder);
+                                resolve({
+                                    success: false,
+                                    pdfPath: pdfExists ? pdfPath : undefined,
+                                    errors,
+                                    warnings,
+                                    duration,
+                                });
+                            }
+                        });
+                        return;
                     }
 
                     // Update VS Code diagnostics
