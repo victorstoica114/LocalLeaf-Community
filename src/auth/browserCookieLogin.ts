@@ -45,7 +45,7 @@ export async function captureCookiesViaBrowserLogin(
         log?.(`Opening browser for login: ${executable}`);
         browserProcess = await launchBrowser(executable, port, tempProfileDir, loginUrl);
         await waitForDebugTargets(port, 15000);
-        const cookieHeader = await waitForLoginCookies(port, serverUrl, browserProcess, log);
+        const cookieHeader = await waitForLoginCookies(port, serverUrl, log);
         return { type: 'success', cookies: cookieHeader };
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -65,17 +65,15 @@ export async function captureCookiesViaBrowserLogin(
 async function waitForLoginCookies(
     port: number,
     serverUrl: string,
-    browserProcess: ChildProcess,
     log?: (message: string) => void,
 ): Promise<string> {
-    const deadline = Date.now() + 180000; // 3 minutes
+    const deadline = Date.now() + 300000; // 5 minutes
     let lastKnownError = '';
+    let lastAuthCheckAt = 0;
+    let lastAuthCookie = '';
+    let lastAuthResult = false;
 
     while (Date.now() < deadline) {
-        if (browserProcess.exitCode !== null) {
-            throw new Error('Browser closed before login completed.');
-        }
-
         try {
             const targets = await getDevToolsTargets(port);
             const target = pickTarget(targets, serverUrl);
@@ -83,7 +81,19 @@ async function waitForLoginCookies(
                 const cookies = await getCookiesFromDevTools(target.webSocketDebuggerUrl);
                 const cookieHeader = buildCookieHeader(cookies, serverUrl);
                 if (cookieHeader && hasSessionCookie(cookieHeader)) {
-                    return cookieHeader;
+                    const now = Date.now();
+                    if (cookieHeader !== lastAuthCookie || now - lastAuthCheckAt >= 1000) {
+                        lastAuthCookie = cookieHeader;
+                        lastAuthCheckAt = now;
+                        lastAuthResult = await isAuthenticatedCookie(serverUrl, cookieHeader);
+                        if (!lastAuthResult) {
+                            log?.('Session cookie detected but login is not fully confirmed yet. Waiting...');
+                        }
+                    }
+
+                    if (lastAuthResult) {
+                        return cookieHeader;
+                    }
                 }
             }
         } catch (error) {
@@ -91,19 +101,51 @@ async function waitForLoginCookies(
             log?.(`Waiting for login cookies: ${lastKnownError}`);
         }
 
-        await delay(1000);
+        await delay(300);
     }
 
     throw new Error(
         lastKnownError
             ? `Timed out waiting for login cookies (${lastKnownError})`
-            : 'Timed out waiting for login cookies. Complete login in the opened browser window.',
+            : 'Timed out waiting for login cookies after 5 minutes. Complete login in the opened browser window.',
     );
 }
 
 function hasSessionCookie(cookieHeader: string): boolean {
     // Common session cookie names used by overleaf.com and self-hosted setups.
     return /(?:^|;\s*)(?:overleaf_session2|overleaf_session|connect\.sid)=/i.test(cookieHeader);
+}
+
+async function isAuthenticatedCookie(serverUrl: string, cookieHeader: string): Promise<boolean> {
+    const fetch = (await import('node-fetch')).default;
+    const projectUrl = new URL('/project', normalizeServerUrl(serverUrl)).toString();
+    const res = await fetch(projectUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: {
+            'Cookie': cookieHeader,
+            'Accept': 'text/html,*/*',
+        },
+    });
+
+    if (res.status === 200) {
+        return true;
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+        const location = (res.headers.get('location') || '').toLowerCase();
+        if (!location) {
+            return false;
+        }
+        if (location.includes('/login')) {
+            return false;
+        }
+        if (location.includes('/project')) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 function normalizeServerUrl(serverUrl: string): string {
