@@ -138,6 +138,8 @@ export class SyncEngine {
     private _syncMode: SyncMode = 'manual';
     /** Paths recently pushed — used to suppress echo from server in manual mode */
     private _recentlyPushedPaths: Set<string> = new Set();
+    /** Paths currently being updated from remote — suppresses echo in handleLocalFileChange */
+    private _remoteUpdatingPaths: Set<string> = new Set();
 
     readonly onStatusChange = this._onStatusChange.event;
 
@@ -684,6 +686,9 @@ export class SyncEngine {
     private async handleLocalFileChange(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
+
+        // Suppress echo from remote-initiated save
+        if (this._remoteUpdatingPaths.has(relativePath)) return;
 
         // Manual mode: record change instead of pushing immediately
         if (this._syncMode === 'manual') {
@@ -1393,10 +1398,57 @@ export class SyncEngine {
                 return;
             }
 
-            if (!contentEquals(localBytes, remoteBytes)) {
-                this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
-                await vscode.workspace.fs.writeFile(localUri, remoteBytes);
-                this.log(`Remote update: ${entry.path}`);
+            // Check if document is open in any editor
+            const openDoc = vscode.workspace.textDocuments.find(
+                d => d.uri.toString() === localUri.toString()
+            );
+
+            if (openDoc) {
+                const remoteText = new TextDecoder().decode(remoteBytes);
+                if (openDoc.getText() !== remoteText) {
+                    this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
+                    this._remoteUpdatingPaths.add(entry.path);
+                    try {
+                        // Always write to disk first
+                        await vscode.workspace.fs.writeFile(localUri, remoteBytes);
+
+                        const activeEditor = vscode.window.activeTextEditor;
+                        if (openDoc.isDirty && activeEditor && activeEditor.document.uri.toString() === localUri.toString()) {
+                            // Active dirty editor: revert from disk so remote changes
+                            // don't pollute the undo stack. This makes remote content
+                            // the new editing baseline.
+                            const savedSelections = activeEditor.selections;
+                            const savedVisibleRanges = activeEditor.visibleRanges;
+                            await vscode.commands.executeCommand('workbench.action.files.revert');
+                            activeEditor.selections = savedSelections;
+                            if (savedVisibleRanges.length > 0) {
+                                activeEditor.revealRange(savedVisibleRanges[0]);
+                            }
+                        } else if (openDoc.isDirty) {
+                            // Non-active dirty editor: apply to buffer + save to avoid
+                            // the "file is newer" conflict when user switches to this tab
+                            const edit = new vscode.WorkspaceEdit();
+                            const fullRange = new vscode.Range(
+                                openDoc.positionAt(0),
+                                openDoc.positionAt(openDoc.getText().length)
+                            );
+                            edit.replace(openDoc.uri, fullRange, remoteText);
+                            await vscode.workspace.applyEdit(edit);
+                            await openDoc.save();
+                        }
+                        // Non-dirty open docs: VS Code auto-reloads from disk
+                    } finally {
+                        this._remoteUpdatingPaths.delete(entry.path);
+                    }
+                    this.log(`Remote update: ${entry.path}`);
+                }
+            } else {
+                // File not open — write to disk directly
+                if (!contentEquals(localBytes, remoteBytes)) {
+                    this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
+                    await vscode.workspace.fs.writeFile(localUri, remoteBytes);
+                    this.log(`Remote update: ${entry.path}`);
+                }
             }
 
             this.baseContent.set(entry.path, remoteBytes);
