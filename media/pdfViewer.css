@@ -180,6 +180,32 @@ body {
     background: transparent;
 }
 
+/* ─── Annotation layer (clickable links) ─────────────────────── */
+
+.annotationLayer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
+    z-index: 3;
+    pointer-events: none;
+}
+
+.annotationLayer .pdf-link {
+    position: absolute;
+    display: block;
+    pointer-events: auto;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: background-color 0.15s;
+}
+
+.annotationLayer .pdf-link:hover {
+    background: rgba(26, 115, 232, 0.15);
+}
+
 /* ─── Error state ─────────────────────────────────────────────── */
 
 .error-message {

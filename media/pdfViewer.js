@@ -13,6 +13,7 @@ let zoomLevel = 1.0;
 let rendering = false;
 let pendingRender = false;
 let scrollPosition = 0;
+let zoomDebounceTimer = null;
 
 const viewer = document.getElementById('viewer');
 const viewerContainer = document.getElementById('viewer-container');
@@ -82,12 +83,15 @@ async function renderAllPages() {
 
     for (var i = 1; i <= totalPages; i++) {
         var page = await pdfDoc.getPage(i);
+        var baseViewport = page.getViewport({ scale: 1.0 });
         var viewport = page.getViewport({ scale: zoomLevel });
 
         // Wrapper (relative position so text layer overlaps canvas)
         var pageDiv = document.createElement('div');
         pageDiv.className = 'pdf-page';
         pageDiv.dataset.pageNum = i;
+        pageDiv.dataset.baseWidth = baseViewport.width;
+        pageDiv.dataset.baseHeight = baseViewport.height;
         pageDiv.style.width = viewport.width + 'px';
         pageDiv.style.height = viewport.height + 'px';
 
@@ -124,11 +128,125 @@ async function renderAllPages() {
         } catch (_) {
             // text layer not critical — ignore if unavailable
         }
+
+        // Annotation layer (clickable links, citations, cross-references)
+        try {
+            await renderAnnotationLayer(page, pageDiv, viewport);
+        } catch (_) {
+            // annotation layer not critical — ignore
+        }
     }
 
     updatePageIndicator();
     rendering = false;
     if (pendingRender) { pendingRender = false; renderAllPages(); }
+}
+
+// ─── Annotation layer (links / citations / references) ───────────
+
+async function renderAnnotationLayer(page, pageDiv, viewport) {
+    var annotations = await page.getAnnotations();
+    if (!annotations || annotations.length === 0) return;
+
+    var annotDiv = document.createElement('div');
+    annotDiv.className = 'annotationLayer';
+    pageDiv.appendChild(annotDiv);
+
+    for (var j = 0; j < annotations.length; j++) {
+        var annot = annotations[j];
+        if (annot.subtype !== 'Link') continue;
+        if (!annot.rect) continue;
+
+        // Convert PDF rect → viewport coordinates
+        var rect = viewport.convertToViewportRectangle(annot.rect);
+        // normalizeRect ensures [left, top, right, bottom]
+        var bounds = pdfjsLib.Util.normalizeRect(rect);
+
+        var link = document.createElement('a');
+        link.className = 'pdf-link';
+        link.style.left = bounds[0] + 'px';
+        link.style.top = bounds[1] + 'px';
+        link.style.width = (bounds[2] - bounds[0]) + 'px';
+        link.style.height = (bounds[3] - bounds[1]) + 'px';
+
+        if (annot.url) {
+            // External URL (hyperref \url / \href)
+            link.title = annot.url;
+            link.dataset.url = annot.url;
+            link.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                vscode.postMessage({ type: 'openExternal', url: this.dataset.url });
+            });
+        } else if (annot.dest) {
+            // Internal destination (citation, cross-reference, TOC)
+            link.dataset.dest = typeof annot.dest === 'string'
+                ? annot.dest : JSON.stringify(annot.dest);
+            link.dataset.destType = typeof annot.dest === 'string' ? 'named' : 'explicit';
+            link.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var dest = this.dataset.destType === 'named'
+                    ? this.dataset.dest : JSON.parse(this.dataset.dest);
+                navigateToDest(dest);
+            });
+        } else if (annot.action === 'GoTo' && annot.dest) {
+            link.dataset.dest = typeof annot.dest === 'string'
+                ? annot.dest : JSON.stringify(annot.dest);
+            link.dataset.destType = typeof annot.dest === 'string' ? 'named' : 'explicit';
+            link.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var dest = this.dataset.destType === 'named'
+                    ? this.dataset.dest : JSON.parse(this.dataset.dest);
+                navigateToDest(dest);
+            });
+        } else {
+            // Unknown link type — skip
+            continue;
+        }
+
+        annotDiv.appendChild(link);
+    }
+}
+
+async function navigateToDest(dest) {
+    if (!pdfDoc) return;
+
+    try {
+        // Named destinations need to be resolved first
+        var destArray = dest;
+        if (typeof dest === 'string') {
+            destArray = await pdfDoc.getDestination(dest);
+        }
+        if (!destArray || !destArray[0]) return;
+
+        // destArray[0] is a page ref object, resolve to page index
+        var pageIndex = await pdfDoc.getPageIndex(destArray[0]);
+        var targetPage = pageIndex + 1;
+
+        var pages = viewer.querySelectorAll('.pdf-page');
+        if (targetPage < 1 || targetPage > pages.length) return;
+
+        var targetDiv = pages[targetPage - 1];
+
+        // If dest specifies a Y position (e.g. [ref, /XYZ, x, y, z]),
+        // scroll to that exact position within the page
+        var destType = destArray[1];
+        if (destType && destType.name === 'XYZ' && destArray[3] !== null) {
+            var yPdf = destArray[3]; // Y in PDF coordinates (bottom-up)
+            var page = await pdfDoc.getPage(targetPage);
+            var vp = page.getViewport({ scale: zoomLevel });
+            // Convert PDF Y (bottom-up) → viewport Y (top-down)
+            var yViewport = vp.height - (yPdf * zoomLevel);
+            var scrollTarget = targetDiv.offsetTop + Math.max(0, yViewport) - 20;
+            viewerContainer.scrollTo({ top: scrollTarget, behavior: 'smooth' });
+        } else {
+            targetDiv.scrollIntoView({ behavior: 'smooth' });
+        }
+    } catch (_) {
+        // Destination resolution failed — ignore
+    }
 }
 
 // ─── Page indicator ──────────────────────────────────────────────
@@ -151,18 +269,60 @@ viewerContainer.addEventListener('scroll', updatePageIndicator);
 
 // ─── Zoom helpers ────────────────────────────────────────────────
 
-function applyZoom(newZoom) {
+/**
+ * Instantly resize existing page/canvas CSS dimensions without re-rendering.
+ * The canvas bitmap stays the same (slightly blurry), but layout is correct.
+ */
+function quickResizePages() {
+    var pages = viewer.querySelectorAll('.pdf-page');
+    for (var i = 0; i < pages.length; i++) {
+        var p = pages[i];
+        var bw = parseFloat(p.dataset.baseWidth);
+        var bh = parseFloat(p.dataset.baseHeight);
+        if (!bw || !bh) continue;
+        var w = bw * zoomLevel;
+        var h = bh * zoomLevel;
+        p.style.width = w + 'px';
+        p.style.height = h + 'px';
+        var canvas = p.querySelector('canvas');
+        if (canvas) {
+            canvas.style.width = w + 'px';
+            canvas.style.height = h + 'px';
+        }
+    }
+}
+
+function applyZoom(newZoom, immediate) {
     newZoom = Math.min(Math.max(newZoom, 0.1), 10.0);
     if (Math.abs(newZoom - zoomLevel) < 0.001) return;
 
-    var ratio = viewerContainer.scrollHeight > 0
+    var scrollRatio = viewerContainer.scrollHeight > 0
         ? viewerContainer.scrollTop / viewerContainer.scrollHeight : 0;
 
     zoomLevel = newZoom;
     zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
-    renderAllPages().then(function () {
-        viewerContainer.scrollTop = ratio * viewerContainer.scrollHeight;
-    });
+
+    if (immediate) {
+        renderAllPages().then(function () {
+            viewerContainer.scrollTop = scrollRatio * viewerContainer.scrollHeight;
+        });
+        return;
+    }
+
+    // Instant CSS resize for smooth visual feedback
+    quickResizePages();
+    viewerContainer.scrollTop = scrollRatio * viewerContainer.scrollHeight;
+
+    // Debounce the expensive full-quality re-render
+    if (zoomDebounceTimer) clearTimeout(zoomDebounceTimer);
+    zoomDebounceTimer = setTimeout(function () {
+        zoomDebounceTimer = null;
+        var r = viewerContainer.scrollHeight > 0
+            ? viewerContainer.scrollTop / viewerContainer.scrollHeight : 0;
+        renderAllPages().then(function () {
+            viewerContainer.scrollTop = r * viewerContainer.scrollHeight;
+        });
+    }, 300);
 }
 
 // Ctrl + scroll-wheel zoom
@@ -205,15 +365,15 @@ document.getElementById('next-page').addEventListener('click', function () {
     if (t) t.scrollIntoView({ behavior: 'smooth' });
 });
 document.getElementById('zoom-in').addEventListener('click', function () {
-    applyZoom(zoomLevel + 0.25);
+    applyZoom(zoomLevel + 0.25, true);
 });
 document.getElementById('zoom-out').addEventListener('click', function () {
-    applyZoom(zoomLevel - 0.25);
+    applyZoom(zoomLevel - 0.25, true);
 });
 document.getElementById('fit-width').addEventListener('click', async function () {
     if (!pdfDoc) return;
     var vp = (await pdfDoc.getPage(1)).getViewport({ scale: 1.0 });
-    applyZoom((viewerContainer.clientWidth - 20) / vp.width);
+    applyZoom((viewerContainer.clientWidth - 20) / vp.width, true);
 });
 
 // ─── Double-click → SyncTeX inverse search ───────────────────────

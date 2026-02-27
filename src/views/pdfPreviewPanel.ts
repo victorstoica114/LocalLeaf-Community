@@ -113,11 +113,13 @@ export class PdfPreviewPanel {
 
     // ─── Webview message handler ─────────────────────────────────
 
-    private handleWebviewMessage(msg: { type: string; page?: number; x?: number; y?: number }) {
+    private handleWebviewMessage(msg: { type: string; page?: number; x?: number; y?: number; url?: string }) {
         if (msg.type === 'synctexClick' && msg.page && msg.x !== undefined && msg.y !== undefined) {
             this.synctexInverseSearch(msg.page, msg.x, msg.y);
         } else if (msg.type === 'recompile') {
             vscode.commands.executeCommand('localleaf.compileLaTeX');
+        } else if (msg.type === 'openExternal' && msg.url) {
+            vscode.env.openExternal(vscode.Uri.parse(msg.url));
         }
     }
 
