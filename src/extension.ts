@@ -1664,14 +1664,36 @@ async function cmdViewDiff(filePath: string) {
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager) return;
 
+    // Fetch remote content first
+    const remoteContent = await syncEngine.getRemoteContent(filePath);
+    if (remoteContent === undefined) {
+        changesWebviewProvider.showToast(`Cannot fetch remote content for ${filePath}`, 'error');
+        return;
+    }
+
+    const remoteText = new TextDecoder().decode(remoteContent);
+
+    // Register a temporary content provider for the remote file
+    const provider = new (class implements vscode.TextDocumentContentProvider {
+        provideTextDocumentContent(): string {
+            return remoteText;
+        }
+    })();
+    const disposable = vscode.workspace.registerTextDocumentContentProvider('localleaf-remote', provider);
+
     const localUri = settingsManager.getFilePath(filePath);
     const remoteUri = vscode.Uri.parse(`localleaf-remote:${filePath}`);
 
-    await vscode.commands.executeCommand('vscode.diff',
-        localUri,
-        remoteUri,
-        `${filePath} (Local ↔ Remote)`
-    );
+    try {
+        await vscode.commands.executeCommand('vscode.diff',
+            localUri,
+            remoteUri,
+            `${filePath} (Local ↔ Remote)`
+        );
+    } finally {
+        // Keep provider alive while diff is open
+        setTimeout(() => disposable.dispose(), 60000);
+    }
 }
 
 async function cmdResolveConflict(filePath: string, resolution: 'remote' | 'local') {

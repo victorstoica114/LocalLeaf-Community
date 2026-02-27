@@ -2210,6 +2210,40 @@ export class SyncEngine {
     }
 
     /**
+     * Get remote file content by relative path.
+     * Returns undefined if the file is not found or content cannot be fetched.
+     */
+    async getRemoteContent(relativePath: string): Promise<Uint8Array | undefined> {
+        const entry = this.fileTreeByPath.get(relativePath);
+        if (!entry || entry.type === 'folder') { return undefined; }
+
+        const projectSettings = this.settings.getSettings();
+        if (!projectSettings) { return undefined; }
+
+        if (entry.type === 'doc') {
+            if (this.socket) {
+                try {
+                    const { lines } = await this.socket.joinDoc(entry.id);
+                    const content = new TextEncoder().encode(lines.join('\n'));
+                    await this.socket.leaveDoc(entry.id);
+                    return content;
+                } catch { /* fall through to HTTP */ }
+            }
+            const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
+            if (result.type === 'success' && result.lines) {
+                return new TextEncoder().encode(result.lines.join('\n'));
+            }
+        } else {
+            const result = await this.api.getFile(projectSettings.projectId, entry.id);
+            if (result.type === 'success' && result.content) {
+                return result.content;
+            }
+        }
+
+        return undefined;
+    }
+
+    /**
      * Get the socket instance
      */
     getSocket(): SocketIOAPI | undefined {
