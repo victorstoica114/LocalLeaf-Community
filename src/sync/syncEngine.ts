@@ -570,6 +570,41 @@ export class SyncEngine {
     }
 
     /**
+     * Apply merged content to an active dirty editor via disk write + revert.
+     * This keeps remote-applied content out of the editor undo stack.
+     */
+    private async applyDirtyDocViaDiskRevert(
+        path: string,
+        doc: vscode.TextDocument,
+        content: Uint8Array
+    ): Promise<boolean> {
+        const activeEditor = vscode.window.activeTextEditor;
+        if (!activeEditor || activeEditor.document.uri.toString() !== doc.uri.toString()) {
+            return false;
+        }
+
+        const beforeSelections = activeEditor.selections;
+        const beforeVisible = activeEditor.visibleRanges;
+
+        this._remoteUpdatingPaths.add(path);
+        try {
+            await vscode.workspace.fs.writeFile(doc.uri, content);
+            await vscode.commands.executeCommand('workbench.action.files.revert');
+
+            const afterEditor = vscode.window.activeTextEditor;
+            if (afterEditor && afterEditor.document.uri.toString() === doc.uri.toString()) {
+                afterEditor.selections = beforeSelections;
+                if (beforeVisible.length > 0) {
+                    afterEditor.revealRange(beforeVisible[0]);
+                }
+            }
+            return true;
+        } finally {
+            this._remoteUpdatingPaths.delete(path);
+        }
+    }
+
+    /**
      * Handle in-memory text edits for unsaved realtime doc syncing.
      */
     private handleTextDocumentChange(event: vscode.TextDocumentChangeEvent): void {
@@ -739,12 +774,10 @@ export class SyncEngine {
 
             const latestOpenDoc = this.getOpenTextDocument(path);
             if (latestOpenDoc?.isDirty) {
-                const applied = await this.applyContentToOpenDocument(path, latestOpenDoc, latest);
-                if (applied) {
-                    this.baseContent.set(path, latest);
-                    this.fileCache.set(path, { hash: hashContent(latest), timestamp: Date.now() });
-                    this.pendingRemoteDocContent.delete(path);
-                }
+                // Preserve local undo stack behavior for user edits: defer remote apply
+                // until the doc is no longer dirty instead of editing the buffer now.
+                this.pendingRemoteDocContent.set(path, latest);
+                this.schedulePendingRemoteApply(path, DEBOUNCE_DELAY);
                 return;
             }
 
@@ -1737,18 +1770,33 @@ export class SyncEngine {
                 }
 
                 const localDocBytes = new TextEncoder().encode(openDoc.getText());
+                const localMatchesBase = contentEquals(this.baseContent.get(entry.path), localDocBytes);
+                let localPushed = false;
                 if (this.shouldPropagate('push', entry.path, localDocBytes)) {
                     try {
-                        await this.pushDocumentChanges(entry.id, entry.path, localDocBytes);
-                        this.baseContent.set(entry.path, localDocBytes);
-                        this.fileCache.set(entry.path, { hash: hashContent(localDocBytes), timestamp: Date.now() });
+                        localPushed = await this.pushDocumentChanges(entry.id, entry.path, localDocBytes);
+                        if (localPushed) {
+                            this.baseContent.set(entry.path, localDocBytes);
+                            this.fileCache.set(entry.path, { hash: hashContent(localDocBytes), timestamp: Date.now() });
+                        }
                     } catch {
                         // Continue with remote reconciliation even if local push fails.
                     }
                 }
 
                 const mergedBytes = await this.fetchDocContentBytes(update.doc, true) || remoteBytes;
-                const applied = await this.applyContentToOpenDocument(entry.path, openDoc, mergedBytes);
+                let applied = false;
+
+                // If local in-memory changes are confirmed synced (or there were none),
+                // prefer disk+revert so remote apply does not enter undo history.
+                if (localPushed || localMatchesBase) {
+                    applied = await this.applyDirtyDocViaDiskRevert(entry.path, openDoc, mergedBytes);
+                }
+
+                if (!applied) {
+                    applied = await this.applyContentToOpenDocument(entry.path, openDoc, mergedBytes);
+                }
+
                 if (!applied) {
                     this.pendingRemoteDocContent.set(entry.path, mergedBytes);
                     this.schedulePendingRemoteApply(entry.path, DEBOUNCE_DELAY);
