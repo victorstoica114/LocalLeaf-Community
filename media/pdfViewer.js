@@ -173,6 +173,25 @@ viewerContainer.addEventListener('wheel', function (e) {
     applyZoom(zoomLevel + delta);
 }, { passive: false });
 
+// ─── Recompile button ────────────────────────────────────────────
+
+var recompileBtn = document.getElementById('recompile-btn');
+
+recompileBtn.addEventListener('click', function () {
+    if (recompileBtn.classList.contains('compiling')) return;
+    vscode.postMessage({ type: 'recompile' });
+});
+
+function setCompilingState(compiling) {
+    if (compiling) {
+        recompileBtn.classList.add('compiling');
+        recompileBtn.innerHTML = '<span class="spinner"></span>Compiling';
+    } else {
+        recompileBtn.classList.remove('compiling');
+        recompileBtn.textContent = 'Recompile';
+    }
+}
+
 // ─── Toolbar buttons ─────────────────────────────────────────────
 
 document.getElementById('prev-page').addEventListener('click', function () {
@@ -231,5 +250,7 @@ window.addEventListener('message', function (event) {
         } else {
             loadPdf(msg.pdfUrl);
         }
+    } else if (msg.type === 'setCompiling') {
+        setCompilingState(msg.compiling);
     }
 });

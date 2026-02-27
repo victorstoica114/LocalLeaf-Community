@@ -46,7 +46,7 @@ export class PdfPreviewPanel {
             this.disposables.forEach(d => d.dispose());
         }, null, this.disposables);
 
-        // Listen for messages from the webview (synctex clicks)
+        // Listen for messages from the webview (synctex clicks, recompile)
         this.panel.webview.onDidReceiveMessage(
             msg => this.handleWebviewMessage(msg),
             null,
@@ -54,6 +54,9 @@ export class PdfPreviewPanel {
         );
 
         this.panel.webview.html = this.getWebviewContent(this.panel.webview, pdfPath);
+
+        // Pin the tab so it doesn't get replaced
+        this.pinTab();
     }
 
     /**
@@ -68,6 +71,8 @@ export class PdfPreviewPanel {
             PdfPreviewPanel.instance.workspaceFolder = wsFolder;
             PdfPreviewPanel.instance.panel.reveal(vscode.ViewColumn.Beside);
             PdfPreviewPanel.instance.updatePdf(pdfPath);
+            // Re-pin in case the tab was unpinned
+            PdfPreviewPanel.instance.pinTab();
             return PdfPreviewPanel.instance;
         }
 
@@ -104,6 +109,8 @@ export class PdfPreviewPanel {
     private handleWebviewMessage(msg: { type: string; page?: number; x?: number; y?: number }) {
         if (msg.type === 'synctexClick' && msg.page && msg.x !== undefined && msg.y !== undefined) {
             this.synctexInverseSearch(msg.page, msg.x, msg.y);
+        } else if (msg.type === 'recompile') {
+            vscode.commands.executeCommand('localleaf.compileLaTeX');
         }
     }
 
@@ -261,14 +268,19 @@ export class PdfPreviewPanel {
 </head>
 <body>
     <div id="toolbar">
-        <button id="prev-page" title="Previous Page">&#9664;</button>
-        <span id="page-info">Page <span id="page-num">1</span> / <span id="page-count">-</span></span>
-        <button id="next-page" title="Next Page">&#9654;</button>
-        <span class="separator">|</span>
-        <button id="zoom-out" title="Zoom Out">&#8722;</button>
-        <span id="zoom-level">100%</span>
-        <button id="zoom-in" title="Zoom In">+</button>
-        <button id="fit-width" title="Fit Width">&#8596;</button>
+        <div id="toolbar-left">
+            <button id="recompile-btn" title="Recompile (Ctrl+Alt+B)">Recompile</button>
+        </div>
+        <div id="toolbar-right">
+            <button id="prev-page" title="Previous Page">&#9664;</button>
+            <span id="page-info">Page <span id="page-num">1</span> / <span id="page-count">-</span></span>
+            <button id="next-page" title="Next Page">&#9654;</button>
+            <span class="separator">|</span>
+            <button id="zoom-out" title="Zoom Out">&#8722;</button>
+            <span id="zoom-level">100%</span>
+            <button id="zoom-in" title="Zoom In">+</button>
+            <button id="fit-width" title="Fit Width">&#8596;</button>
+        </div>
     </div>
     <div id="viewer-container">
         <div id="viewer"></div>
@@ -294,11 +306,25 @@ export class PdfPreviewPanel {
     }
 
     /**
-     * Show/hide compiling indicator on the tab title
+     * Show/hide compiling indicator on the tab title and webview toolbar
      */
     static setCompiling(compiling: boolean): void {
         if (!PdfPreviewPanel.instance) return;
         PdfPreviewPanel.instance.panel.title = compiling ? '⟳ Compiling...' : 'PDF Preview';
+        PdfPreviewPanel.instance.panel.webview.postMessage({
+            type: 'setCompiling',
+            compiling,
+        });
+    }
+
+    /**
+     * Pin the tab so it stays open (not preview / ephemeral)
+     */
+    private pinTab(): void {
+        // Brief delay to ensure the panel tab is focused before pinning
+        setTimeout(() => {
+            vscode.commands.executeCommand('workbench.action.pinEditor');
+        }, 100);
     }
 
     dispose(): void {

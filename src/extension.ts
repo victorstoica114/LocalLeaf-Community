@@ -1520,18 +1520,10 @@ async function cmdCompileLaTeX() {
         compiler = settings.compiler as CompilerType;
     }
 
-    await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: `LocalLeaf: Compiling ${mainTex}...`,
-        cancellable: true,
-    }, async (progress, token) => {
-        token.onCancellationRequested(() => {
-            latexCompiler?.cancel();
-        });
-
-        const result = await latexCompiler!.compile(workspaceFolder.fsPath, mainTex, compiler);
-        handleCompilationResult(result);
-    });
+    // Use the same compilation flow as auto-compile (Ctrl+S)
+    handleCompilationStarted();
+    const result = await latexCompiler.compile(workspaceFolder.fsPath, mainTex, compiler);
+    handleCompilationResult(result);
 }
 
 /** Resolve function for the current compilation progress notification */
