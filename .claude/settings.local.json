@@ -14,7 +14,10 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)",
       "Bash(find E:\\\\Code\\\\Vibe\\\\LocalLeaf\\\\src:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(npx:*)",
+      "Bash(code:*)",
+      "Bash(unzip:*)"
     ]
   }
 }
