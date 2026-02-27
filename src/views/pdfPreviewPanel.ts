@@ -10,6 +10,12 @@ import * as fs from 'fs';
 import { spawn } from 'child_process';
 import { LatexCompiler } from '../compilation/latexCompiler';
 
+/** Decoration for SyncTeX jump highlight */
+const synctexHighlight = vscode.window.createTextEditorDecorationType({
+    backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
+    isWholeLine: true,
+});
+
 export class PdfPreviewPanel {
     static readonly viewType = 'localleaf.pdfPreview';
     private static instance: PdfPreviewPanel | undefined;
@@ -18,6 +24,7 @@ export class PdfPreviewPanel {
     private currentPdfPath?: string;
     private workspaceFolder: string;
     private disposables: vscode.Disposable[] = [];
+    private highlightDisposable?: vscode.Disposable;
 
     private constructor(extensionUri: vscode.Uri, pdfPath: string, workspaceFolder: string) {
         this.extensionUri = extensionUri;
@@ -225,6 +232,17 @@ export class PdfPreviewPanel {
                 new vscode.Range(pos, pos),
                 vscode.TextEditorRevealType.InCenter
             );
+
+            // Highlight the target line, clear on cursor move
+            const lineRange = new vscode.Range(safeLine, 0, safeLine, Number.MAX_SAFE_INTEGER);
+            editor.setDecorations(synctexHighlight, [lineRange]);
+
+            this.highlightDisposable?.dispose();
+            this.highlightDisposable = vscode.window.onDidChangeTextEditorSelection(() => {
+                editor.setDecorations(synctexHighlight, []);
+                this.highlightDisposable?.dispose();
+                this.highlightDisposable = undefined;
+            });
         } catch {
             // File may not exist — ignore
         }
@@ -329,6 +347,7 @@ export class PdfPreviewPanel {
 
     dispose(): void {
         PdfPreviewPanel.instance = undefined;
+        this.highlightDisposable?.dispose();
         this.panel.dispose();
         this.disposables.forEach(d => d.dispose());
     }
