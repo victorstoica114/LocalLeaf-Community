@@ -37,20 +37,40 @@ async function loadPdf(url) {
         var resp = await fetch(url, { cache: 'no-store' });
         var data = await resp.arrayBuffer();
 
-        // Destroy previous document to free memory
-        if (pdfDoc) {
-            try { pdfDoc.destroy(); } catch (_) {}
-        }
-
-        pdfDoc = await pdfjsLib.getDocument({ data: data }).promise;
-        totalPages = pdfDoc.numPages;
-        pageCount.textContent = totalPages;
-
-        await renderAllPages();
-        viewerContainer.scrollTop = scrollPosition;
+        await openPdfData(data);
     } catch (error) {
         viewer.innerHTML = '<div class="error-message">Failed to load PDF: ' + error.message + '</div>';
     }
+}
+
+async function loadPdfFromBase64(base64) {
+    try {
+        scrollPosition = viewerContainer.scrollTop;
+
+        var raw = atob(base64);
+        var bytes = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) {
+            bytes[i] = raw.charCodeAt(i);
+        }
+
+        await openPdfData(bytes.buffer);
+    } catch (error) {
+        viewer.innerHTML = '<div class="error-message">Failed to load PDF: ' + error.message + '</div>';
+    }
+}
+
+async function openPdfData(data) {
+    // Destroy previous document to free memory
+    if (pdfDoc) {
+        try { pdfDoc.destroy(); } catch (_) {}
+    }
+
+    pdfDoc = await pdfjsLib.getDocument({ data: data }).promise;
+    totalPages = pdfDoc.numPages;
+    pageCount.textContent = totalPages;
+
+    await renderAllPages();
+    viewerContainer.scrollTop = scrollPosition;
 }
 
 // ─── Rendering (canvas + text layer) ─────────────────────────────
@@ -206,6 +226,10 @@ viewer.addEventListener('dblclick', function (e) {
 window.addEventListener('message', function (event) {
     var msg = event.data;
     if (msg.type === 'updatePdf') {
-        loadPdf(msg.pdfUrl);
+        if (msg.pdfData) {
+            loadPdfFromBase64(msg.pdfData);
+        } else {
+            loadPdf(msg.pdfUrl);
+        }
     }
 });

@@ -6,6 +6,7 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { spawn } from 'child_process';
 import { LatexCompiler } from '../compilation/latexCompiler';
 
@@ -75,16 +76,27 @@ export class PdfPreviewPanel {
     }
 
     /**
-     * Refresh the PDF display with a new or updated PDF
+     * Refresh the PDF display with a new or updated PDF.
+     * Reads the file directly and sends raw bytes via postMessage
+     * to bypass the webview resource server (avoids truncated / stale responses
+     * that cause pdf.js XRef parse errors).
      */
     updatePdf(pdfPath: string): void {
         this.currentPdfPath = pdfPath;
-        const pdfUri = this.panel.webview.asWebviewUri(vscode.Uri.file(pdfPath));
-        // Append cache-busting query param so pdf.js re-fetches the file
-        this.panel.webview.postMessage({
-            type: 'updatePdf',
-            pdfUrl: pdfUri.toString() + '?t=' + Date.now(),
-        });
+        try {
+            const bytes = fs.readFileSync(pdfPath);
+            this.panel.webview.postMessage({
+                type: 'updatePdf',
+                pdfData: bytes.toString('base64'),
+            });
+        } catch {
+            // Fallback to URL-based loading
+            const pdfUri = this.panel.webview.asWebviewUri(vscode.Uri.file(pdfPath));
+            this.panel.webview.postMessage({
+                type: 'updatePdf',
+                pdfUrl: pdfUri.toString() + '?t=' + Date.now(),
+            });
+        }
     }
 
     // ─── Webview message handler ─────────────────────────────────

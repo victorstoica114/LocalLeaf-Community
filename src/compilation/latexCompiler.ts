@@ -113,6 +113,17 @@ export class LatexCompiler implements vscode.Disposable {
         // Build command arguments (with output directory)
         const args = this.buildArgs(selectedCompiler, mainTex, buildDir);
 
+        // Environment: add workspace root to search paths so bibtex/biber
+        // can find .bib/.bst files when output goes to a separate build dir.
+        const env = this.getCompileEnv(workspaceFolder);
+
+        // For non-latexmk compilers, run a preliminary pass + bibtex/biber
+        // so that \ref{} and \cite{} references resolve correctly.
+        // latexmk handles this automatically.
+        if (selectedCompiler !== 'latexmk') {
+            await this.runPreliminaryPasses(selectedCompiler, args, buildDir, mainTex, workspaceFolder, env);
+        }
+
         // Record PDF modification time before compilation so we can tell
         // whether the compiler actually produced new output
         const pdfFile = mainTex.replace(/\.tex$/, '.pdf');
@@ -132,6 +143,7 @@ export class LatexCompiler implements vscode.Disposable {
                 cwd: workspaceFolder,
                 shell: true,
                 stdio: 'pipe',
+                env,
             });
 
             this.currentProcess = proc;
@@ -395,6 +407,70 @@ export class LatexCompiler implements vscode.Disposable {
         for (const [uri, diagnostics] of diagnosticMap) {
             this.diagnosticCollection.set(vscode.Uri.parse(uri), diagnostics);
         }
+    }
+
+    /**
+     * Environment with workspace root in TeX search paths.
+     * Ensures bibtex/biber can locate .bib/.bst files when
+     * build output is redirected to a separate directory.
+     */
+    private getCompileEnv(workspaceFolder: string): NodeJS.ProcessEnv {
+        const sep = path.delimiter;
+        return {
+            ...process.env,
+            TEXINPUTS: `${workspaceFolder}${sep}${process.env.TEXINPUTS || ''}`,
+            BIBINPUTS: `${workspaceFolder}${sep}${process.env.BIBINPUTS || ''}`,
+            BSTINPUTS: `${workspaceFolder}${sep}${process.env.BSTINPUTS || ''}`,
+        };
+    }
+
+    /**
+     * Spawn a process and wait for it to finish.
+     */
+    private spawnAndWait(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<number | null> {
+        return new Promise((resolve) => {
+            const proc = spawn(command, args, { cwd, shell: true, stdio: 'pipe', env });
+            this.currentProcess = proc;
+            proc.on('close', (code) => { this.currentProcess = undefined; resolve(code); });
+            proc.on('error', () => { this.currentProcess = undefined; resolve(-1); });
+        });
+    }
+
+    /**
+     * Run a preliminary compilation pass + bibtex/biber so that
+     * \ref{} and \cite{} references are available for the final pass.
+     * Only needed for direct compilers (pdflatex, xelatex, lualatex);
+     * latexmk handles multiple passes automatically.
+     */
+    private async runPreliminaryPasses(
+        compiler: CompilerType,
+        args: string[],
+        buildDir: string,
+        mainTex: string,
+        workspaceFolder: string,
+        env: NodeJS.ProcessEnv,
+    ): Promise<void> {
+        // First pass — generates .aux with \citation{} and \label{} entries
+        await this.spawnAndWait(compiler, args, workspaceFolder, env);
+
+        // Detect and run bibtex or biber for bibliography
+        const mainBase = path.basename(mainTex, '.tex');
+        const auxBase = path.join(buildDir, mainBase);
+        const bcfPath = auxBase + '.bcf';
+        const auxPath = auxBase + '.aux';
+
+        if (fs.existsSync(bcfPath)) {
+            // BibLaTeX project → biber
+            await this.spawnAndWait('biber', [auxBase], workspaceFolder, env);
+        } else if (fs.existsSync(auxPath)) {
+            try {
+                const auxContent = fs.readFileSync(auxPath, 'utf-8');
+                if (auxContent.includes('\\citation{') || auxContent.includes('\\bibdata{')) {
+                    await this.spawnAndWait('bibtex', [auxBase], workspaceFolder, env);
+                }
+            } catch { /* .aux read failed — skip */ }
+        }
+        // Caller runs the final pass which resolves all references.
     }
 
     dispose(): void {
