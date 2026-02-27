@@ -871,6 +871,8 @@ async function cmdSyncNow() {
         }, async () => {
             await syncEngine!.pullAll();
             await syncEngine!.pushChanges();
+            // All changes have been synced — clear any remaining tracker entries
+            syncEngine!.changeTracker.clearAll();
         });
         vscode.window.showInformationMessage('LocalLeaf: Sync complete');
     } else {

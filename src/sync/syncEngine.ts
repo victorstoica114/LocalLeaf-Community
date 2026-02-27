@@ -135,6 +135,8 @@ export class SyncEngine {
     private _changeTracker: ChangeTracker = new ChangeTracker();
     /** Current sync mode */
     private _syncMode: SyncMode = 'manual';
+    /** Paths recently pushed — used to suppress echo from server in manual mode */
+    private _recentlyPushedPaths: Set<string> = new Set();
 
     readonly onStatusChange = this._onStatusChange.event;
 
@@ -885,6 +887,9 @@ export class SyncEngine {
 
         // Manual mode: record change instead of applying immediately
         if (this._syncMode === 'manual') {
+            if (this._recentlyPushedPaths.has(path)) {
+                return; // Skip echo of our own push
+            }
             this._changeTracker.addRemoteChange({
                 path,
                 type: 'created',
@@ -988,6 +993,9 @@ export class SyncEngine {
 
         // Manual mode: record change
         if (this._syncMode === 'manual') {
+            if (this._recentlyPushedPaths.has(oldPath) || this._recentlyPushedPaths.has(newPath)) {
+                return; // Skip echo of our own push
+            }
             this._changeTracker.addRemoteChange({
                 path: newPath,
                 type: 'renamed',
@@ -1048,6 +1056,9 @@ export class SyncEngine {
 
         // Manual mode: record change
         if (this._syncMode === 'manual') {
+            if (this._recentlyPushedPaths.has(entryPath)) {
+                return; // Skip echo of our own push
+            }
             this._changeTracker.addRemoteChange({
                 path: entryPath,
                 type: 'deleted',
@@ -1110,6 +1121,9 @@ export class SyncEngine {
 
         // Manual mode: record change
         if (this._syncMode === 'manual') {
+            if (this._recentlyPushedPaths.has(oldPath) || this._recentlyPushedPaths.has(newPath)) {
+                return; // Skip echo of our own push
+            }
             this._changeTracker.addRemoteChange({
                 path: newPath,
                 type: 'moved',
@@ -1154,6 +1168,9 @@ export class SyncEngine {
 
         // Manual mode: record change but don't modify local files
         if (this._syncMode === 'manual') {
+            if (this._recentlyPushedPaths.has(entry.path)) {
+                return; // Skip echo of our own push
+            }
             this._changeTracker.addRemoteChange({
                 path: entry.path,
                 type: 'modified',
@@ -1775,9 +1792,12 @@ export class SyncEngine {
 
             await this.settings.updateLastSynced();
 
-            // In manual mode, don't clear tracker — conflicts and outgoing changes are still pending.
-            // In realtime mode, everything was applied, so clear all.
-            if (this._syncMode !== 'manual') {
+            if (this._syncMode === 'manual') {
+                // In manual mode, clear remote changes — they've been reconciled by pullAll.
+                // Local changes are kept since they still need to be pushed.
+                this._changeTracker.clearRemote();
+            } else {
+                // In realtime mode, everything was applied, so clear all.
                 this._changeTracker.clearAll();
             }
 
@@ -2063,6 +2083,14 @@ export class SyncEngine {
 
         let pushedCount = 0;
 
+        // Mark all paths being pushed to suppress echoes from server
+        for (const change of localChanges) {
+            this._recentlyPushedPaths.add(change.path);
+            if (change.oldPath) {
+                this._recentlyPushedPaths.add(change.oldPath);
+            }
+        }
+
         try {
             for (const change of localChanges) {
                 switch (change.type) {
@@ -2168,6 +2196,14 @@ export class SyncEngine {
             const authErr = isAuthError(error);
             this.setStatus('error', authErr ? 'Session expired' : `Push failed: ${error}`, undefined, authErr);
             throw error;
+        } finally {
+            // Clear echo suppression after a delay to cover socket round-trip
+            const pushedPaths = new Set(this._recentlyPushedPaths);
+            setTimeout(() => {
+                for (const p of pushedPaths) {
+                    this._recentlyPushedPaths.delete(p);
+                }
+            }, DEBOUNCE_DELAY * 2);
         }
     }
 

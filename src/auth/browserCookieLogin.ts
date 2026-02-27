@@ -179,25 +179,27 @@ async function getPrioritizedExecutableCandidates(
 ): Promise<string[]> {
     const candidates: string[] = [];
 
-    if (preference === 'auto' || preference === 'system') {
+    if (preference === 'system') {
+        // Respect the OS-registered default browser
         const defaultExecutable = await getSystemDefaultBrowserExecutable(serverUrl, log);
         if (defaultExecutable) {
             if (isChromiumBrowserExecutable(defaultExecutable)) {
                 candidates.push(defaultExecutable);
             } else {
-                log?.(`Default browser is not Chromium-based, falling back to Edge/Chrome: ${defaultExecutable}`);
+                log?.(`Default browser is not Chromium-based, falling back to Chrome/Edge: ${defaultExecutable}`);
             }
         }
-    }
-
-    if (preference === 'chrome') {
+        // Fallback: Chrome first, then Edge
+        candidates.push(...getChromeExecutableCandidates());
+        candidates.push(...getEdgeExecutableCandidates());
+    } else if (preference === 'chrome') {
         candidates.push(...getChromeExecutableCandidates());
         candidates.push(...getEdgeExecutableCandidates());
     } else if (preference === 'edge') {
         candidates.push(...getEdgeExecutableCandidates());
         candidates.push(...getChromeExecutableCandidates());
     } else {
-        // fallback order when default browser is unavailable: Chrome first, then Edge
+        // 'auto': Chrome first, then Edge — no system default lookup
         candidates.push(...getChromeExecutableCandidates());
         candidates.push(...getEdgeExecutableCandidates());
     }

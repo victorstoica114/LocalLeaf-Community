@@ -8,7 +8,8 @@
       "Bash(where synctex:*)",
       "Bash(synctex help:*)",
       "Bash(node:*)",
-      "Bash(reg query:*)"
+      "Bash(reg query:*)",
+      "Bash(cmd:*)"
     ]
   }
 }

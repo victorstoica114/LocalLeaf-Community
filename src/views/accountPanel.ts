@@ -229,10 +229,10 @@ export class AccountPanel {
         <div class="row">
             <label for="browserPreference">Browser for Login via Browser</label>
             <select id="browserPreference">
-                <option value="system">System Default (Recommended)</option>
+                <option value="auto">Auto (Recommended)</option>
                 <option value="chrome">Google Chrome</option>
                 <option value="edge">Microsoft Edge</option>
-                <option value="auto">Auto</option>
+                <option value="system">System Default</option>
             </select>
         </div>
 
