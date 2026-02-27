@@ -173,7 +173,7 @@ body {
 }
 
 .textLayer ::selection {
-    background: rgba(0, 100, 200, 0.35);
+    background: rgba(0, 0, 255, 1);
 }
 
 .textLayer br::selection {

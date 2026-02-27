@@ -280,7 +280,7 @@ export class PdfPreviewPanel {
                    style-src ${webview.cspSource} 'unsafe-inline';
                    script-src 'nonce-${nonce}';
                    img-src ${webview.cspSource} data: blob:;
-                   font-src ${webview.cspSource};
+                   font-src ${webview.cspSource} blob: data:;
                    worker-src blob:;
                    connect-src ${webview.cspSource};">
     <link rel="stylesheet" href="${viewerCssUri}">
