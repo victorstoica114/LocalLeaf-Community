@@ -123,6 +123,9 @@ export class SyncEngine {
     private fileTreeByPath: Map<string, FileTreeEntry> = new Map();
     private fileCache: Map<string, FileCache> = new Map();
     private baseContent: Map<string, Uint8Array> = new Map();
+    private pendingRemoteDocContent: Map<string, Uint8Array> = new Map();
+    private docPushTimers: Map<string, NodeJS.Timeout> = new Map();
+    private pendingRemoteApplyTimers: Map<string, NodeJS.Timeout> = new Map();
     private ignoreParser: IgnoreParser;
     private _status: SyncStatus = 'disconnected';
     private _onStatusChange = new vscode.EventEmitter<SyncStatusEvent>();
@@ -136,9 +139,9 @@ export class SyncEngine {
     private _changeTracker: ChangeTracker = new ChangeTracker();
     /** Current sync mode */
     private _syncMode: SyncMode = 'manual';
-    /** Paths recently pushed — used to suppress echo from server in manual mode */
+    /** Paths recently pushed; used to suppress echo from server in manual mode */
     private _recentlyPushedPaths: Set<string> = new Set();
-    /** Paths currently being updated from remote — suppresses echo in handleLocalFileChange */
+    /** Paths currently being updated from remote; suppresses echo in handleLocalFileChange */
     private _remoteUpdatingPaths: Set<string> = new Set();
 
     readonly onStatusChange = this._onStatusChange.event;
@@ -200,7 +203,7 @@ export class SyncEngine {
 
         const oldMode = this._syncMode;
         this._syncMode = mode;
-        this.log(`Sync mode changed: ${oldMode} → ${mode}`);
+        this.log(`Sync mode changed: ${oldMode} -> ${mode}`);
 
         if (mode === 'realtime' && !options?.skipConfirmation) {
             // Switching to realtime: apply any pending changes first
@@ -486,6 +489,9 @@ export class SyncEngine {
             this.localWatcher.onDidChange(uri => this.handleLocalFileChange(uri)),
             this.localWatcher.onDidCreate(uri => this.handleLocalFileCreate(uri)),
             this.localWatcher.onDidDelete(uri => this.handleLocalFileDelete(uri)),
+            vscode.workspace.onDidChangeTextDocument(e => this.handleTextDocumentChange(e)),
+            vscode.workspace.onDidSaveTextDocument(doc => this.handleTextDocumentSaved(doc)),
+            vscode.workspace.onDidCloseTextDocument(doc => this.handleTextDocumentClosed(doc)),
             this.localWatcher
         );
     }
@@ -503,6 +509,271 @@ export class SyncEngine {
      */
     private shouldSync(relativePath: string): boolean {
         return !this.ignoreParser.shouldIgnore(relativePath);
+    }
+
+    /**
+     * Get relative path if a URI belongs to current workspace.
+     */
+    private tryGetRelativePath(uri: vscode.Uri): string | undefined {
+        const workspacePath = this.settings.getWorkspaceFolder().path;
+        if (!uri.path.startsWith(workspacePath)) {
+            return undefined;
+        }
+        return uri.path.slice(workspacePath.length);
+    }
+
+    /**
+     * Get open text document by synced relative path.
+     */
+    private getOpenTextDocument(relativePath: string): vscode.TextDocument | undefined {
+        const targetUri = this.settings.getFilePath(relativePath);
+        return vscode.workspace.textDocuments.find(d => d.uri.toString() === targetUri.toString());
+    }
+
+    /**
+     * Apply content to an open document buffer without touching on-disk file.
+     * Returns true if the buffer update succeeded.
+     */
+    private async applyContentToOpenDocument(
+        path: string,
+        doc: vscode.TextDocument,
+        content: Uint8Array
+    ): Promise<boolean> {
+        const text = new TextDecoder().decode(content);
+        if (doc.getText() === text) {
+            return true;
+        }
+
+        this._remoteUpdatingPaths.add(path);
+        try {
+            const fullRange = new vscode.Range(
+                doc.positionAt(0),
+                doc.positionAt(doc.getText().length)
+            );
+
+            const visibleEditor = vscode.window.visibleTextEditors.find(
+                e => e.document.uri.toString() === doc.uri.toString()
+            );
+
+            if (visibleEditor) {
+                return await visibleEditor.edit((editBuilder) => {
+                    editBuilder.replace(fullRange, text);
+                }, { undoStopBefore: false, undoStopAfter: false });
+            }
+
+            const edit = new vscode.WorkspaceEdit();
+            edit.replace(doc.uri, fullRange, text);
+            return await vscode.workspace.applyEdit(edit);
+        } finally {
+            this._remoteUpdatingPaths.delete(path);
+        }
+    }
+
+    /**
+     * Handle in-memory text edits for unsaved realtime doc syncing.
+     */
+    private handleTextDocumentChange(event: vscode.TextDocumentChangeEvent): void {
+        if (this._syncMode !== 'realtime') {
+            return;
+        }
+        if (!this.socket) {
+            return;
+        }
+
+        if (event.contentChanges.length === 0) {
+            return;
+        }
+
+        const doc = event.document;
+        if (doc.uri.scheme !== 'file') {
+            return;
+        }
+
+        const relativePath = this.tryGetRelativePath(doc.uri);
+        if (!relativePath || !this.shouldSync(relativePath)) {
+            return;
+        }
+
+        if (this._remoteUpdatingPaths.has(relativePath)) {
+            return;
+        }
+
+        const entry = this.fileTreeByPath.get(relativePath);
+        if (!entry || entry.type !== 'doc') {
+            return;
+        }
+
+        const existingTimer = this.docPushTimers.get(relativePath);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+        }
+
+        const timer = setTimeout(async () => {
+            this.docPushTimers.delete(relativePath);
+
+            const currentDoc = this.getOpenTextDocument(relativePath);
+            if (!currentDoc) {
+                return;
+            }
+
+            const content = new TextEncoder().encode(currentDoc.getText());
+            if (!this.shouldPropagate('push', relativePath, content)) {
+                return;
+            }
+
+            await this.acquireLock(relativePath);
+            try {
+                const currentEntry = this.fileTreeByPath.get(relativePath);
+                if (!currentEntry || currentEntry.type !== 'doc') {
+                    return;
+                }
+
+                this.setStatus('pushing', `Uploading ${relativePath}`, relativePath);
+                const pushed = await this.pushDocumentChanges(currentEntry.id, relativePath, content);
+                if (pushed) {
+                    this.log(`Pushed to Overleaf: ${relativePath}`);
+                }
+
+                this.baseContent.set(relativePath, content);
+                this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
+                this.setStatus('idle');
+            } catch (error) {
+                console.error(`[LocalLeaf] Failed to sync in-memory doc ${relativePath}:`, error);
+                const authErr = isAuthError(error);
+                this.setStatus('error', authErr ? 'Session expired' : `Failed to sync: ${error}`, undefined, authErr);
+            } finally {
+                this.releaseLock(relativePath);
+            }
+        }, DEBOUNCE_DELAY);
+
+        this.docPushTimers.set(relativePath, timer);
+    }
+
+    /**
+     * Handle doc save event to reconcile queued remote updates.
+     */
+    private handleTextDocumentSaved(doc: vscode.TextDocument): void {
+        if (doc.uri.scheme !== 'file') {
+            return;
+        }
+        const relativePath = this.tryGetRelativePath(doc.uri);
+        if (!relativePath) {
+            return;
+        }
+
+        // Saved content is now on disk; clear immediate push debounce.
+        const existingTimer = this.docPushTimers.get(relativePath);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+            this.docPushTimers.delete(relativePath);
+        }
+
+        if (this.pendingRemoteDocContent.has(relativePath)) {
+            // Give local save-triggered push time to settle before applying queued remote.
+            this.schedulePendingRemoteApply(relativePath, DEBOUNCE_DELAY * 2);
+        }
+    }
+
+    /**
+     * Handle doc close event to apply queued remote content if needed.
+     */
+    private handleTextDocumentClosed(doc: vscode.TextDocument): void {
+        if (doc.uri.scheme !== 'file') {
+            return;
+        }
+        const relativePath = this.tryGetRelativePath(doc.uri);
+        if (!relativePath) {
+            return;
+        }
+
+        const existingTimer = this.docPushTimers.get(relativePath);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+            this.docPushTimers.delete(relativePath);
+        }
+
+        if (this.pendingRemoteDocContent.has(relativePath)) {
+            this.schedulePendingRemoteApply(relativePath, 0);
+        }
+    }
+
+    /**
+     * Schedule applying queued remote content for a path.
+     */
+    private schedulePendingRemoteApply(path: string, delayMs: number): void {
+        const existing = this.pendingRemoteApplyTimers.get(path);
+        if (existing) {
+            clearTimeout(existing);
+        }
+
+        const timer = setTimeout(async () => {
+            this.pendingRemoteApplyTimers.delete(path);
+            await this.applyPendingRemoteUpdate(path);
+        }, delayMs);
+        this.pendingRemoteApplyTimers.set(path, timer);
+    }
+
+    /**
+     * Apply queued remote doc snapshot once local editor buffer is no longer dirty.
+     */
+    private async applyPendingRemoteUpdate(path: string): Promise<void> {
+        const queued = this.pendingRemoteDocContent.get(path);
+        if (!queued) {
+            return;
+        }
+
+        const entry = this.fileTreeByPath.get(path);
+        if (!entry || entry.type !== 'doc') {
+            this.pendingRemoteDocContent.delete(path);
+            return;
+        }
+
+        const openDoc = this.getOpenTextDocument(path);
+        if (openDoc?.isDirty) {
+            return;
+        }
+
+        await this.acquireLock(path);
+        try {
+            const latest = await this.fetchDocContentBytes(entry.id, true) || queued;
+
+            const latestOpenDoc = this.getOpenTextDocument(path);
+            if (latestOpenDoc?.isDirty) {
+                const applied = await this.applyContentToOpenDocument(path, latestOpenDoc, latest);
+                if (applied) {
+                    this.baseContent.set(path, latest);
+                    this.fileCache.set(path, { hash: hashContent(latest), timestamp: Date.now() });
+                    this.pendingRemoteDocContent.delete(path);
+                }
+                return;
+            }
+
+            const localUri = this.settings.getFilePath(path);
+            let localContent: Uint8Array | undefined;
+            try {
+                localContent = await vscode.workspace.fs.readFile(localUri);
+            } catch {
+                localContent = undefined;
+            }
+
+            if (!contentEquals(localContent, latest)) {
+                this._remoteUpdatingPaths.add(path);
+                try {
+                    await vscode.workspace.fs.writeFile(localUri, latest);
+                    this.log(`Applied queued remote update: ${path}`);
+                } finally {
+                    this._remoteUpdatingPaths.delete(path);
+                }
+            }
+
+            this.baseContent.set(path, latest);
+            this.fileCache.set(path, { hash: hashContent(latest), timestamp: Date.now() });
+            this.pendingRemoteDocContent.delete(path);
+        } catch (error) {
+            console.error(`[LocalLeaf] Failed to apply queued remote update ${path}:`, error);
+        } finally {
+            this.releaseLock(path);
+        }
     }
 
     /**
@@ -629,6 +900,37 @@ export class SyncEngine {
         for (const move of cacheMoves) {
             this.fileCache.set(move.newPath, move.cache);
         }
+
+        const pendingRemoteMoves: Array<{ oldPath: string; newPath: string; content: Uint8Array }> = [];
+        for (const [path, content] of this.pendingRemoteDocContent.entries()) {
+            const matches = path === oldPrefix || (includeDescendants && path.startsWith(oldPrefix));
+            if (!matches) continue;
+            const newPath = path === oldPrefix ? newPrefix : newPrefix + path.slice(oldPrefix.length);
+            pendingRemoteMoves.push({ oldPath: path, newPath, content });
+        }
+        for (const move of pendingRemoteMoves) {
+            this.pendingRemoteDocContent.delete(move.oldPath);
+        }
+        for (const move of pendingRemoteMoves) {
+            this.pendingRemoteDocContent.set(move.newPath, move.content);
+        }
+
+        const timerMaps: Array<Map<string, NodeJS.Timeout>> = [
+            this.docPushTimers,
+            this.pendingRemoteApplyTimers,
+        ];
+        for (const timers of timerMaps) {
+            const keys = Array.from(timers.keys());
+            for (const key of keys) {
+                const matches = key === oldPrefix || (includeDescendants && key.startsWith(oldPrefix));
+                if (!matches) continue;
+                const timeout = timers.get(key);
+                if (timeout) {
+                    clearTimeout(timeout);
+                }
+                timers.delete(key);
+            }
+        }
     }
 
     /**
@@ -673,6 +975,32 @@ export class SyncEngine {
         }
         for (const p of cacheToDelete) {
             this.fileCache.delete(p);
+        }
+
+        const pendingToDelete: string[] = [];
+        for (const path of this.pendingRemoteDocContent.keys()) {
+            const matches = path === pathPrefix || (includeDescendants && path.startsWith(pathPrefix));
+            if (matches) pendingToDelete.push(path);
+        }
+        for (const p of pendingToDelete) {
+            this.pendingRemoteDocContent.delete(p);
+        }
+
+        const timerMaps: Array<Map<string, NodeJS.Timeout>> = [
+            this.docPushTimers,
+            this.pendingRemoteApplyTimers,
+        ];
+        for (const timers of timerMaps) {
+            const keys = Array.from(timers.keys());
+            for (const key of keys) {
+                const matches = key === pathPrefix || (includeDescendants && key.startsWith(pathPrefix));
+                if (!matches) continue;
+                const timeout = timers.get(key);
+                if (timeout) {
+                    clearTimeout(timeout);
+                }
+                timers.delete(key);
+            }
         }
 
         return removedEntries;
@@ -1398,61 +1726,48 @@ export class SyncEngine {
                 return;
             }
 
-            // Check if document is open in any editor
-            const openDoc = vscode.workspace.textDocuments.find(
-                d => d.uri.toString() === localUri.toString()
-            );
-
-            if (openDoc) {
-                const remoteText = new TextDecoder().decode(remoteBytes);
-                if (openDoc.getText() !== remoteText) {
-                    this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
-                    this._remoteUpdatingPaths.add(entry.path);
-                    try {
-                        // Always write to disk first
-                        await vscode.workspace.fs.writeFile(localUri, remoteBytes);
-
-                        const activeEditor = vscode.window.activeTextEditor;
-                        if (openDoc.isDirty && activeEditor && activeEditor.document.uri.toString() === localUri.toString()) {
-                            // Active dirty editor: revert from disk so remote changes
-                            // don't pollute the undo stack. This makes remote content
-                            // the new editing baseline.
-                            const savedSelections = activeEditor.selections;
-                            const savedVisibleRanges = activeEditor.visibleRanges;
-                            await vscode.commands.executeCommand('workbench.action.files.revert');
-                            activeEditor.selections = savedSelections;
-                            if (savedVisibleRanges.length > 0) {
-                                activeEditor.revealRange(savedVisibleRanges[0]);
-                            }
-                        } else if (openDoc.isDirty) {
-                            // Non-active dirty editor: apply to buffer + save to avoid
-                            // the "file is newer" conflict when user switches to this tab
-                            const edit = new vscode.WorkspaceEdit();
-                            const fullRange = new vscode.Range(
-                                openDoc.positionAt(0),
-                                openDoc.positionAt(openDoc.getText().length)
-                            );
-                            edit.replace(openDoc.uri, fullRange, remoteText);
-                            await vscode.workspace.applyEdit(edit);
-                            await openDoc.save();
-                        }
-                        // Non-dirty open docs: VS Code auto-reloads from disk
-                    } finally {
-                        this._remoteUpdatingPaths.delete(entry.path);
-                    }
-                    this.log(`Remote update: ${entry.path}`);
+            let appliedBytes = remoteBytes;
+            const openDoc = this.getOpenTextDocument(entry.path);
+            if (openDoc?.isDirty) {
+                // Dirty editor: push in-memory local text first, then merge latest remote into buffer.
+                const pendingPushTimer = this.docPushTimers.get(entry.path);
+                if (pendingPushTimer) {
+                    clearTimeout(pendingPushTimer);
+                    this.docPushTimers.delete(entry.path);
                 }
-            } else {
-                // File not open — write to disk directly
-                if (!contentEquals(localBytes, remoteBytes)) {
-                    this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
+
+                const localDocBytes = new TextEncoder().encode(openDoc.getText());
+                if (this.shouldPropagate('push', entry.path, localDocBytes)) {
+                    try {
+                        await this.pushDocumentChanges(entry.id, entry.path, localDocBytes);
+                        this.baseContent.set(entry.path, localDocBytes);
+                        this.fileCache.set(entry.path, { hash: hashContent(localDocBytes), timestamp: Date.now() });
+                    } catch {
+                        // Continue with remote reconciliation even if local push fails.
+                    }
+                }
+
+                const mergedBytes = await this.fetchDocContentBytes(update.doc, true) || remoteBytes;
+                const applied = await this.applyContentToOpenDocument(entry.path, openDoc, mergedBytes);
+                if (!applied) {
+                    this.pendingRemoteDocContent.set(entry.path, mergedBytes);
+                    this.schedulePendingRemoteApply(entry.path, DEBOUNCE_DELAY);
+                }
+
+                appliedBytes = mergedBytes;
+            } else if (!contentEquals(localBytes, remoteBytes)) {
+                this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
+                this._remoteUpdatingPaths.add(entry.path);
+                try {
                     await vscode.workspace.fs.writeFile(localUri, remoteBytes);
                     this.log(`Remote update: ${entry.path}`);
+                } finally {
+                    this._remoteUpdatingPaths.delete(entry.path);
                 }
             }
 
-            this.baseContent.set(entry.path, remoteBytes);
-            this.fileCache.set(entry.path, { hash: hashContent(remoteBytes), timestamp: Date.now() });
+            this.baseContent.set(entry.path, appliedBytes);
+            this.fileCache.set(entry.path, { hash: hashContent(appliedBytes), timestamp: Date.now() });
 
             this.setStatus('idle');
         } catch (error) {
@@ -1561,7 +1876,7 @@ export class SyncEngine {
             await vscode.commands.executeCommand('vscode.diff',
                 localUri,
                 remoteUri,
-                `${filePath} (Local ↔ Remote)`
+                `${filePath} (Local <-> Remote)`
             );
         } finally {
             // Keep provider registered while diff is open
@@ -1573,7 +1888,7 @@ export class SyncEngine {
      * Ask user how to resolve conflict
      */
     private async askConflictResolution(filePath: string, localUri: vscode.Uri, remoteContent: Uint8Array): Promise<'useRemote' | 'useLocal' | 'skip'> {
-        // In manual mode, never block — record conflict and skip
+        // In manual mode, never block; record conflict and skip
         if (this._syncMode === 'manual') {
             this._changeTracker.addLocalChange({
                 path: filePath,
@@ -1587,7 +1902,7 @@ export class SyncEngine {
                 source: 'remote',
                 timestamp: Date.now(),
             });
-            debugLog('askConflictResolution: manual mode — recorded conflict for', filePath);
+            debugLog('askConflictResolution: manual mode; recorded conflict for', filePath);
             return 'skip';
         }
 
@@ -1658,7 +1973,7 @@ export class SyncEngine {
 
     /**
      * Handle local files that were deleted on Overleaf.
-     * Auto-keeps locally — the user can resolve via the Changes panel.
+     * Auto-keeps locally; the user can resolve via the Changes panel.
      */
     private async handleOrphanedLocalFiles(orphanedPaths: string[]): Promise<void> {
         if (orphanedPaths.length === 0) return;
@@ -2056,7 +2371,7 @@ export class SyncEngine {
             await this.settings.updateLastSynced();
 
             if (this._syncMode === 'manual') {
-                // In manual mode, clear remote changes — they've been reconciled by pullAll.
+                // In manual mode, clear remote changes; they've been reconciled by pullAll.
                 // Local changes are kept since they still need to be pushed.
                 this._changeTracker.clearRemote();
             } else {
@@ -2191,18 +2506,18 @@ export class SyncEngine {
                         const remoteChanged = base ? !contentEquals(remoteContent, base) : true;
 
                         if (!localChanged && !remoteChanged) {
-                            // No changes — skip
+                            // No changes; skip
                         } else if (!localChanged && remoteChanged) {
-                            // Only remote changed — safe to pull
+                            // Only remote changed; safe to pull
                             await vscode.workspace.fs.writeFile(localUri, remoteContent);
                             this.baseContent.set(change.path, remoteContent);
                             this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                             appliedCount++;
                         } else if (localChanged && !remoteChanged) {
-                            // Only local changed — nothing to pull
+                            // Only local changed; nothing to pull
                             skippedCount++;
                         } else if (localContent && contentEquals(localContent, remoteContent)) {
-                            // Both changed to same content — update base
+                            // Both changed to same content; update base
                             this.baseContent.set(change.path, remoteContent);
                             this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                         } else {
@@ -2215,7 +2530,7 @@ export class SyncEngine {
                                 this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                                 appliedCount++;
                             } else if (resolution === 'useLocal') {
-                                // Keep local — base stays as-is, user will push
+                                // Keep local; base stays as-is, user will push
                             } else {
                                 skippedCount++;
                             }
@@ -2522,6 +2837,15 @@ export class SyncEngine {
         this._changeTracker.dispose();
         this.socket?.disconnect();
         this.socket = undefined;
+        for (const timer of this.docPushTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.docPushTimers.clear();
+        for (const timer of this.pendingRemoteApplyTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.pendingRemoteApplyTimers.clear();
+        this.pendingRemoteDocContent.clear();
         this.disposables.forEach(d => d.dispose());
         this.disposables = [];
         this.setStatus('disconnected');
@@ -2534,3 +2858,4 @@ export class SyncEngine {
         return this.fileTree;
     }
 }
+
