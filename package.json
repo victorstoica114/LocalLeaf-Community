@@ -228,14 +228,9 @@
           "group": "navigation@3"
         },
         {
-          "command": "localleaf.toggleSyncMode",
-          "when": "view == localleaf.changesView",
-          "group": "navigation@4"
-        },
-        {
           "command": "localleaf.compileLaTeX",
           "when": "view == localleaf.changesView",
-          "group": "navigation@5"
+          "group": "navigation@4"
         },
         {
           "command": "localleaf.showPdfPreview",

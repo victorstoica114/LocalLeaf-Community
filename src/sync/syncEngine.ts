@@ -128,6 +128,7 @@ export class SyncEngine {
     private _onStatusChange = new vscode.EventEmitter<SyncStatusEvent>();
     private disposables: vscode.Disposable[] = [];
     private syncLock: Set<string> = new Set();
+    private lockQueues: Map<string, Array<() => void>> = new Map();
     private joinedDocs: Set<string> = new Set();
     private logFn?: (message: string) => void;
 
@@ -529,19 +530,150 @@ export class SyncEngine {
     /**
      * Acquire sync lock for a path
      */
-    private acquireLock(path: string): boolean {
-        if (this.syncLock.has(path)) {
-            return false;
+    private async acquireLock(path: string): Promise<void> {
+        if (!this.syncLock.has(path)) {
+            this.syncLock.add(path);
+            return;
         }
+
+        await new Promise<void>((resolve) => {
+            const queue = this.lockQueues.get(path) || [];
+            queue.push(resolve);
+            this.lockQueues.set(path, queue);
+        });
+
+        // Lock ownership is effectively handed off by releaseLock.
         this.syncLock.add(path);
-        return true;
     }
 
     /**
      * Release sync lock for a path
      */
     private releaseLock(path: string): void {
+        const queue = this.lockQueues.get(path);
+        const next = queue?.shift();
+
+        if (queue && queue.length === 0) {
+            this.lockQueues.delete(path);
+        }
+
+        if (next) {
+            // Keep the lock held while handing over to the next waiter.
+            next();
+            return;
+        }
+
         this.syncLock.delete(path);
+    }
+
+    /**
+     * Update paths in the in-memory file tree.
+     */
+    private moveTreePaths(oldPrefix: string, newPrefix: string, includeDescendants: boolean): void {
+        type EntryMove = { entry: FileTreeEntry; oldPath: string; newPath: string };
+        const entryMoves: EntryMove[] = [];
+
+        for (const entry of this.fileTree.values()) {
+            const matches = entry.path === oldPrefix ||
+                (includeDescendants && entry.path.startsWith(oldPrefix));
+            if (!matches) continue;
+
+            const newPath = entry.path === oldPrefix
+                ? newPrefix
+                : newPrefix + entry.path.slice(oldPrefix.length);
+            entryMoves.push({ entry, oldPath: entry.path, newPath });
+        }
+
+        for (const move of entryMoves) {
+            this.fileTreeByPath.delete(move.oldPath);
+        }
+        for (const move of entryMoves) {
+            move.entry.path = move.newPath;
+            this.fileTreeByPath.set(move.newPath, move.entry);
+        }
+    }
+
+    /**
+     * Update file paths in tree and caches when a path prefix changes.
+     * Used for rename/move operations, including recursive folder updates.
+     */
+    private movePathTracking(oldPrefix: string, newPrefix: string, includeDescendants: boolean): void {
+        this.moveTreePaths(oldPrefix, newPrefix, includeDescendants);
+
+        const contentMoves: Array<{ oldPath: string; newPath: string; content: Uint8Array }> = [];
+        for (const [path, content] of this.baseContent.entries()) {
+            const matches = path === oldPrefix || (includeDescendants && path.startsWith(oldPrefix));
+            if (!matches) continue;
+            const newPath = path === oldPrefix ? newPrefix : newPrefix + path.slice(oldPrefix.length);
+            contentMoves.push({ oldPath: path, newPath, content });
+        }
+        for (const move of contentMoves) {
+            this.baseContent.delete(move.oldPath);
+        }
+        for (const move of contentMoves) {
+            this.baseContent.set(move.newPath, move.content);
+        }
+
+        const cacheMoves: Array<{ oldPath: string; newPath: string; cache: FileCache }> = [];
+        for (const [path, cache] of this.fileCache.entries()) {
+            const matches = path === oldPrefix || (includeDescendants && path.startsWith(oldPrefix));
+            if (!matches) continue;
+            const newPath = path === oldPrefix ? newPrefix : newPrefix + path.slice(oldPrefix.length);
+            cacheMoves.push({ oldPath: path, newPath, cache });
+        }
+        for (const move of cacheMoves) {
+            this.fileCache.delete(move.oldPath);
+        }
+        for (const move of cacheMoves) {
+            this.fileCache.set(move.newPath, move.cache);
+        }
+    }
+
+    /**
+     * Remove file tree entries by path or path prefix.
+     */
+    private removeTreeEntries(pathPrefix: string, includeDescendants: boolean): FileTreeEntry[] {
+        const removedEntries: FileTreeEntry[] = [];
+        for (const entry of this.fileTree.values()) {
+            const matches = entry.path === pathPrefix ||
+                (includeDescendants && entry.path.startsWith(pathPrefix));
+            if (!matches) continue;
+            removedEntries.push(entry);
+        }
+
+        for (const entry of removedEntries) {
+            this.fileTree.delete(entry.id);
+            this.fileTreeByPath.delete(entry.path);
+        }
+        return removedEntries;
+    }
+
+    /**
+     * Remove file tree entries and caches by path or path prefix.
+     * Returns removed tree entries for additional cleanup (e.g. joined docs).
+     */
+    private removePathTracking(pathPrefix: string, includeDescendants: boolean): FileTreeEntry[] {
+        const removedEntries = this.removeTreeEntries(pathPrefix, includeDescendants);
+
+        const baseToDelete: string[] = [];
+        for (const path of this.baseContent.keys()) {
+            const matches = path === pathPrefix || (includeDescendants && path.startsWith(pathPrefix));
+            if (matches) baseToDelete.push(path);
+        }
+        for (const p of baseToDelete) {
+            this.baseContent.delete(p);
+        }
+
+        const cacheToDelete: string[] = [];
+        for (const path of this.fileCache.keys()) {
+            const matches = path === pathPrefix || (includeDescendants && path.startsWith(pathPrefix));
+            if (matches) cacheToDelete.push(path);
+        }
+        for (const p of cacheToDelete) {
+            this.fileCache.delete(p);
+        }
+
+        return removedEntries;
     }
 
     // === Local change handlers ===
@@ -567,7 +699,7 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(relativePath)) return;
+        await this.acquireLock(relativePath);
 
         try {
             // Read file content - may throw if file was deleted between watcher event and now
@@ -636,35 +768,92 @@ export class SyncEngine {
     private async pushDocumentChanges(docId: string, path: string, newContent: Uint8Array): Promise<boolean> {
         if (!this.socket) return false;
 
-        try {
-            // Join document to get current version (even if already joined for watching)
-            const { lines: remoteLines, version } = await this.socket.joinDoc(docId);
-            const remoteContent = remoteLines.join('\n');
-            const localContent = new TextDecoder().decode(newContent);
+        const localContent = new TextDecoder().decode(newContent);
+        const maxAttempts = 4;
 
-            // Calculate diff and create OT operations
-            const ops = this.calculateOps(remoteContent, localContent);
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                // Join document to get current authoritative version.
+                const { lines: remoteLines, version } = await this.socket.joinDoc(docId);
+                const remoteContent = remoteLines.join('\n');
 
-            if (ops.length > 0) {
+                // Keep doc joined for watching.
+                this.joinedDocs.add(docId);
+
+                if (remoteContent === localContent) {
+                    return false;
+                }
+
+                const ops = this.calculateOps(remoteContent, localContent);
                 const update: DocumentUpdate = {
                     doc: docId,
                     op: ops,
                     v: version,
+                    lastV: version,
                 };
+
                 await this.socket.applyOtUpdate(docId, update);
-
-                // Keep doc joined for watching
-                this.joinedDocs.add(docId);
                 return true;
-            }
+            } catch (error) {
+                const isRetryable = this.isVersionConflictError(error);
+                const isLastAttempt = attempt === maxAttempts;
 
-            // Keep doc joined for watching even if no changes
-            this.joinedDocs.add(docId);
-            return false;
-        } catch (error) {
-            console.error(`[LocalLeaf] OT update failed for ${path}:`, error);
-            throw error;
+                if (isRetryable && !isLastAttempt) {
+                    // Another collaborator updated between join/apply; retry with fresh version.
+                    await new Promise(resolve => setTimeout(resolve, 40 * attempt));
+                    continue;
+                }
+
+                console.error(`[LocalLeaf] OT update failed for ${path}:`, error);
+                throw error;
+            }
         }
+
+        return false;
+    }
+
+    /**
+     * Detect OT version/conflict errors that are safe to retry.
+     */
+    private isVersionConflictError(error: unknown): boolean {
+        const text = String(error).toLowerCase();
+        return text.includes('version') ||
+            text.includes('transform') ||
+            text.includes('stale') ||
+            text.includes('out of date') ||
+            text.includes('conflict');
+    }
+
+    /**
+     * Fetch full document content from remote.
+     * Preserves existing joined-doc subscriptions by default.
+     */
+    private async fetchDocContentBytes(docId: string, preserveJoined: boolean = true): Promise<Uint8Array | undefined> {
+        const projectSettings = this.settings.getSettings();
+        if (!projectSettings) {
+            return undefined;
+        }
+
+        if (this.socket) {
+            try {
+                const wasJoined = this.joinedDocs.has(docId);
+                const { lines } = await this.socket.joinDoc(docId);
+                if (!wasJoined && !preserveJoined) {
+                    await this.socket.leaveDoc(docId);
+                } else {
+                    this.joinedDocs.add(docId);
+                }
+                return new TextEncoder().encode(lines.join('\n'));
+            } catch {
+                // Fall back to HTTP
+            }
+        }
+
+        const result = await this.api.getDocContent(projectSettings.projectId, docId);
+        if (result.type === 'success' && result.lines) {
+            return new TextEncoder().encode(result.lines.join('\n'));
+        }
+        return undefined;
     }
 
     /**
@@ -706,7 +895,7 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(relativePath)) return;
+        await this.acquireLock(relativePath);
 
         try {
             // Stat the file - may throw if file was deleted between watcher event and now
@@ -765,8 +954,14 @@ export class SyncEngine {
 
                 const isTextFile = this.isTextFile(name);
 
-                if (isTextFile) {
-                    await this.api.addDoc(projectSettings.projectId, parentId, name);
+                if (isTextFile && this.socket) {
+                    await this.createTextDocWithContent(
+                        projectSettings.projectId,
+                        parentId,
+                        relativePath,
+                        name,
+                        content
+                    );
                 } else {
                     await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
                 }
@@ -816,7 +1011,7 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(relativePath)) return;
+        await this.acquireLock(relativePath);
 
         try {
             // Try both file path and folder path (with trailing slash)
@@ -846,10 +1041,16 @@ export class SyncEngine {
 
             await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
 
-            this.fileTree.delete(entry.id);
-            this.fileTreeByPath.delete(pathToUse);
-            this.baseContent.delete(pathToUse);
-            this.fileCache.delete(pathToUse);
+            const removedEntries = this.removePathTracking(pathToUse, entry.type === 'folder');
+            for (const removed of removedEntries) {
+                if (removed.type !== 'doc' || !this.joinedDocs.has(removed.id)) continue;
+                try {
+                    await this.socket?.leaveDoc(removed.id);
+                } catch {
+                    // Ignore leave errors
+                }
+                this.joinedDocs.delete(removed.id);
+            }
 
             this.log(`Deleted from Overleaf: ${pathToUse}`);
             this.setStatus('idle');
@@ -901,7 +1102,7 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(path)) return;
+        await this.acquireLock(path);
 
         try {
             this.setStatus('pulling', `Downloading ${path}`, path);
@@ -987,9 +1188,7 @@ export class SyncEngine {
 
         // Always update file tree
         entry.name = newName;
-        entry.path = newPath;
-        this.fileTreeByPath.delete(oldPath);
-        this.fileTreeByPath.set(newPath, entry);
+        this.moveTreePaths(oldPath, newPath, entry.type === 'folder');
 
         // Manual mode: record change
         if (this._syncMode === 'manual') {
@@ -1008,7 +1207,7 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(oldPath)) return;
+        await this.acquireLock(oldPath);
 
         try {
             this.setStatus('pulling', `Renaming ${oldPath} to ${newPath}`, oldPath);
@@ -1018,17 +1217,8 @@ export class SyncEngine {
             const newUri = this.settings.getFilePath(newPath);
             await vscode.workspace.fs.rename(oldUri, newUri);
 
-            // Update caches
-            const content = this.baseContent.get(oldPath);
-            if (content) {
-                this.baseContent.delete(oldPath);
-                this.baseContent.set(newPath, content);
-            }
-            const cache = this.fileCache.get(oldPath);
-            if (cache) {
-                this.fileCache.delete(oldPath);
-                this.fileCache.set(newPath, cache);
-            }
+            // Keep caches aligned with the path transition.
+            this.movePathTracking(oldPath, newPath, entry.type === 'folder');
 
             this.setStatus('idle');
         } catch (error) {
@@ -1050,14 +1240,17 @@ export class SyncEngine {
         const entryPath = entry.path;
         const entryType = entry.type;
 
-        // Always update file tree
-        this.fileTree.delete(entityId);
-        this.fileTreeByPath.delete(entryPath);
+        // Always update file tree (recursively for folders)
+        const removedEntries = this.removeTreeEntries(entryPath, entryType === 'folder');
 
         // Manual mode: record change
         if (this._syncMode === 'manual') {
             if (this._recentlyPushedPaths.has(entryPath)) {
                 return; // Skip echo of our own push
+            }
+            for (const removed of removedEntries) {
+                if (removed.type !== 'doc') continue;
+                this.joinedDocs.delete(removed.id);
             }
             this._changeTracker.addRemoteChange({
                 path: entryPath,
@@ -1070,27 +1263,27 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(entryPath)) return;
+        await this.acquireLock(entryPath);
 
         try {
             this.setStatus('pulling', `Deleting ${entryPath}`, entryPath);
 
-            // Leave doc if joined
-            if (entryType === 'doc' && this.joinedDocs.has(entityId)) {
+            // Leave all removed docs if joined.
+            for (const removed of removedEntries) {
+                if (removed.type !== 'doc' || !this.joinedDocs.has(removed.id)) continue;
                 try {
-                    await this.socket?.leaveDoc(entityId);
+                    await this.socket?.leaveDoc(removed.id);
                 } catch {
                     // Ignore leave errors
                 }
-                this.joinedDocs.delete(entityId);
+                this.joinedDocs.delete(removed.id);
             }
 
             // Delete local file
             const localUri = this.settings.getFilePath(entryPath);
             await vscode.workspace.fs.delete(localUri, { recursive: true });
 
-            this.baseContent.delete(entryPath);
-            this.fileCache.delete(entryPath);
+            this.removePathTracking(entryPath, entryType === 'folder');
 
             this.setStatus('idle');
         } catch (error) {
@@ -1114,10 +1307,8 @@ export class SyncEngine {
             : newParent.path + entry.name;
 
         // Always update file tree
-        entry.path = newPath;
         entry.parentId = newParentId;
-        this.fileTreeByPath.delete(oldPath);
-        this.fileTreeByPath.set(newPath, entry);
+        this.moveTreePaths(oldPath, newPath, entry.type === 'folder');
 
         // Manual mode: record change
         if (this._syncMode === 'manual') {
@@ -1137,7 +1328,7 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(oldPath)) return;
+        await this.acquireLock(oldPath);
 
         try {
             this.setStatus('pulling', `Moving ${oldPath} to ${newPath}`, oldPath);
@@ -1146,6 +1337,8 @@ export class SyncEngine {
             const oldUri = this.settings.getFilePath(oldPath);
             const newUri = this.settings.getFilePath(newPath);
             await vscode.workspace.fs.rename(oldUri, newUri);
+
+            this.movePathTracking(oldPath, newPath, entry.type === 'folder');
 
             this.setStatus('idle');
         } catch (error) {
@@ -1182,46 +1375,32 @@ export class SyncEngine {
             return;
         }
 
-        if (!this.acquireLock(entry.path)) return;
+        await this.acquireLock(entry.path);
 
         try {
-            // Get current local content
             const localUri = this.settings.getFilePath(entry.path);
-            let localContent: string;
             let localBytes: Uint8Array | undefined;
             try {
                 localBytes = await vscode.workspace.fs.readFile(localUri);
-                localContent = new TextDecoder().decode(localBytes);
             } catch {
-                localContent = '';
                 localBytes = undefined;
             }
 
-            // Apply OT operations
-            let newContent = localContent;
-            if (update.op) {
-                for (const op of update.op) {
-                    if (op.d !== undefined) {
-                        // Delete operation
-                        newContent = newContent.slice(0, op.p) + newContent.slice(op.p + op.d.length);
-                    }
-                    if (op.i !== undefined) {
-                        // Insert operation
-                        newContent = newContent.slice(0, op.p) + op.i + newContent.slice(op.p);
-                    }
-                }
+            // Avoid positional drift by always reconciling against an authoritative
+            // snapshot, not incremental OT against potentially stale local text.
+            const remoteBytes = await this.fetchDocContentBytes(update.doc, true);
+            if (!remoteBytes) {
+                return;
             }
 
-            // Only write if content actually changed (prevents file flashing)
-            const contentBytes = new TextEncoder().encode(newContent);
-            if (!contentEquals(localBytes, contentBytes)) {
+            if (!contentEquals(localBytes, remoteBytes)) {
                 this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
-                await vscode.workspace.fs.writeFile(localUri, contentBytes);
+                await vscode.workspace.fs.writeFile(localUri, remoteBytes);
                 this.log(`Remote update: ${entry.path}`);
             }
 
-            this.baseContent.set(entry.path, contentBytes);
-            this.fileCache.set(entry.path, { hash: hashContent(contentBytes), timestamp: Date.now() });
+            this.baseContent.set(entry.path, remoteBytes);
+            this.fileCache.set(entry.path, { hash: hashContent(remoteBytes), timestamp: Date.now() });
 
             this.setStatus('idle');
         } catch (error) {
@@ -1545,6 +1724,61 @@ export class SyncEngine {
     }
 
     /**
+     * Wait for a doc entry to appear in the file tree (typically via socket echo).
+     */
+    private async waitForDocEntry(path: string, timeoutMs: number = 2000): Promise<FileTreeEntry | undefined> {
+        const started = Date.now();
+        while (Date.now() - started < timeoutMs) {
+            const entry = this.fileTreeByPath.get(path);
+            if (entry && entry.type === 'doc') {
+                return entry;
+            }
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        return undefined;
+    }
+
+    /**
+     * Create a remote text doc and immediately push initial content.
+     * This prevents empty-doc races when creating new text files.
+     */
+    private async createTextDocWithContent(
+        projectId: string,
+        parentId: string,
+        path: string,
+        name: string,
+        content: Uint8Array
+    ): Promise<void> {
+        const result = await this.api.addDoc(projectId, parentId, name);
+        if (result.type !== 'success') {
+            throw new Error(result.message || `Failed to create doc ${path}`);
+        }
+
+        let entry: FileTreeEntry | undefined;
+        if (result.doc?._id) {
+            entry = {
+                id: result.doc._id,
+                type: 'doc',
+                name,
+                path,
+                parentId,
+            };
+            this.fileTree.set(result.doc._id, entry);
+            this.fileTreeByPath.set(path, entry);
+        } else if (this.socket) {
+            entry = await this.waitForDocEntry(path);
+        }
+
+        if (!entry) {
+            throw new Error(`Created doc but could not resolve doc id for ${path}`);
+        }
+
+        if (content.length > 0) {
+            await this.pushDocumentChanges(entry.id, path, content);
+        }
+    }
+
+    /**
      * Upload a local file to Overleaf (create new entity).
      */
     private async uploadLocalFile(relativePath: string): Promise<void> {
@@ -1560,10 +1794,8 @@ export class SyncEngine {
 
         this.setStatus('pushing', `Uploading ${relativePath}`, relativePath);
 
-        if (isTextFile) {
-            await this.api.addDoc(projectSettings.projectId, parentId, name);
-            // Note: addDoc creates an empty doc, we need to push content after
-            // The file tree will be updated via socket events
+        if (isTextFile && this.socket) {
+            await this.createTextDocWithContent(projectSettings.projectId, parentId, relativePath, name, content);
         } else {
             await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
         }
@@ -1616,33 +1848,12 @@ export class SyncEngine {
                 let remoteContent: Uint8Array;
 
                 if (entry.type === 'doc') {
-                    // For docs, try socket first, fall back to HTTP
-                    if (this.socket) {
-                        try {
-                            const { lines } = await this.socket.joinDoc(entry.id);
-                            const content = lines.join('\n');
-                            remoteContent = new TextEncoder().encode(content);
-                            await this.socket.leaveDoc(entry.id);
-                            debugLog('pullAll: Got doc via socket', entry.path,
-                                'lines:', lines.length,
-                                'contentLen:', content.length);
-                        } catch (err) {
-                            debugLog('pullAll: Failed to joinDoc', entry.path, err);
-                            return;
-                        }
-                    } else {
-                        // HTTP fallback for docs
-                        const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
-                        if (result.type !== 'success' || !result.lines) {
-                            debugLog('pullAll: Failed to get doc via HTTP', entry.path);
-                            return;
-                        }
-                        const content = result.lines.join('\n');
-                        remoteContent = new TextEncoder().encode(content);
-                        debugLog('pullAll: Got doc via HTTP', entry.path,
-                            'lines:', result.lines.length,
-                            'contentLen:', content.length);
+                    const content = await this.fetchDocContentBytes(entry.id, false);
+                    if (!content) {
+                        debugLog('pullAll: Failed to get doc', entry.path);
+                        return;
                     }
+                    remoteContent = content;
                 } else {
                     // For binary files, use HTTP API
                     const result = await this.api.getFile(projectSettings.projectId, entry.id);
@@ -1866,19 +2077,7 @@ export class SyncEngine {
                             // Download content
                             let remoteContent: Uint8Array | undefined;
                             if (entry.type === 'doc') {
-                                if (this.socket) {
-                                    try {
-                                        const { lines } = await this.socket.joinDoc(entry.id);
-                                        remoteContent = new TextEncoder().encode(lines.join('\n'));
-                                        await this.socket.leaveDoc(entry.id);
-                                    } catch { /* fallthrough to HTTP */ }
-                                }
-                                if (!remoteContent) {
-                                    const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
-                                    if (result.type === 'success' && result.lines) {
-                                        remoteContent = new TextEncoder().encode(result.lines.join('\n'));
-                                    }
-                                }
+                                remoteContent = await this.fetchDocContentBytes(entry.id, false);
                             } else {
                                 const result = await this.api.getFile(projectSettings.projectId, entry.id);
                                 if (result.type === 'success' && result.content) {
@@ -1915,19 +2114,7 @@ export class SyncEngine {
                         // Download latest remote content
                         let remoteContent: Uint8Array | undefined;
                         if (entry.type === 'doc') {
-                            if (this.socket) {
-                                try {
-                                    const { lines } = await this.socket.joinDoc(entry.id);
-                                    remoteContent = new TextEncoder().encode(lines.join('\n'));
-                                    await this.socket.leaveDoc(entry.id);
-                                } catch { /* fallthrough to HTTP */ }
-                            }
-                            if (!remoteContent) {
-                                const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
-                                if (result.type === 'success' && result.lines) {
-                                    remoteContent = new TextEncoder().encode(result.lines.join('\n'));
-                                }
-                            }
+                            remoteContent = await this.fetchDocContentBytes(entry.id, false);
                         } else {
                             const result = await this.api.getFile(projectSettings.projectId, entry.id);
                             if (result.type === 'success' && result.content) {
@@ -1991,8 +2178,17 @@ export class SyncEngine {
                         } catch {
                             // File may already be gone
                         }
-                        this.baseContent.delete(change.path);
-                        this.fileCache.delete(change.path);
+                        const includeDescendants = change.entityType === 'folder' || change.path.endsWith('/');
+                        const removedEntries = this.removePathTracking(change.path, includeDescendants);
+                        for (const removed of removedEntries) {
+                            if (removed.type !== 'doc' || !this.joinedDocs.has(removed.id)) continue;
+                            try {
+                                await this.socket?.leaveDoc(removed.id);
+                            } catch {
+                                // Ignore leave errors
+                            }
+                            this.joinedDocs.delete(removed.id);
+                        }
                         appliedCount++;
                         break;
                     }
@@ -2006,12 +2202,8 @@ export class SyncEngine {
                             } catch {
                                 // May fail if old path doesn't exist locally
                             }
-                            // Update caches
-                            const content = this.baseContent.get(change.oldPath);
-                            if (content) {
-                                this.baseContent.delete(change.oldPath);
-                                this.baseContent.set(change.path, content);
-                            }
+                            const includeDescendants = change.entityType === 'folder' || change.oldPath.endsWith('/');
+                            this.movePathTracking(change.oldPath, change.path, includeDescendants);
                         }
                         appliedCount++;
                         break;
@@ -2026,6 +2218,8 @@ export class SyncEngine {
                             } catch {
                                 // May fail if old path doesn't exist locally
                             }
+                            const includeDescendants = change.entityType === 'folder' || change.oldPath.endsWith('/');
+                            this.movePathTracking(change.oldPath, change.path, includeDescendants);
                         }
                         appliedCount++;
                         break;
@@ -2143,22 +2337,30 @@ export class SyncEngine {
                         if (stat.type === vscode.FileType.Directory) {
                             const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
                             if (result.type === 'success' && result.folder) {
+                                const folderPath = change.path + '/';
                                 const folderEntry: FileTreeEntry = {
                                     id: result.folder._id,
                                     type: 'folder',
                                     name,
-                                    path: change.path + '/',
+                                    path: folderPath,
                                     parentId,
                                 };
                                 this.fileTree.set(result.folder._id, folderEntry);
-                                this.fileTreeByPath.set(change.path + '/', folderEntry);
+                                this.fileTreeByPath.set(folderPath, folderEntry);
+                                this.baseContent.set(folderPath, new Uint8Array(0));
                             }
                         } else {
                             const content = await vscode.workspace.fs.readFile(localUri);
                             const isTextFile = this.isTextFile(name);
 
-                            if (isTextFile) {
-                                await this.api.addDoc(projectSettings.projectId, parentId, name);
+                            if (isTextFile && this.socket) {
+                                await this.createTextDocWithContent(
+                                    projectSettings.projectId,
+                                    parentId,
+                                    change.path,
+                                    name,
+                                    content
+                                );
                             } else {
                                 await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
                             }
@@ -2177,10 +2379,16 @@ export class SyncEngine {
                         this.setStatus('pushing', `Deleting ${change.path}`, change.path);
                         await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
 
-                        this.fileTree.delete(entry.id);
-                        this.fileTreeByPath.delete(change.path);
-                        this.baseContent.delete(change.path);
-                        this.fileCache.delete(change.path);
+                        const removedEntries = this.removePathTracking(entry.path, entry.type === 'folder');
+                        for (const removed of removedEntries) {
+                            if (removed.type !== 'doc' || !this.joinedDocs.has(removed.id)) continue;
+                            try {
+                                await this.socket?.leaveDoc(removed.id);
+                            } catch {
+                                // Ignore leave errors
+                            }
+                            this.joinedDocs.delete(removed.id);
+                        }
                         pushedCount++;
                         break;
                     }
@@ -2223,9 +2431,14 @@ export class SyncEngine {
         if (entry.type === 'doc') {
             if (this.socket) {
                 try {
+                    const wasJoined = this.joinedDocs.has(entry.id);
                     const { lines } = await this.socket.joinDoc(entry.id);
                     const content = new TextEncoder().encode(lines.join('\n'));
-                    await this.socket.leaveDoc(entry.id);
+                    if (!wasJoined) {
+                        await this.socket.leaveDoc(entry.id);
+                    } else {
+                        this.joinedDocs.add(entry.id);
+                    }
                     return content;
                 } catch { /* fall through to HTTP */ }
             }
