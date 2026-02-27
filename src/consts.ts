@@ -36,6 +36,7 @@ export const DEFAULT_IGNORE_PATTERNS = [
     '*.blg',
     '*.fdb_latexmk',
     '*.fls',
+    '*.git',
     '*.log',
     '*.out',
     '*.run.xml',

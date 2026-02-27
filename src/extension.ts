@@ -10,7 +10,7 @@ import { SettingsManager, createSettingsWatcher } from './utils/settingsManager'
 import { BaseAPI, ProjectInfo } from './api/base';
 import { SyncEngine, SyncStatus } from './sync/syncEngine';
 import { IgnoreParser } from './sync/ignoreParser';
-import { SyncMode } from './sync/changeTracker';
+import { PendingChange, SyncMode } from './sync/changeTracker';
 import { CursorTracker, TrackedUser, getInitials } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
 import { DetailsProvider, ToolsProvider } from './views/sidebarProvider';
@@ -22,6 +22,8 @@ import { AutoCompiler } from './compilation/autoCompiler';
 import { PdfPreviewPanel } from './views/pdfPreviewPanel';
 import { BrowserPreference, captureCookiesViaBrowserLogin } from './auth/browserCookieLogin';
 import { AccountPanel, AccountPanelAction, AccountPanelState } from './views/accountPanel';
+import { LocalLeafScmBridge } from './scm/localLeafScmBridge';
+import { GitCommitHook } from './integrations/gitCommitHook';
 
 /**
  * Auth state type
@@ -46,6 +48,8 @@ let detailsProvider: DetailsProvider;
 let latexCompiler: LatexCompiler | undefined;
 let autoCompiler: AutoCompiler | undefined;
 let extensionContext: vscode.ExtensionContext;
+let scmBridge: LocalLeafScmBridge;
+let gitCommitHook: GitCommitHook | undefined;
 
 /**
  * Extension activation
@@ -99,6 +103,13 @@ export async function activate(context: vscode.ExtensionContext) {
     const initSettingsManager = SettingsManager.getCurrentInstance();
     const isInitLinked = initSettingsManager && await initSettingsManager.isLinked();
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', !!isInitLinked);
+    await vscode.commands.executeCommand('setContext', 'localleaf.scmActive', false);
+    await vscode.commands.executeCommand('setContext', 'localleaf.gitCommitAutoPushEnabled', false);
+
+    // Initialize SCM bridge and Git commit hook integration
+    scmBridge = new LocalLeafScmBridge();
+    gitCommitHook = new GitCommitHook(runCommitTriggeredOverleafPush, log);
+    context.subscriptions.push(scmBridge, gitCommitHook);
 
     // Create status bar items
     // Sync status (left side)
@@ -124,6 +135,13 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register commands
     registerCommands(context);
 
+    // Watch for git-commit auto-push setting changes
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(async event => {
+        if (event.affectsConfiguration('localleaf.gitCommitAutoPush')) {
+            await refreshScmAndHookState();
+        }
+    }));
+
     // Check if current workspace is linked
     const settingsManager = SettingsManager.getCurrentInstance();
     if (settingsManager && await settingsManager.isLinked()) {
@@ -137,12 +155,15 @@ export async function activate(context: vscode.ExtensionContext) {
         collaboratorStatusItem.hide();
     }
 
+    await refreshScmAndHookState();
+
     // Watch for settings changes
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (workspaceFolder) {
         const settingsWatcher = createSettingsWatcher(workspaceFolder, async () => {
             log('Settings changed, reloading...');
             await settingsManager?.load();
+            await refreshScmAndHookState();
         });
         context.subscriptions.push(settingsWatcher);
     }
@@ -209,6 +230,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     const credential = await credentialManager.getCredential(projectSettings.serverUrl);
     if (!credential) {
         updateStatusBar('disconnected', 'Not logged in');
+        await refreshScmAndHookState();
         vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
         return;
     }
@@ -223,6 +245,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     // Listen to status changes
     syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
+        await refreshScmAndHookState();
         // Handle auth errors
         if (event.authError) {
             await setAuthState('expired');
@@ -238,6 +261,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     changesWebviewProvider.setSyncMode(syncMode);
     await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', syncMode);
     updateSyncModeStatusBar(syncMode);
+    await refreshScmAndHookState();
 
     // Connect
     try {
@@ -317,6 +341,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         });
     } catch (error) {
         log(`Failed to connect: ${error}`);
+        await refreshScmAndHookState();
         vscode.window.showErrorMessage(`LocalLeaf: Failed to connect - ${error}`);
     }
 }
@@ -568,6 +593,133 @@ function refreshSidebar(): void {
     detailsProvider.refresh();
 }
 
+/**
+ * Whether git-commit-triggered Overleaf push is enabled.
+ */
+function isGitCommitAutoPushEnabled(): boolean {
+    return vscode.workspace.getConfiguration('localleaf').get<boolean>('gitCommitAutoPush', true);
+}
+
+/**
+ * Whether sync engine is currently connected enough to serve push/pull operations.
+ */
+function isSyncEngineConnected(engine: SyncEngine | undefined): boolean {
+    if (!engine) return false;
+    return engine.status !== 'disconnected' && engine.status !== 'error';
+}
+
+/**
+ * Focus the LocalLeaf Changes view.
+ */
+async function focusChangesView(): Promise<void> {
+    await vscode.commands.executeCommand('localleaf.changesView.focus');
+}
+
+/**
+ * Keep SCM provider state and git commit hook state in sync with current linkage/session.
+ */
+async function refreshScmAndHookState(): Promise<void> {
+    if (!scmBridge) {
+        return;
+    }
+
+    const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const settingsManager = SettingsManager.getCurrentInstance();
+    const isLinked = !!(settingsManager && await settingsManager.isLinked());
+    const mode: SyncMode = syncEngine?.syncMode
+        ?? (settingsManager?.getSettings()?.syncMode === 'realtime' ? 'realtime' : 'manual');
+    const isConnected = isSyncEngineConnected(syncEngine);
+    const settingEnabled = isGitCommitAutoPushEnabled();
+    const hookEnabled = isLinked && isConnected && mode === 'manual' && settingEnabled && !!workspaceUri;
+
+    await scmBridge.refreshState({
+        linked: isLinked,
+        connected: isConnected,
+        mode,
+        hookEnabled,
+        workspaceUri,
+    });
+
+    if (hookEnabled && workspaceUri) {
+        await gitCommitHook?.start(workspaceUri);
+    } else {
+        gitCommitHook?.stop();
+    }
+}
+
+/**
+ * Handle conflicts discovered during commit-triggered auto-push.
+ */
+async function handleCommitHookConflicts(conflicts: PendingChange[]): Promise<void> {
+    const firstConflictPath = conflicts[0]?.path;
+
+    await focusChangesView();
+    const action = await vscode.window.showErrorMessage(
+        `LocalLeaf: Auto-push after Git commit was skipped because ${conflicts.length} conflict(s) need resolution.`,
+        'Open Changes',
+        'View First Diff',
+    );
+
+    if (action === 'View First Diff' && firstConflictPath) {
+        await cmdViewDiff(firstConflictPath);
+        return;
+    }
+
+    if (action === 'Open Changes') {
+        await focusChangesView();
+    }
+}
+
+/**
+ * Push LocalLeaf pending changes after a successful VS Code Git commit.
+ */
+async function runCommitTriggeredOverleafPush(): Promise<void> {
+    if (!syncEngine) {
+        return;
+    }
+    if (syncEngine.syncMode !== 'manual') {
+        return;
+    }
+    if (!isGitCommitAutoPushEnabled()) {
+        return;
+    }
+    if (!isSyncEngineConnected(syncEngine)) {
+        log(`Commit hook: skipped because LocalLeaf is not connected (status: ${syncEngine.status}).`);
+        return;
+    }
+    if (syncEngine.status !== 'idle') {
+        log(`Commit hook: skipped because LocalLeaf is busy (status: ${syncEngine.status}).`);
+        return;
+    }
+
+    const localPendingCount = syncEngine.changeTracker.getLocalChangeCount();
+    if (localPendingCount === 0) {
+        log('Commit hook: no pending LocalLeaf changes to push.');
+        return;
+    }
+
+    const conflicts = syncEngine.changeTracker.getConflicts();
+    if (conflicts.length > 0) {
+        log(`Commit hook: aborted due to ${conflicts.length} pending conflict(s).`);
+        await handleCommitHookConflicts(conflicts);
+        return;
+    }
+
+    try {
+        await syncEngine.pushChanges({ force: true });
+        log(`Commit hook: pushed ${localPendingCount} LocalLeaf change(s) after Git commit.`);
+    } catch (error) {
+        log(`Commit hook: auto-push failed - ${error}`);
+        const action = await vscode.window.showErrorMessage(
+            `LocalLeaf: Auto-push after Git commit failed - ${error}`,
+            'Open Changes',
+        );
+        if (action === 'Open Changes') {
+            await focusChangesView();
+        }
+    }
+}
+
 // === Command Implementations ===
 
 const COOKIE_TUTORIAL_URL = 'https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies';
@@ -756,6 +908,7 @@ async function cmdLogout() {
     }
 
     updateStatusBar('disconnected', 'Logged out');
+    await refreshScmAndHookState();
     await updateLoginStatus();
     await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', false);
     refreshSidebar();
@@ -828,6 +981,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
     statusBarItem.show();
     await updateLoginStatus();
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
+    await refreshScmAndHookState();
     refreshSidebar();
 
     // Initialize sync (this will auto-pull)
@@ -868,6 +1022,7 @@ async function cmdUnlinkFolder() {
 
     updateStatusBar('disconnected');
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', false);
+    await refreshScmAndHookState();
     changesWebviewProvider.clearChanges();
     refreshSidebar();
     vscode.window.showInformationMessage('LocalLeaf: Folder unlinked');
@@ -1112,6 +1267,7 @@ async function cmdReconnect() {
     }
 
     stopStatusUpdates();
+    await refreshScmAndHookState();
 
     const projectSettings = settingsManager.getSettings();
     if (!projectSettings) return;
@@ -1119,6 +1275,7 @@ async function cmdReconnect() {
     const credential = await credentialManager.getCredential(projectSettings.serverUrl);
     if (!credential) {
         updateStatusBar('disconnected', 'Not logged in');
+        await refreshScmAndHookState();
         vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
         return;
     }
@@ -1133,9 +1290,11 @@ async function cmdReconnect() {
     const syncMode: SyncMode = projectSettings.syncMode === 'realtime' ? 'realtime' : 'manual';
     changesWebviewProvider.setSyncMode(syncMode);
     await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', syncMode);
+    await refreshScmAndHookState();
 
     syncEngine.onStatusChange(async event => {
         updateStatusBar(event.status, event.message);
+        await refreshScmAndHookState();
         // Handle auth errors
         if (event.authError) {
             await setAuthState('expired');
@@ -1167,6 +1326,8 @@ async function cmdReconnect() {
     } catch (error) {
         log(`Failed to reconnect: ${error}`);
         changesWebviewProvider.showToast(`Failed to reconnect: ${error}`, 'error');
+    } finally {
+        await refreshScmAndHookState();
     }
 }
 
@@ -1460,6 +1621,7 @@ async function cmdToggleSyncMode() {
     await syncEngine.setSyncMode(newMode, { skipConfirmation: true });
     changesWebviewProvider.setSyncMode(newMode);
     await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', newMode);
+    await refreshScmAndHookState();
     updateSyncModeStatusBar(newMode);
     refreshSidebar();
 
@@ -1777,6 +1939,7 @@ async function cmdOpenProject(context: vscode.ExtensionContext, project: Project
     statusBarItem.show();
     await updateLoginStatus();
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
+    await refreshScmAndHookState();
     refreshSidebar();
 
     // Initialize sync (this will auto-pull)
@@ -1788,6 +1951,8 @@ async function cmdOpenProject(context: vscode.ExtensionContext, project: Project
  */
 export function deactivate() {
     stopStatusUpdates();
+    gitCommitHook?.dispose();
+    scmBridge?.dispose();
 
     if (autoCompiler) {
         autoCompiler.dispose();

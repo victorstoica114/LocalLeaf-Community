@@ -26,6 +26,9 @@
     "workspaceContains:.localleaf",
     "onView:localleaf.projectsView"
   ],
+  "extensionDependencies": [
+    "vscode.git"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "configurationDefaults": {
@@ -293,6 +296,18 @@
           "group": "1_sort@3"
         }
       ],
+      "scm/title": [
+        {
+          "command": "localleaf.pullFromOverleaf",
+          "when": "scmProvider == localleaf && localleaf.isLinked && localleaf.scmActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "localleaf.pushToOverleaf",
+          "when": "scmProvider == localleaf && localleaf.isLinked && localleaf.scmActive",
+          "group": "navigation@2"
+        }
+      ],
       "view/item/context": [],
       "editor/title": [
         {
@@ -333,6 +348,12 @@
           "type": "boolean",
           "default": true,
           "description": "Enable automatic sync when files change"
+        },
+        "localleaf.gitCommitAutoPush": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Automatically push LocalLeaf manual-mode changes to Overleaf after successful Git commits in VS Code."
         },
         "localleaf.syncMode": {
           "type": "string",

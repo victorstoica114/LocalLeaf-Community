@@ -14,6 +14,7 @@ let rendering = false;
 let pendingRender = false;
 let scrollPosition = 0;
 let zoomDebounceTimer = null;
+let renderedZoom = 1.0;
 
 const viewer = document.getElementById('viewer');
 const viewerContainer = document.getElementById('viewer-container');
@@ -137,6 +138,7 @@ async function renderAllPages() {
         }
     }
 
+    renderedZoom = zoomLevel;
     updatePageIndicator();
     rendering = false;
     if (pendingRender) { pendingRender = false; renderAllPages(); }
@@ -274,6 +276,7 @@ viewerContainer.addEventListener('scroll', updatePageIndicator);
  * The canvas bitmap stays the same (slightly blurry), but layout is correct.
  */
 function quickResizePages() {
+    var scaleRatio = zoomLevel / renderedZoom;
     var pages = viewer.querySelectorAll('.pdf-page');
     for (var i = 0; i < pages.length; i++) {
         var p = pages[i];
@@ -288,6 +291,16 @@ function quickResizePages() {
         if (canvas) {
             canvas.style.width = w + 'px';
             canvas.style.height = h + 'px';
+        }
+        // Scale text & annotation layers to match the new zoom
+        var layers = p.querySelectorAll('.textLayer, .annotationLayer');
+        for (var j = 0; j < layers.length; j++) {
+            var layer = layers[j];
+            // Fix dimensions to the rendered size, then CSS-scale to new zoom
+            layer.style.width = (bw * renderedZoom) + 'px';
+            layer.style.height = (bh * renderedZoom) + 'px';
+            layer.style.transform = 'scale(' + scaleRatio + ')';
+            layer.style.transformOrigin = 'top left';
         }
     }
 }

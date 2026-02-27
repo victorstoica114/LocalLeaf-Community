@@ -112,6 +112,12 @@ interface FileTreeEntry {
     parentId?: string;
 }
 
+interface LineEdit {
+    start: number;
+    end: number;
+    newLines: string[];
+}
+
 /**
  * Sync Engine - manages real-time file synchronization
  */
@@ -508,7 +514,19 @@ export class SyncEngine {
      * Check if path should be synced (not ignored)
      */
     private shouldSync(relativePath: string): boolean {
+        if (this.isAlwaysIgnoredPath(relativePath)) {
+            return false;
+        }
         return !this.ignoreParser.shouldIgnore(relativePath);
+    }
+
+    /**
+     * Internal hard ignore list for transient local files that should never be synced.
+     * These are independent of user .leafignore content.
+     */
+    private isAlwaysIgnoredPath(relativePath: string): boolean {
+        const name = relativePath.split('/').pop()?.toLowerCase() || '';
+        return name.endsWith('.git');
     }
 
     /**
@@ -1904,6 +1922,222 @@ export class SyncEngine {
     }
 
     /**
+     * Try to auto-merge text conflicts when local and remote edits do not overlap.
+     * Returns merged bytes when successful, otherwise undefined.
+     */
+    private tryAutoMergeTextConflict(
+        baseContent: Uint8Array | undefined,
+        localContent: Uint8Array | undefined,
+        remoteContent: Uint8Array
+    ): Uint8Array | undefined {
+        if (!baseContent || !localContent) {
+            return undefined;
+        }
+
+        const decoder = new TextDecoder();
+        const baseText = decoder.decode(baseContent).replace(/\r\n/g, '\n');
+        const localText = decoder.decode(localContent).replace(/\r\n/g, '\n');
+        const remoteText = decoder.decode(remoteContent).replace(/\r\n/g, '\n');
+
+        // Skip potentially binary content.
+        if (baseText.includes('\u0000') || localText.includes('\u0000') || remoteText.includes('\u0000')) {
+            return undefined;
+        }
+
+        const baseLines = baseText.split('\n');
+        const localLines = localText.split('\n');
+        const remoteLines = remoteText.split('\n');
+
+        const localEdits = this.computeLineEdits(baseLines, localLines);
+        const remoteEdits = this.computeLineEdits(baseLines, remoteLines);
+        if (!localEdits || !remoteEdits) {
+            return undefined;
+        }
+
+        const mergedLines = this.mergeNonOverlappingLineEdits(baseLines, localEdits, remoteEdits);
+        if (!mergedLines) {
+            return undefined;
+        }
+
+        let mergedText = mergedLines.join('\n');
+        if ((baseText.endsWith('\n') || localText.endsWith('\n') || remoteText.endsWith('\n')) && !mergedText.endsWith('\n')) {
+            mergedText += '\n';
+        }
+
+        return new TextEncoder().encode(mergedText);
+    }
+
+    /**
+     * Compute line-level edits from base -> target via LCS.
+     * Returns undefined when file is too large for safe in-memory DP merge.
+     */
+    private computeLineEdits(baseLines: string[], targetLines: string[]): LineEdit[] | undefined {
+        const n = baseLines.length;
+        const m = targetLines.length;
+        const maxCells = 4_000_000;
+        const cells = (n + 1) * (m + 1);
+        if (cells > maxCells) {
+            return undefined;
+        }
+
+        const cols = m + 1;
+        const dp = new Uint32Array(cells);
+
+        for (let i = n - 1; i >= 0; i--) {
+            const row = i * cols;
+            const nextRow = (i + 1) * cols;
+            const baseLine = baseLines[i];
+            for (let j = m - 1; j >= 0; j--) {
+                const idx = row + j;
+                if (baseLine === targetLines[j]) {
+                    dp[idx] = dp[nextRow + j + 1] + 1;
+                } else {
+                    const down = dp[nextRow + j];
+                    const right = dp[idx + 1];
+                    dp[idx] = down >= right ? down : right;
+                }
+            }
+        }
+
+        type DiffOp = { type: 'equal' | 'insert' | 'delete'; line?: string };
+        const ops: DiffOp[] = [];
+        let i = 0;
+        let j = 0;
+        while (i < n || j < m) {
+            if (i < n && j < m && baseLines[i] === targetLines[j]) {
+                ops.push({ type: 'equal' });
+                i++;
+                j++;
+                continue;
+            }
+
+            const down = i < n ? dp[(i + 1) * cols + j] : 0;
+            const right = j < m ? dp[i * cols + j + 1] : 0;
+
+            if (j < m && (i === n || right >= down)) {
+                ops.push({ type: 'insert', line: targetLines[j] });
+                j++;
+            } else if (i < n) {
+                ops.push({ type: 'delete' });
+                i++;
+            }
+        }
+
+        const edits: LineEdit[] = [];
+        let baseIndex = 0;
+        let k = 0;
+        while (k < ops.length) {
+            if (ops[k].type === 'equal') {
+                baseIndex++;
+                k++;
+                continue;
+            }
+
+            const start = baseIndex;
+            const newLines: string[] = [];
+            while (k < ops.length && ops[k].type !== 'equal') {
+                const op = ops[k];
+                if (op.type === 'delete') {
+                    baseIndex++;
+                } else if (op.type === 'insert') {
+                    newLines.push(op.line || '');
+                }
+                k++;
+            }
+            edits.push({ start, end: baseIndex, newLines });
+        }
+
+        return edits;
+    }
+
+    /**
+     * Merge two edit sets against the same base when they do not overlap.
+     * Returns merged lines or undefined if edits overlap/conflict.
+     */
+    private mergeNonOverlappingLineEdits(
+        baseLines: string[],
+        localEdits: LineEdit[],
+        remoteEdits: LineEdit[]
+    ): string[] | undefined {
+        const localSpans = localEdits.filter(e => e.end > e.start);
+        const remoteSpans = remoteEdits.filter(e => e.end > e.start);
+        const localInserts = localEdits.filter(e => e.end === e.start);
+        const remoteInserts = remoteEdits.filter(e => e.end === e.start);
+
+        // Replacement/deletion spans cannot overlap.
+        for (const l of localSpans) {
+            for (const r of remoteSpans) {
+                if (l.start < r.end && r.start < l.end) {
+                    return undefined;
+                }
+            }
+        }
+
+        // Insertion strictly inside opposite replacement span is ambiguous.
+        for (const ins of localInserts) {
+            for (const span of remoteSpans) {
+                if (span.start < ins.start && ins.start < span.end) {
+                    return undefined;
+                }
+            }
+        }
+        for (const ins of remoteInserts) {
+            for (const span of localSpans) {
+                if (span.start < ins.start && ins.start < span.end) {
+                    return undefined;
+                }
+            }
+        }
+
+        const insertByPos = new Map<number, { local?: LineEdit; remote?: LineEdit }>();
+        for (const ins of localInserts) {
+            const slot = insertByPos.get(ins.start) || {};
+            slot.local = ins;
+            insertByPos.set(ins.start, slot);
+        }
+        for (const ins of remoteInserts) {
+            const slot = insertByPos.get(ins.start) || {};
+            slot.remote = ins;
+            insertByPos.set(ins.start, slot);
+        }
+
+        const mergedInserts: LineEdit[] = [];
+        for (const [pos, pair] of insertByPos) {
+            if (pair.local && pair.remote) {
+                if (!this.areLineArraysEqual(pair.local.newLines, pair.remote.newLines)) {
+                    return undefined;
+                }
+                mergedInserts.push({ start: pos, end: pos, newLines: pair.local.newLines });
+            } else if (pair.local) {
+                mergedInserts.push(pair.local);
+            } else if (pair.remote) {
+                mergedInserts.push(pair.remote);
+            }
+        }
+
+        const combined = [...localSpans, ...remoteSpans, ...mergedInserts]
+            .sort((a, b) => (b.start - a.start) || (b.end - a.end));
+
+        const merged = [...baseLines];
+        for (const edit of combined) {
+            merged.splice(edit.start, edit.end - edit.start, ...edit.newLines);
+        }
+        return merged;
+    }
+
+    private areLineArraysEqual(a: string[], b: string[]): boolean {
+        if (a.length !== b.length) {
+            return false;
+        }
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Show diff between local and remote file
      */
     private async showDiff(filePath: string, localUri: vscode.Uri, remoteContent: Uint8Array): Promise<void> {
@@ -2241,6 +2475,7 @@ export class SyncEngine {
         let downloadedCount = 0;
         let skippedCount = 0;
         let conflictCount = 0;
+        const unresolvedManualConflictPaths = new Set<string>();
 
         try {
             const downloadFile = async (entry: FileTreeEntry) => {
@@ -2254,7 +2489,7 @@ export class SyncEngine {
                     return;
                 }
 
-                if (this.ignoreParser.shouldIgnore(entry.path)) {
+                if (!this.shouldSync(entry.path)) {
                     debugLog('pullAll: Ignored', entry.path);
                     return;
                 }
@@ -2288,11 +2523,46 @@ export class SyncEngine {
                 if (exists) {
                     const hasConflict = await this.hasConflict(localUri, remoteContent);
                     if (hasConflict) {
+                        // Try non-overlapping auto-merge for text docs in manual mode.
+                        if (this._syncMode === 'manual' && entry.type === 'doc') {
+                            let localContent: Uint8Array | undefined;
+                            try {
+                                localContent = await vscode.workspace.fs.readFile(localUri);
+                            } catch {
+                                localContent = undefined;
+                            }
+                            const base = this.baseContent.get(entry.path);
+                            const merged = this.tryAutoMergeTextConflict(base, localContent, remoteContent);
+                            if (merged && localContent) {
+                                if (!contentEquals(localContent, merged)) {
+                                    await vscode.workspace.fs.writeFile(localUri, merged);
+                                }
+                                // Remote baseline moved; keep local as pending delta for later push.
+                                this.baseContent.set(entry.path, remoteContent);
+                                this.fileCache.set(entry.path, { hash: hashContent(merged), timestamp: Date.now() });
+                                if (!this._changeTracker.hasLocalChange(entry.path)) {
+                                    this._changeTracker.addLocalChange({
+                                        path: entry.path,
+                                        type: 'modified',
+                                        source: 'local',
+                                        timestamp: Date.now(),
+                                        entityId: entry.id,
+                                        entityType: entry.type,
+                                    });
+                                }
+                                downloadedCount++;
+                                return;
+                            }
+                        }
+
                         conflictCount++;
                         const resolution = await this.askConflictResolution(entry.path, localUri, remoteContent);
 
                         if (resolution === 'skip') {
                             debugLog('pullAll: Skipped (user choice)', entry.path);
+                            if (this._syncMode === 'manual') {
+                                unresolvedManualConflictPaths.add(entry.path);
+                            }
                             skippedCount++;
                             return;
                         }
@@ -2372,7 +2642,7 @@ export class SyncEngine {
                 // Skip folders
                 if (syncedPath.endsWith('/')) continue;
                 // Skip ignored files
-                if (this.ignoreParser.shouldIgnore(syncedPath)) continue;
+                if (!this.shouldSync(syncedPath)) continue;
                 // Check if local file actually exists
                 const localUri = this.settings.getFilePath(syncedPath);
                 if (await this.localFileExists(localUri)) {
@@ -2396,7 +2666,7 @@ export class SyncEngine {
                             : relativePath;
 
                         // Skip ignored files
-                        if (this.ignoreParser.shouldIgnore(fullPath)) continue;
+                        if (!this.shouldSync(fullPath)) continue;
 
                         if (type === vscode.FileType.Directory) {
                             await scanLocalFiles(vscode.Uri.joinPath(dirUri, name), fullPath);
@@ -2422,6 +2692,15 @@ export class SyncEngine {
                 // In manual mode, clear remote changes; they've been reconciled by pullAll.
                 // Local changes are kept since they still need to be pushed.
                 this._changeTracker.clearRemote();
+                // Keep unresolved remote conflicts visible in the Changes panel.
+                for (const conflictPath of unresolvedManualConflictPaths) {
+                    this._changeTracker.addRemoteChange({
+                        path: conflictPath,
+                        type: 'modified',
+                        source: 'remote',
+                        timestamp: Date.now(),
+                    });
+                }
             } else {
                 // In realtime mode, everything was applied, so clear all.
                 this._changeTracker.clearAll();
@@ -2478,6 +2757,11 @@ export class SyncEngine {
 
         try {
             for (const change of remoteChanges) {
+                let keepRemoteChange = false;
+                if (!this.shouldSync(change.path)) {
+                    this._changeTracker.clearRemote(change.path);
+                    continue;
+                }
                 switch (change.type) {
                     case 'created': {
                         const entry = this.fileTree.get(change.entityId || '');
@@ -2508,7 +2792,13 @@ export class SyncEngine {
                                     if (hasConflict) {
                                         conflictCount++;
                                         const resolution = await this.askConflictResolution(change.path, localUri, remoteContent);
-                                        if (resolution === 'skip') { skippedCount++; break; }
+                                        if (resolution === 'skip') {
+                                            if (this._syncMode === 'manual') {
+                                                keepRemoteChange = true;
+                                            }
+                                            skippedCount++;
+                                            break;
+                                        }
                                         if (resolution === 'useLocal') { break; }
                                     }
                                 }
@@ -2569,6 +2859,31 @@ export class SyncEngine {
                             this.baseContent.set(change.path, remoteContent);
                             this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                         } else {
+                            // Try non-overlapping auto-merge for text docs.
+                            if (entry.type === 'doc' && localContent) {
+                                const merged = this.tryAutoMergeTextConflict(base, localContent, remoteContent);
+                                if (merged) {
+                                    if (!contentEquals(localContent, merged)) {
+                                        await vscode.workspace.fs.writeFile(localUri, merged);
+                                    }
+                                    // Remote baseline moved; keep local as pending delta for later push.
+                                    this.baseContent.set(change.path, remoteContent);
+                                    this.fileCache.set(change.path, { hash: hashContent(merged), timestamp: Date.now() });
+                                    if (this._syncMode === 'manual' && !this._changeTracker.hasLocalChange(change.path)) {
+                                        this._changeTracker.addLocalChange({
+                                            path: change.path,
+                                            type: 'modified',
+                                            source: 'local',
+                                            timestamp: Date.now(),
+                                            entityId: entry.id,
+                                            entityType: entry.type,
+                                        });
+                                    }
+                                    appliedCount++;
+                                    break;
+                                }
+                            }
+
                             // True conflict
                             conflictCount++;
                             const resolution = await this.askConflictResolution(change.path, localUri, remoteContent);
@@ -2580,6 +2895,9 @@ export class SyncEngine {
                             } else if (resolution === 'useLocal') {
                                 // Keep local; base stays as-is, user will push
                             } else {
+                                if (this._syncMode === 'manual') {
+                                    keepRemoteChange = true;
+                                }
                                 skippedCount++;
                             }
                         }
@@ -2642,7 +2960,9 @@ export class SyncEngine {
                 }
 
                 // Clear processed change
-                this._changeTracker.clearRemote(change.path);
+                if (!keepRemoteChange) {
+                    this._changeTracker.clearRemote(change.path);
+                }
             }
 
             await this.settings.updateLastSynced();
@@ -2704,6 +3024,10 @@ export class SyncEngine {
 
         try {
             for (const change of localChanges) {
+                if (!this.shouldSync(change.path)) {
+                    this._changeTracker.clearLocal(change.path);
+                    continue;
+                }
                 switch (change.type) {
                     case 'modified': {
                         const entry = this.fileTreeByPath.get(change.path);
