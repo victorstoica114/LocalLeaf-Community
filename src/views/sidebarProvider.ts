@@ -2,10 +2,10 @@
  * LocalLeaf Sidebar Providers
  *
  * TreeDataProviders for the sidebar:
- * - ChangesProvider: grouped change tree when linked (manual mode: conflicts/incoming/outgoing/activity, realtime: activity)
  * - DetailsProvider: server/account/compiler info when linked (collapsed)
  * - ToolsProvider: utility actions
  *
+ * ChangesProvider has been moved to changesWebviewProvider.ts (WebviewViewProvider).
  * ProjectsProvider has been moved to projectsWebviewProvider.ts (WebviewViewProvider).
  */
 
@@ -14,226 +14,6 @@ import { CredentialManager } from '../utils/credentialManager';
 import { SettingsManager } from '../utils/settingsManager';
 import { COMMANDS } from '../consts';
 import { SyncStatus } from '../sync/syncEngine';
-import { ChangeTracker, SyncMode } from '../sync/changeTracker';
-
-// ── Changes Provider (linked state — grouped tree) ──────────────────
-
-/** Group node IDs for the tree */
-type GroupId = 'conflicts' | 'incoming' | 'outgoing' | 'alerts';
-
-export class ChangesProvider implements vscode.TreeDataProvider<SidebarItem> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<void>();
-    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
-
-    private syncStatus: SyncStatus = 'disconnected';
-    private changeTracker?: ChangeTracker;
-    private syncMode: SyncMode = 'manual';
-    private trackerDisposable?: vscode.Disposable;
-
-    /** Non-blocking alert messages (shown in the sidebar instead of popups) */
-    private alerts: { message: string; icon: string }[] = [];
-
-    refresh(): void {
-        this._onDidChangeTreeData.fire();
-    }
-
-    /** Set the change tracker reference and subscribe to its events */
-    setChangeTracker(tracker: ChangeTracker): void {
-        if (this.trackerDisposable) {
-            this.trackerDisposable.dispose();
-        }
-        this.changeTracker = tracker;
-        this.trackerDisposable = tracker.onDidChange(() => this.refresh());
-    }
-
-    setSyncMode(mode: SyncMode): void {
-        this.syncMode = mode;
-        this.refresh();
-    }
-
-    /** Show an alert in the sidebar panel instead of a popup */
-    addAlert(message: string, icon: string = 'info'): void {
-        // Avoid duplicates
-        if (!this.alerts.some(a => a.message === message)) {
-            this.alerts.push({ message, icon });
-            this.refresh();
-        }
-    }
-
-    clearAlerts(): void {
-        this.alerts = [];
-        this.refresh();
-    }
-
-    clearChanges(): void {
-        this.changeTracker?.clearAll();
-        this.refresh();
-    }
-
-    setSyncStatus(status: SyncStatus): void {
-        this.syncStatus = status;
-    }
-
-    getTreeItem(element: SidebarItem): vscode.TreeItem {
-        return element;
-    }
-
-    async getChildren(element?: SidebarItem): Promise<SidebarItem[]> {
-        if (!element) {
-            return this.getRootNodes();
-        }
-
-        const groupId = element.groupId as GroupId;
-        if (!groupId) return [];
-
-        switch (groupId) {
-            case 'conflicts':
-                return this.getConflictItems();
-            case 'incoming':
-                return this.getIncomingItems();
-            case 'outgoing':
-                return this.getOutgoingItems();
-            case 'alerts':
-                return this.getAlertItems();
-            default:
-                return [];
-        }
-    }
-
-    private getRootNodes(): SidebarItem[] {
-        const nodes: SidebarItem[] = [];
-
-        if (this.syncMode === 'realtime') {
-            nodes.push(new SidebarItem('Real-time sync active', {
-                icon: 'zap',
-                description: '',
-                collapsibleState: vscode.TreeItemCollapsibleState.None,
-            }));
-            return nodes;
-        }
-
-        // Manual mode: show conflicts, incoming, outgoing
-        if (this.changeTracker) {
-            const conflictCount = this.changeTracker.getConflictCount();
-            const remoteCount = this.changeTracker.getRemoteChangeCount() - conflictCount;
-            const localCount = this.changeTracker.getLocalChangeCount() - conflictCount;
-
-            if (conflictCount > 0) {
-                const conflictNode = new SidebarItem(`Conflicts (${conflictCount})`, {
-                    icon: 'warning',
-                    collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
-                });
-                conflictNode.groupId = 'conflicts';
-                nodes.push(conflictNode);
-            }
-
-            if (remoteCount > 0) {
-                const incomingNode = new SidebarItem(`Remote Changes (${remoteCount})`, {
-                    icon: 'cloud-download',
-                    collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
-                });
-                incomingNode.groupId = 'incoming';
-                nodes.push(incomingNode);
-            }
-
-            if (localCount > 0) {
-                const outgoingNode = new SidebarItem(`Local Changes (${localCount})`, {
-                    icon: 'cloud-upload',
-                    collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
-                });
-                outgoingNode.groupId = 'outgoing';
-                nodes.push(outgoingNode);
-            }
-        }
-
-        // Alerts section (replaces right-bottom popups)
-        if (this.alerts.length > 0) {
-            const alertNode = new SidebarItem(`Alerts (${this.alerts.length})`, {
-                icon: 'bell',
-                collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
-            });
-            alertNode.groupId = 'alerts';
-            nodes.push(alertNode);
-        }
-
-        return nodes;
-    }
-
-    private getConflictItems(): SidebarItem[] {
-        if (!this.changeTracker) return [];
-
-        const conflicts = this.changeTracker.getConflicts();
-        return conflicts.map(c => {
-            const item = new SidebarItem(displayPath(c.path), {
-                icon: 'warning',
-                description: 'modified both',
-                tooltip: `${c.path}\nModified locally and remotely`,
-                contextValue: 'conflict',
-                command: {
-                    command: COMMANDS.VIEW_DIFF,
-                    title: 'View Diff',
-                    arguments: [c.path],
-                },
-            });
-            return item;
-        });
-    }
-
-    private getIncomingItems(): SidebarItem[] {
-        if (!this.changeTracker) return [];
-
-        const remote = this.changeTracker.getRemoteChanges();
-        // Exclude conflicts (those are shown in the conflicts group)
-        return remote
-            .filter(c => !this.changeTracker!.hasLocalChange(c.path))
-            .map(c => {
-                const icon = changeTypeIcon(c.type);
-                return new SidebarItem(displayPath(c.path), {
-                    icon,
-                    description: c.type,
-                    tooltip: `${c.path}\nRemote: ${c.type}`,
-                    contextValue: 'incoming-change',
-                    command: {
-                        command: 'vscode.open',
-                        title: 'Open File',
-                        arguments: [fileUri(c.path)],
-                    },
-                });
-            });
-    }
-
-    private getOutgoingItems(): SidebarItem[] {
-        if (!this.changeTracker) return [];
-
-        const local = this.changeTracker.getLocalChanges();
-        // Exclude conflicts
-        return local
-            .filter(c => !this.changeTracker!.hasRemoteChange(c.path))
-            .map(c => {
-                const icon = changeTypeIcon(c.type);
-                return new SidebarItem(displayPath(c.path), {
-                    icon,
-                    description: c.type,
-                    tooltip: `${c.path}\nLocal: ${c.type}`,
-                    contextValue: 'outgoing-change',
-                    command: {
-                        command: 'vscode.open',
-                        title: 'Open File',
-                        arguments: [fileUri(c.path)],
-                    },
-                });
-            });
-    }
-
-    private getAlertItems(): SidebarItem[] {
-        return this.alerts.map(a => {
-            return new SidebarItem(a.message, {
-                icon: a.icon,
-                collapsibleState: vscode.TreeItemCollapsibleState.None,
-            });
-        });
-    }
-}
 
 // ── Details Provider (linked state — collapsed bottom) ─────────────
 
@@ -371,7 +151,7 @@ export function syncStatusDescription(status: SyncStatus, lastSynced?: string): 
     return text;
 }
 
-function changeTypeIcon(type: string): string {
+export function changeTypeIcon(type: string): string {
     switch (type) {
         case 'modified': return 'diff-modified';
         case 'created': return 'diff-added';
@@ -382,7 +162,7 @@ function changeTypeIcon(type: string): string {
     }
 }
 
-function formatTimeAgo(ts: number): string {
+export function formatTimeAgo(ts: number): string {
     const sec = Math.floor((Date.now() - ts) / 1000);
     if (sec < 5) { return 'just now'; }
     if (sec < 60) { return `${sec}s ago`; }
@@ -394,16 +174,9 @@ function formatTimeAgo(ts: number): string {
 }
 
 /** Display the filename only (last segment of path) */
-function displayPath(relativePath: string): string {
+export function displayPath(relativePath: string): string {
     const clean = relativePath.replace(/^\/+/, '').replace(/\/+$/, '');
     return clean.split('/').pop() || clean;
-}
-
-function fileUri(relativePath: string): vscode.Uri | undefined {
-    const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
-    if (!folder) { return undefined; }
-    const clean = relativePath.replace(/^\/+/, '');
-    return vscode.Uri.joinPath(folder, clean);
 }
 
 // ── SidebarItem ────────────────────────────────────────────────────

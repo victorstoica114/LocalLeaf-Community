@@ -13,7 +13,8 @@ import { IgnoreParser } from './sync/ignoreParser';
 import { SyncMode } from './sync/changeTracker';
 import { CursorTracker, TrackedUser } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
-import { ChangesProvider, DetailsProvider, ToolsProvider, syncStatusDescription } from './views/sidebarProvider';
+import { DetailsProvider, ToolsProvider } from './views/sidebarProvider';
+import { ChangesWebviewProvider } from './views/changesWebviewProvider';
 import { ProjectsWebviewProvider, ProjectSortField } from './views/projectsWebviewProvider';
 import { LatexCompiler, CompilerType, CompilationResult } from './compilation/latexCompiler';
 import * as path from 'path';
@@ -40,9 +41,8 @@ let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
 let authState: AuthState = 'none';
 let projectsWebviewProvider: ProjectsWebviewProvider;
-let changesProvider: ChangesProvider;
+let changesWebviewProvider: ChangesWebviewProvider;
 let detailsProvider: DetailsProvider;
-let changesTreeView: vscode.TreeView<any>;
 let latexCompiler: LatexCompiler | undefined;
 let autoCompiler: AutoCompiler | undefined;
 let extensionContext: vscode.ExtensionContext;
@@ -67,7 +67,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize sidebar providers
     projectsWebviewProvider = new ProjectsWebviewProvider(context.extensionUri, credentialManager);
-    changesProvider = new ChangesProvider();
+    changesWebviewProvider = new ChangesWebviewProvider(context.extensionUri);
     detailsProvider = new DetailsProvider(credentialManager);
     const toolsProvider = new ToolsProvider();
 
@@ -77,16 +77,19 @@ export async function activate(context: vscode.ExtensionContext) {
         projectsWebviewProvider,
         { webviewOptions: { retainContextWhenHidden: true } },
     );
-    changesTreeView = vscode.window.createTreeView('localleaf.changesView', {
-        treeDataProvider: changesProvider,
-    });
+    // Changes view is now a webview
+    const changesViewDisposable = vscode.window.registerWebviewViewProvider(
+        ChangesWebviewProvider.viewType,
+        changesWebviewProvider,
+        { webviewOptions: { retainContextWhenHidden: true } },
+    );
     const toolsTreeView = vscode.window.createTreeView('localleaf.toolsView', {
         treeDataProvider: toolsProvider,
     });
     const detailsTreeView = vscode.window.createTreeView('localleaf.detailsView', {
         treeDataProvider: detailsProvider,
     });
-    context.subscriptions.push(projectsViewDisposable, changesTreeView, toolsTreeView, detailsTreeView);
+    context.subscriptions.push(projectsViewDisposable, changesViewDisposable, toolsTreeView, detailsTreeView);
 
     // Set context for viewsWelcome / toolbar conditionals
     const serverUrl = credentialManager.getDefaultServer();
@@ -228,11 +231,11 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     });
 
     // Wire up change tracker to changes view
-    changesProvider.setChangeTracker(syncEngine.changeTracker);
+    changesWebviewProvider.setChangeTracker(syncEngine.changeTracker);
 
     // Read sync mode from settings and apply
     const syncMode: SyncMode = projectSettings.syncMode === 'realtime' ? 'realtime' : 'manual';
-    changesProvider.setSyncMode(syncMode);
+    changesWebviewProvider.setSyncMode(syncMode);
     await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', syncMode);
     updateSyncModeStatusBar(syncMode);
 
@@ -320,14 +323,10 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
  * Update sync status bar
  */
 function updateStatusBar(status: SyncStatus, message?: string) {
-    if (changesProvider) {
-        changesProvider.setSyncStatus(status);
-    }
-    // Update changes view title with sync status
-    if (changesTreeView) {
+    if (changesWebviewProvider) {
         const settingsManager = SettingsManager.getCurrentInstance();
         const lastSynced = settingsManager?.getSettings()?.lastSynced;
-        changesTreeView.description = syncStatusDescription(status, lastSynced);
+        changesWebviewProvider.setSyncStatus(status, lastSynced);
     }
 
     const icons: Record<SyncStatus, string> = {
@@ -544,7 +543,7 @@ function log(message: string) {
  */
 function refreshSidebar(): void {
     projectsWebviewProvider.refresh();
-    changesProvider.refresh();
+    changesWebviewProvider.refresh();
     detailsProvider.refresh();
 }
 
@@ -848,7 +847,7 @@ async function cmdUnlinkFolder() {
 
     updateStatusBar('disconnected');
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', false);
-    changesProvider.clearChanges();
+    changesWebviewProvider.clearChanges();
     refreshSidebar();
     vscode.window.showInformationMessage('LocalLeaf: Folder unlinked');
 }
@@ -864,17 +863,15 @@ async function cmdSyncNow() {
 
     if (syncEngine.syncMode === 'manual') {
         // In manual mode: full pull (non-blocking conflicts) then push
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: 'LocalLeaf: Syncing...',
-            cancellable: false,
-        }, async () => {
-            await syncEngine!.pullAll();
-            await syncEngine!.pushChanges();
+        try {
+            await syncEngine.pullAll();
+            await syncEngine.pushChanges({ force: true });
             // All changes have been synced — clear any remaining tracker entries
-            syncEngine!.changeTracker.clearAll();
-        });
-        vscode.window.showInformationMessage('LocalLeaf: Sync complete');
+            syncEngine.changeTracker.clearAll();
+            changesWebviewProvider.showToast('Sync complete', 'info', 4000);
+        } catch (error) {
+            changesWebviewProvider.showToast(`Sync failed: ${error}`, 'error');
+        }
     } else {
         // In realtime mode: do a full pull to catch up
         await cmdPullFromOverleaf();
@@ -891,19 +888,13 @@ async function cmdPullFromOverleaf() {
     }
 
     try {
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: 'LocalLeaf: Pulling from Overleaf...',
-            cancellable: false,
-        }, async () => {
-            // Always use pullAll for full reconciliation.
-            // In manual mode, conflicts are auto-skipped and recorded
-            // in the change tracker (no blocking popups).
-            await syncEngine!.pullAll();
-        });
-        vscode.window.showInformationMessage('LocalLeaf: Pull complete');
+        // Always use pullAll for full reconciliation.
+        // In manual mode, conflicts are auto-skipped and recorded
+        // in the change tracker (no blocking popups).
+        await syncEngine!.pullAll();
+        changesWebviewProvider.showToast('Pull complete', 'info', 4000);
     } catch (error) {
-        vscode.window.showErrorMessage(`LocalLeaf: Pull failed - ${error}`);
+        changesWebviewProvider.showToast(`Pull failed: ${error}`, 'error');
     }
 }
 
@@ -918,19 +909,32 @@ async function cmdPushToOverleaf() {
 
     if (syncEngine.syncMode === 'manual') {
         try {
-            await vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: 'LocalLeaf: Pushing to Overleaf...',
-                cancellable: false,
-            }, async () => {
-                await syncEngine!.pushChanges();
-            });
-            vscode.window.showInformationMessage('LocalLeaf: Push complete');
+            // Check for conflicts before pushing
+            const conflicts = syncEngine.changeTracker.getConflicts();
+            if (conflicts.length > 0) {
+                const choice = await changesWebviewProvider.showConfirmation({
+                    message: `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
+                    buttons: [
+                        { label: 'Pull First', value: 'pull', primary: true },
+                        { label: 'Force Push', value: 'force', danger: true },
+                        { label: 'Cancel', value: 'cancel' },
+                    ],
+                });
+                if (choice === 'pull') {
+                    await syncEngine.pullChanges();
+                    return;
+                }
+                if (choice !== 'force') {
+                    return;
+                }
+            }
+            await syncEngine.pushChanges({ force: true });
+            changesWebviewProvider.showToast('Push complete', 'info', 4000);
         } catch (error) {
-            vscode.window.showErrorMessage(`LocalLeaf: Push failed - ${error}`);
+            changesWebviewProvider.showToast(`Push failed: ${error}`, 'error');
         }
     } else {
-        vscode.window.showInformationMessage('LocalLeaf: Push is automatic in real-time mode');
+        changesWebviewProvider.showToast('Push is automatic in real-time mode', 'info', 4000);
     }
 }
 
@@ -1104,9 +1108,9 @@ async function cmdReconnect() {
     syncEngine = new SyncEngine(api, settingsManager, log);
 
     // Wire up change tracker
-    changesProvider.setChangeTracker(syncEngine.changeTracker);
+    changesWebviewProvider.setChangeTracker(syncEngine.changeTracker);
     const syncMode: SyncMode = projectSettings.syncMode === 'realtime' ? 'realtime' : 'manual';
-    changesProvider.setSyncMode(syncMode);
+    changesWebviewProvider.setSyncMode(syncMode);
     await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', syncMode);
 
     syncEngine.onStatusChange(async event => {
@@ -1136,10 +1140,10 @@ async function cmdReconnect() {
             await syncEngine.pullAll();
         }
         await syncEngine.joinAllDocsForWatching();
-        vscode.window.showInformationMessage(`LocalLeaf: Reconnected to "${projectSettings.projectName}"`);
+        changesWebviewProvider.showToast(`Reconnected to "${projectSettings.projectName}"`, 'info', 4000);
     } catch (error) {
         log(`Failed to reconnect: ${error}`);
-        vscode.window.showErrorMessage(`LocalLeaf: Failed to reconnect - ${error}`);
+        changesWebviewProvider.showToast(`Failed to reconnect: ${error}`, 'error');
     }
 }
 
@@ -1405,14 +1409,39 @@ async function cmdToggleSyncMode() {
     const currentMode = syncEngine.syncMode;
     const newMode: SyncMode = currentMode === 'manual' ? 'realtime' : 'manual';
 
-    await syncEngine.setSyncMode(newMode);
-    changesProvider.setSyncMode(newMode);
+    // Check pending changes before switching to realtime
+    if (newMode === 'realtime') {
+        const hasLocal = syncEngine.changeTracker.getLocalChangeCount() > 0;
+        const hasRemote = syncEngine.changeTracker.getRemoteChangeCount() > 0;
+        if (hasLocal || hasRemote) {
+            const choice = await changesWebviewProvider.showConfirmation({
+                message: 'You have pending changes. Apply them before switching to real-time mode?',
+                buttons: [
+                    { label: 'Apply & Switch', value: 'apply', primary: true },
+                    { label: 'Discard & Switch', value: 'discard', danger: true },
+                    { label: 'Cancel', value: 'cancel' },
+                ],
+            });
+            if (choice === 'cancel') {
+                return;
+            }
+            if (choice === 'apply') {
+                if (hasRemote) { await syncEngine.pullChanges(); }
+                if (hasLocal) { await syncEngine.pushChanges({ force: true }); }
+            } else {
+                syncEngine.changeTracker.clearAll();
+            }
+        }
+    }
+
+    await syncEngine.setSyncMode(newMode, { skipConfirmation: true });
+    changesWebviewProvider.setSyncMode(newMode);
     await vscode.commands.executeCommand('setContext', 'localleaf.syncMode', newMode);
     updateSyncModeStatusBar(newMode);
     refreshSidebar();
 
     const label = newMode === 'manual' ? 'Manual' : 'Real-time';
-    vscode.window.showInformationMessage(`LocalLeaf: Sync mode set to ${label}`);
+    changesWebviewProvider.showToast(`Sync mode set to ${label}`, 'info', 4000);
 }
 
 /**
@@ -1659,7 +1688,7 @@ async function cmdResolveConflict(filePath: string, resolution: 'remote' | 'loca
     }
 
     const label = resolution === 'remote' ? 'remote' : 'local';
-    vscode.window.showInformationMessage(`LocalLeaf: Resolved "${filePath}" using ${label} version`);
+    changesWebviewProvider.showToast(`Resolved "${filePath}" using ${label} version`, 'info', 4000);
 }
 
 async function cmdDiscardChange(filePath: string) {

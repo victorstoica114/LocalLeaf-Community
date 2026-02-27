@@ -51,6 +51,7 @@
         {
           "id": "localleaf.changesView",
           "name": "Changes",
+          "type": "webview",
           "when": "localleaf.isLinked"
         },
         {
@@ -67,13 +68,7 @@
         }
       ]
     },
-    "viewsWelcome": [
-      {
-        "view": "localleaf.changesView",
-        "contents": "No file changes yet.\nChanges will appear here as files are synced.",
-        "when": "localleaf.isLinked"
-      }
-    ],
+    "viewsWelcome": [],
     "commands": [
       {
         "command": "localleaf.login",
@@ -303,38 +298,7 @@
           "group": "1_sort@3"
         }
       ],
-      "view/item/context": [
-        {
-          "command": "localleaf.viewDiff",
-          "when": "viewItem == conflict",
-          "group": "inline"
-        },
-        {
-          "command": "localleaf.resolveConflictRemote",
-          "when": "viewItem == conflict",
-          "group": "1_resolve@1"
-        },
-        {
-          "command": "localleaf.resolveConflictLocal",
-          "when": "viewItem == conflict",
-          "group": "1_resolve@2"
-        },
-        {
-          "command": "localleaf.viewDiff",
-          "when": "viewItem == conflict",
-          "group": "1_resolve@3"
-        },
-        {
-          "command": "localleaf.discardChange",
-          "when": "viewItem == incoming-change || viewItem == outgoing-change",
-          "group": "inline"
-        },
-        {
-          "command": "localleaf.viewDiff",
-          "when": "viewItem == incoming-change || viewItem == outgoing-change",
-          "group": "1_actions@1"
-        }
-      ],
+      "view/item/context": [],
       "editor/title": [
         {
           "command": "localleaf.compileLaTeX",

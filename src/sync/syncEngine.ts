@@ -192,14 +192,14 @@ export class SyncEngine {
     /**
      * Set sync mode with transition logic
      */
-    async setSyncMode(mode: SyncMode): Promise<void> {
+    async setSyncMode(mode: SyncMode, options?: { skipConfirmation?: boolean }): Promise<void> {
         if (this._syncMode === mode) return;
 
         const oldMode = this._syncMode;
         this._syncMode = mode;
         this.log(`Sync mode changed: ${oldMode} → ${mode}`);
 
-        if (mode === 'realtime') {
+        if (mode === 'realtime' && !options?.skipConfirmation) {
             // Switching to realtime: apply any pending changes first
             const hasLocal = this._changeTracker.getLocalChangeCount() > 0;
             const hasRemote = this._changeTracker.getRemoteChangeCount() > 0;
@@ -2050,7 +2050,7 @@ export class SyncEngine {
     /**
      * Push buffered local changes in manual mode.
      */
-    async pushChanges(): Promise<void> {
+    async pushChanges(options?: { force?: boolean }): Promise<void> {
         if (!this.project) {
             throw new Error('Not connected');
         }
@@ -2061,20 +2061,22 @@ export class SyncEngine {
             return;
         }
 
-        // Check for conflicts before pushing
-        const conflicts = this._changeTracker.getConflicts();
-        if (conflicts.length > 0) {
-            const choice = await vscode.window.showWarningMessage(
-                `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
-                'Pull First',
-                'Force Push'
-            );
-            if (choice === 'Pull First') {
-                await this.pullChanges();
-                return;
-            }
-            if (choice !== 'Force Push') {
-                return;
+        // Check for conflicts before pushing (skip if force)
+        if (!options?.force) {
+            const conflicts = this._changeTracker.getConflicts();
+            if (conflicts.length > 0) {
+                const choice = await vscode.window.showWarningMessage(
+                    `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
+                    'Pull First',
+                    'Force Push'
+                );
+                if (choice === 'Pull First') {
+                    await this.pullChanges();
+                    return;
+                }
+                if (choice !== 'Force Push') {
+                    return;
+                }
             }
         }
 
