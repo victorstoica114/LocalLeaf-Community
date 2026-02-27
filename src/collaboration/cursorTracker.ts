@@ -45,9 +45,21 @@ function hashString(str: string): number {
 /**
  * Get a consistent color for a user based on their user ID
  */
-function getColorForUserId(userId: string): string {
+export function getColorForUserId(userId: string): string {
     const hash = hashString(userId);
     return CURSOR_COLORS[hash % CURSOR_COLORS.length];
+}
+
+/**
+ * Get initials from a name (up to 2 characters, uppercase)
+ */
+export function getInitials(name: string): string {
+    if (!name) { return '?'; }
+    const parts = name.trim().split(/\s+/);
+    if (parts.length >= 2) {
+        return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+    }
+    return name[0].toUpperCase();
 }
 
 /**
@@ -64,7 +76,8 @@ export interface TrackedUser {
     column: number;
     lastUpdated: number;
     color: string;
-    decoration: vscode.TextEditorDecorationType;
+    cursorDecoration: vscode.TextEditorDecorationType;
+    lineDecoration: vscode.TextEditorDecorationType;
     hoverMessage: vscode.MarkdownString;
 }
 
@@ -77,6 +90,9 @@ export class CursorTracker {
     private disposables: vscode.Disposable[] = [];
     private _publicId?: string;
     private docIdToPath: Map<string, string> = new Map();
+
+    private _onDidChangeUsers = new vscode.EventEmitter<void>();
+    readonly onDidChangeUsers = this._onDidChangeUsers.event;
 
     constructor(
         private readonly socket: SocketIOAPI,
@@ -91,8 +107,6 @@ export class CursorTracker {
      * Build mapping from doc IDs to file paths
      */
     private buildDocIdToPathMap(): void {
-        // This will be populated by the sync engine
-        // For now, we'll get paths from the project tree
         const project = this.socket.project;
         if (project) {
             this.traverseProject(project.rootFolder[0], '', true);
@@ -103,7 +117,6 @@ export class CursorTracker {
      * Traverse project tree to build doc ID to path mapping
      */
     private traverseProject(folder: any, parentPath: string, isRoot: boolean = false): void {
-        // Root folder contents go directly to /, subfolders include their name
         const folderPath = isRoot ? '/' : parentPath + folder.name + '/';
 
         for (const doc of folder.docs || []) {
@@ -146,7 +159,7 @@ export class CursorTracker {
         // Listen for selection changes to update our position
         this.disposables.push(
             vscode.window.onDidChangeTextEditorSelection(e => this.handleLocalSelectionChange(e)),
-            vscode.window.onDidChangeVisibleTextEditors(editors => this.refreshDecorations())
+            vscode.window.onDidChangeVisibleTextEditors(() => this.refreshDecorations())
         );
     }
 
@@ -169,6 +182,35 @@ export class CursorTracker {
 
         this.addOrUpdateUser(user);
     }
+
+    // ── Decoration factories ───────────────────────────────────────
+
+    /**
+     * Create the cursor bar decoration (vertical line + name tag).
+     * Uses `before` pseudo-element for the name label above the cursor.
+     */
+    private createCursorDecoration(color: string): vscode.TextEditorDecorationType {
+        return vscode.window.createTextEditorDecorationType({
+            borderStyle: 'none none none solid',
+            borderWidth: '2px',
+            borderColor: color,
+            overviewRulerColor: color,
+            overviewRulerLane: vscode.OverviewRulerLane.Center,
+            rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+        });
+    }
+
+    /**
+     * Create the line background highlight decoration.
+     */
+    private createLineDecoration(color: string): vscode.TextEditorDecorationType {
+        return vscode.window.createTextEditorDecorationType({
+            backgroundColor: color + '18', // very subtle (~9% opacity)
+            isWholeLine: true,
+        });
+    }
+
+    // ── User management ────────────────────────────────────────────
 
     /**
      * Add or update a user's cursor
@@ -194,19 +236,14 @@ export class CursorTracker {
             this.updateDecoration(existing);
         } else {
             // Create new tracked user
-            // Use consistent color based on user ID (same user = same color across sessions)
             let color = this.userIdToColor.get(user.userId);
             if (!color) {
                 color = getColorForUserId(user.userId);
                 this.userIdToColor.set(user.userId, color);
             }
 
-            const decoration = vscode.window.createTextEditorDecorationType({
-                outline: `2px solid ${color}`,
-                overviewRulerColor: color,
-                overviewRulerLane: vscode.OverviewRulerLane.Center,
-                rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-            });
+            const cursorDecoration = this.createCursorDecoration(color);
+            const lineDecoration = this.createLineDecoration(color);
 
             const hoverMessage = new vscode.MarkdownString();
             hoverMessage.appendMarkdown(`<span style="color:${color};"><b>${user.name}</b></span>`);
@@ -223,13 +260,16 @@ export class CursorTracker {
                 column: user.column,
                 lastUpdated: user.lastUpdated,
                 color,
-                decoration,
+                cursorDecoration,
+                lineDecoration,
                 hoverMessage,
             };
 
             this.users.set(user.clientId, tracked);
             this.updateDecoration(tracked);
         }
+
+        this._onDidChangeUsers.fire();
     }
 
     /**
@@ -239,7 +279,6 @@ export class CursorTracker {
         if (!user.docPath) return;
 
         const workspaceFolder = this.settings.getWorkspaceFolder();
-        // Remove leading slash for proper path joining
         const relativePath = user.docPath.startsWith('/') ? user.docPath.slice(1) : user.docPath;
         const uri = vscode.Uri.joinPath(workspaceFolder, relativePath);
 
@@ -248,11 +287,16 @@ export class CursorTracker {
         );
 
         if (editor) {
-            const range = new vscode.Range(user.row, user.column, user.row, user.column + 1);
-            editor.setDecorations(user.decoration, [{
-                range,
+            // Cursor bar on the character position
+            const cursorRange = new vscode.Range(user.row, user.column, user.row, user.column + 1);
+            editor.setDecorations(user.cursorDecoration, [{
+                range: cursorRange,
                 hoverMessage: user.hoverMessage,
             }]);
+
+            // Subtle line highlight
+            const lineRange = new vscode.Range(user.row, 0, user.row, 0);
+            editor.setDecorations(user.lineDecoration, [lineRange]);
         }
     }
 
@@ -261,7 +305,6 @@ export class CursorTracker {
      */
     private clearDecoration(user: TrackedUser, docPath: string): void {
         const workspaceFolder = this.settings.getWorkspaceFolder();
-        // Remove leading slash for proper path joining
         const relativePath = docPath.startsWith('/') ? docPath.slice(1) : docPath;
         const uri = vscode.Uri.joinPath(workspaceFolder, relativePath);
 
@@ -270,7 +313,8 @@ export class CursorTracker {
         );
 
         if (editor) {
-            editor.setDecorations(user.decoration, []);
+            editor.setDecorations(user.cursorDecoration, []);
+            editor.setDecorations(user.lineDecoration, []);
         }
     }
 
@@ -289,12 +333,13 @@ export class CursorTracker {
     private handleUserDisconnected(clientId: string): void {
         const user = this.users.get(clientId);
         if (user) {
-            // Clear decoration
             if (user.docPath) {
                 this.clearDecoration(user, user.docPath);
             }
-            user.decoration.dispose();
+            user.cursorDecoration.dispose();
+            user.lineDecoration.dispose();
             this.users.delete(clientId);
+            this._onDidChangeUsers.fire();
         }
     }
 
@@ -302,12 +347,9 @@ export class CursorTracker {
      * Handle local selection change to update our position
      */
     private async handleLocalSelectionChange(event: vscode.TextEditorSelectionChangeEvent): Promise<void> {
-        // Don't filter by event.kind - we want to track all cursor movements
-
         const uri = event.textEditor.document.uri;
         if (uri.scheme !== 'file') return;
 
-        // Get relative path
         const workspacePath = this.settings.getWorkspaceFolder().path;
         if (!uri.path.startsWith(workspacePath)) return;
 
@@ -383,7 +425,6 @@ export class CursorTracker {
 
         if (user && user.docPath) {
             const workspaceFolder = this.settings.getWorkspaceFolder();
-            // Remove leading slash from docPath for proper joining
             const relativePath = user.docPath.startsWith('/') ? user.docPath.slice(1) : user.docPath;
             const uri = vscode.Uri.joinPath(workspaceFolder, relativePath);
 
@@ -393,7 +434,6 @@ export class CursorTracker {
                     preview: false,
                 });
             } catch (error) {
-                // File might not exist locally yet, offer to pull
                 vscode.window.showWarningMessage(
                     `Cannot open ${user.docPath}. The file may not exist locally. Try pulling from Overleaf.`,
                     'Pull Now'
@@ -413,9 +453,11 @@ export class CursorTracker {
      */
     dispose(): void {
         for (const user of this.users.values()) {
-            user.decoration.dispose();
+            user.cursorDecoration.dispose();
+            user.lineDecoration.dispose();
         }
         this.users.clear();
+        this._onDidChangeUsers.dispose();
         this.disposables.forEach(d => d.dispose());
     }
 }

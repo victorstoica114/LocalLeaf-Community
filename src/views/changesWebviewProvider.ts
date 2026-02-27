@@ -33,6 +33,15 @@ export interface ToastMessage {
     type: 'info' | 'warning' | 'error';
 }
 
+export interface OnlineUserInfo {
+    clientId: string;
+    name: string;
+    color: string;
+    initials: string;
+    docPath?: string;
+    row?: number;
+}
+
 interface ChangesViewState {
     syncMode: SyncMode;
     syncStatus: SyncStatus;
@@ -42,6 +51,7 @@ interface ChangesViewState {
     localChanges: ChangeItem[];
     confirmation: ConfirmationRequest | null;
     toasts: ToastMessage[];
+    onlineUsers: OnlineUserInfo[];
 }
 
 // Messages from webview → extension
@@ -52,7 +62,9 @@ type WebviewMessage =
     | { command: 'resolveConflictRemote'; path: string }
     | { command: 'resolveConflictLocal'; path: string }
     | { command: 'confirmationResponse'; id: string; value: string }
-    | { command: 'dismissToast'; id: string };
+    | { command: 'dismissToast'; id: string }
+    | { command: 'jumpToUser'; clientId: string }
+    | { command: 'toggleSyncMode' };
 
 // ── Provider ───────────────────────────────────────────────────────
 
@@ -69,6 +81,7 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
     private confirmation: ConfirmationRequest | null = null;
     private confirmationResolve?: (value: string) => void;
     private toastCounter = 0;
+    private onlineUsers: OnlineUserInfo[] = [];
 
     constructor(private readonly extensionUri: vscode.Uri) {}
 
@@ -157,6 +170,14 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    /**
+     * Update the online users displayed in the sidebar.
+     */
+    setOnlineUsers(users: OnlineUserInfo[]): void {
+        this.onlineUsers = users;
+        this.pushState();
+    }
+
     // ── Private ────────────────────────────────────────────────────
 
     private handleMessage(msg: WebviewMessage): void {
@@ -187,6 +208,12 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
             case 'dismissToast':
                 this.toasts = this.toasts.filter(t => t.id !== msg.id);
                 this.pushState();
+                break;
+            case 'jumpToUser':
+                vscode.commands.executeCommand('localleaf.jumpToCollaborator', msg.clientId);
+                break;
+            case 'toggleSyncMode':
+                vscode.commands.executeCommand('localleaf.toggleSyncMode');
                 break;
         }
     }
@@ -221,6 +248,7 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
             localChanges,
             confirmation: this.confirmation,
             toasts: this.toasts,
+            onlineUsers: this.onlineUsers,
         };
     }
 
@@ -264,7 +292,45 @@ body{
     border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 4px;
+}
+.status-left{
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.status-right{
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    font-size: 0.95em;
+}
+.sync-mode-label{
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+}
+.sync-toggle{
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 1em;
+    font-weight: 600;
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+.sync-toggle.on{
+    color: var(--vscode-charts-green, #89d185);
+}
+.sync-toggle.off{
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+}
+.sync-toggle:hover{
+    background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31));
 }
 
 /* ── Confirmation banner ───────────────────────────── */
@@ -443,12 +509,60 @@ body{
     font-size: 0.9em;
 }
 
-/* ── Realtime badge ────────────────────────────────── */
-.realtime-badge{
-    padding: 12px;
-    text-align: center;
+/* ── Online users ──────────────────────────────────── */
+.online-users{
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+}
+.online-users-label{
+    font-size: 0.75em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
     color: var(--vscode-descriptionForeground);
-    font-size: 0.9em;
+    margin-right: 2px;
+}
+.avatar{
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.7em;
+    font-weight: 700;
+    color: #000;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: transform 0.1s;
+    position: relative;
+}
+.avatar:hover{
+    transform: scale(1.15);
+}
+.avatar-tooltip{
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 4px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--vscode-editorWidget-background, #252526);
+    color: var(--vscode-foreground);
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 0.8em;
+    font-weight: 400;
+    white-space: nowrap;
+    z-index: 10;
+    pointer-events: none;
+    box-shadow: 0 2px 6px rgba(0,0,0,.3);
+}
+.avatar:hover .avatar-tooltip{
+    display: block;
 }
 
 /* ── Animations ────────────────────────────────────── */
@@ -508,8 +622,44 @@ body{
             return clean.split('/').pop() || clean;
         }
 
+        function renderOnlineUsers() {
+            if (!state.onlineUsers || state.onlineUsers.length === 0) return null;
+            const avatars = state.onlineUsers.map(u => {
+                const tip = u.docPath
+                    ? u.name + ' — ' + u.docPath + ':' + ((u.row || 0) + 1)
+                    : u.name;
+                return h('div', {
+                    className: 'avatar',
+                    style: 'background:' + u.color,
+                    title: '',
+                    onClick: () => vscode.postMessage({ command: 'jumpToUser', clientId: u.clientId }),
+                },
+                    u.initials,
+                    h('span', { className: 'avatar-tooltip' }, tip),
+                );
+            });
+            return h('div', { className: 'online-users' },
+                h('span', { className: 'online-users-label' }, 'Online'),
+                ...avatars,
+            );
+        }
+
         function renderStatusStrip() {
-            return h('div', {className:'status-strip'}, state.statusText);
+            const isRealtime = state.syncMode === 'realtime';
+            const toggleLabel = isRealtime ? 'ON' : 'OFF';
+            const toggleCls = 'sync-toggle ' + (isRealtime ? 'on' : 'off');
+
+            return h('div', {className:'status-strip'},
+                h('span', {className:'status-left'}, state.statusText),
+                h('span', {className:'status-right'},
+                    h('span', {className:'sync-mode-label'}, 'Real-time sync'),
+                    h('button', {
+                        className: toggleCls,
+                        title: isRealtime ? 'Switch to manual sync' : 'Switch to real-time sync',
+                        onClick: () => vscode.postMessage({command:'toggleSyncMode'}),
+                    }, toggleLabel),
+                ),
+            );
         }
 
         function renderConfirmation() {
@@ -587,6 +737,10 @@ body{
 
             root.appendChild(renderStatusStrip());
 
+            // Online users
+            const usersEl = renderOnlineUsers();
+            if (usersEl) root.appendChild(usersEl);
+
             // Toasts (top, below status)
             const toastsEl = renderToasts();
             if (toastsEl) root.appendChild(toastsEl);
@@ -594,11 +748,6 @@ body{
             // Confirmation banner
             const confEl = renderConfirmation();
             if (confEl) root.appendChild(confEl);
-
-            if (state.syncMode === 'realtime') {
-                root.appendChild(h('div', {className:'realtime-badge'}, '\u26A1 Real-time sync active'));
-                return;
-            }
 
             // Change groups
             const conflictsEl = renderGroup('conflicts', 'Conflicts', '\u26A0', state.conflicts, 'conflict');

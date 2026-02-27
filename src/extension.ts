@@ -11,7 +11,7 @@ import { BaseAPI, ProjectInfo } from './api/base';
 import { SyncEngine, SyncStatus } from './sync/syncEngine';
 import { IgnoreParser } from './sync/ignoreParser';
 import { SyncMode } from './sync/changeTracker';
-import { CursorTracker, TrackedUser } from './collaboration/cursorTracker';
+import { CursorTracker, TrackedUser, getInitials } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
 import { DetailsProvider, ToolsProvider } from './views/sidebarProvider';
 import { ChangesWebviewProvider } from './views/changesWebviewProvider';
@@ -248,6 +248,8 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         if (socket) {
             cursorTracker = new CursorTracker(socket, settings);
             await cursorTracker.initialize();
+            cursorTracker.onDidChangeUsers(() => pushOnlineUsersToWebview());
+            pushOnlineUsersToWebview();
             context.subscriptions.push({ dispose: () => cursorTracker?.dispose() });
         }
 
@@ -493,6 +495,25 @@ function updateCollaboratorStatus() {
     }
 
     collaboratorStatusItem.show();
+}
+
+/**
+ * Push online users from CursorTracker to the Changes webview
+ */
+function pushOnlineUsersToWebview(): void {
+    if (!cursorTracker) {
+        changesWebviewProvider.setOnlineUsers([]);
+        return;
+    }
+    const users = cursorTracker.getOnlineUsers().map(u => ({
+        clientId: u.clientId,
+        name: u.name,
+        color: u.color,
+        initials: getInitials(u.name),
+        docPath: u.docPath,
+        row: u.row,
+    }));
+    changesWebviewProvider.setOnlineUsers(users);
 }
 
 /**
@@ -1130,6 +1151,8 @@ async function cmdReconnect() {
         if (socket) {
             cursorTracker = new CursorTracker(socket, settingsManager);
             await cursorTracker.initialize();
+            cursorTracker.onDidChangeUsers(() => pushOnlineUsersToWebview());
+            pushOnlineUsersToWebview();
         }
 
         startStatusUpdates();
@@ -1188,13 +1211,13 @@ async function cmdConfigure() {
 /**
  * Jump to collaborator cursor
  */
-async function cmdJumpToCollaborator() {
+async function cmdJumpToCollaborator(clientId?: string) {
     if (!cursorTracker) {
         vscode.window.showWarningMessage('LocalLeaf: Not connected');
         return;
     }
 
-    await cursorTracker.jumpToUser();
+    await cursorTracker.jumpToUser(clientId);
 }
 
 /**
