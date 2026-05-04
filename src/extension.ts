@@ -285,10 +285,13 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         // Auto-detect main document from project settings
         await syncEngine.detectMainDocument();
 
-        // On project load: pull only in realtime mode; manual mode waits for explicit user action
+        // On project load: always pull on first link (empty workspace); otherwise only in realtime mode
         try {
-            if (syncMode === 'realtime') {
-                log('Auto-pulling files from Overleaf (realtime mode)...');
+            const isFirstSync = !syncEngine.hasBaseContent();
+            if (isFirstSync || syncMode === 'realtime') {
+                log(isFirstSync
+                    ? 'First sync — downloading project files...'
+                    : 'Auto-pulling files from Overleaf (realtime mode)...');
                 await syncEngine.pullAll();
                 log('Auto-pull complete');
             } else {

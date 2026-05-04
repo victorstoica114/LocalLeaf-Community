@@ -149,6 +149,8 @@ export class SyncEngine {
     private _recentlyPushedPaths: Set<string> = new Set();
     /** Paths currently being updated from remote; suppresses echo in handleLocalFileChange */
     private _remoteUpdatingPaths: Set<string> = new Set();
+    /** True while pullAll/pullChanges is writing files; suppresses watcher echo */
+    private _isPulling: boolean = false;
 
     readonly onStatusChange = this._onStatusChange.event;
 
@@ -177,6 +179,13 @@ export class SyncEngine {
      */
     get status(): SyncStatus {
         return this._status;
+    }
+
+    /**
+     * Check if any base content has been synced (false = first-time project setup)
+     */
+    hasBaseContent(): boolean {
+        return this.baseContent.size > 0;
     }
 
     /**
@@ -1069,6 +1078,9 @@ export class SyncEngine {
         // Suppress echo from remote-initiated save
         if (this._remoteUpdatingPaths.has(relativePath)) return;
 
+        // Suppress echo from pull operations writing files to disk
+        if (this._isPulling) return;
+
         // Manual mode: record change instead of pushing immediately
         if (this._syncMode === 'manual') {
             const entry = this.fileTreeByPath.get(relativePath);
@@ -1268,6 +1280,9 @@ export class SyncEngine {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
 
+        // Suppress echo from pull operations writing files to disk
+        if (this._isPulling) return;
+
         // Manual mode: record change instead of pushing immediately
         if (this._syncMode === 'manual') {
             this._changeTracker.addLocalChange({
@@ -1376,6 +1391,9 @@ export class SyncEngine {
     private async handleLocalFileDelete(uri: vscode.Uri): Promise<void> {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
+
+        // Suppress echo from pull operations (e.g. orphan cleanup)
+        if (this._isPulling) return;
 
         // Manual mode: record change instead of deleting immediately
         if (this._syncMode === 'manual') {
@@ -2465,6 +2483,8 @@ export class SyncEngine {
         debugLog('pullAll: File tree size:', this.fileTree.size);
         debugLog('pullAll: Project name:', this.project.name);
 
+        this._isPulling = true;
+
         // Reset conflict resolution state
         this.conflictResolution = 'ask';
         this.applyToAll = false;
@@ -2713,6 +2733,8 @@ export class SyncEngine {
             const authErr = isAuthError(error);
             this.setStatus('error', authErr ? 'Session expired' : `Pull failed: ${error}`, undefined, authErr);
             throw error;
+        } finally {
+            this._isPulling = false;
         }
     }
 
@@ -2749,6 +2771,7 @@ export class SyncEngine {
         this.applyToAll = false;
 
         this.setStatus('pulling', `Applying ${remoteChanges.length} remote changes...`);
+        this._isPulling = true;
         const projectSettings = this.settings.getSettings()!;
 
         let appliedCount = 0;
@@ -2973,6 +2996,8 @@ export class SyncEngine {
             const authErr = isAuthError(error);
             this.setStatus('error', authErr ? 'Session expired' : `Pull failed: ${error}`, undefined, authErr);
             throw error;
+        } finally {
+            this._isPulling = false;
         }
     }
 
