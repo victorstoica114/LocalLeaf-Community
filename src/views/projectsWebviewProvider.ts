@@ -11,12 +11,13 @@
 import * as vscode from 'vscode';
 import { BaseAPI, ProjectInfo } from '../api/base';
 import { CredentialManager } from '../utils/credentialManager';
+import { DetectedLocalLeafProject, SettingsManager } from '../utils/settingsManager';
 import { CONFIG_DIR, COMMANDS } from '../consts';
 
 export type ProjectSortField = 'name' | 'lastUpdated' | 'accessLevel';
 export type SortOrder = 'asc' | 'desc';
 
-type ViewState = 'no-folder' | 'non-empty-folder' | 'not-logged-in' | 'project-list';
+type ViewState = 'no-folder' | 'non-empty-folder' | 'not-logged-in' | 'project-list' | 'local-project-list';
 
 export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     static readonly viewType = 'localleaf.projectsView';
@@ -26,6 +27,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     private sortOrder: SortOrder = 'desc';
     private filterText = '';
     private cachedProjects: ProjectInfo[] = [];
+    private cachedLocalProjects: DetectedLocalLeafProject[] = [];
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -86,6 +88,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         }
 
         const rootUri = folders[0].uri;
+        this.cachedLocalProjects = await SettingsManager.findLinkedProjectFolders();
 
         // Check for .localleaf directory
         const configUri = vscode.Uri.joinPath(rootUri, CONFIG_DIR);
@@ -104,6 +107,9 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                 entries = await vscode.workspace.fs.readDirectory(rootUri);
             } catch {
                 // can't read – treat as non-empty
+            }
+            if (this.cachedLocalProjects.length > 0) {
+                return 'local-project-list';
             }
             if (entries.length > 0) {
                 return 'non-empty-folder';
@@ -152,10 +158,6 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         switch (msg.type) {
             case 'filterChanged':
                 this.filterText = msg.text ?? '';
-                // Re-render with new filter (no network fetch – use cache)
-                if (this._view) {
-                    this._view.webview.html = this.getHtml('project-list', this.cachedProjects);
-                }
                 break;
 
             case 'sortChanged':
@@ -166,6 +168,14 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                 const project = this.cachedProjects.find(p => p.id === msg.projectId);
                 if (project) {
                     vscode.commands.executeCommand(COMMANDS.OPEN_PROJECT, project);
+                }
+                break;
+            }
+
+            case 'selectLocalProject': {
+                const project = this.cachedLocalProjects.find(p => p.uri.toString() === msg.uri);
+                if (project) {
+                    vscode.commands.executeCommand(COMMANDS.OPEN_LOCAL_PROJECT, project.uri.toString());
                 }
                 break;
             }
@@ -217,19 +227,15 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
             case 'project-list':
                 return this.getProjectListHtml(projects);
+
+            case 'local-project-list':
+                return this.getLocalProjectListHtml(this.cachedLocalProjects);
         }
     }
 
     private getProjectListHtml(projects: ProjectInfo[]): string {
-        // Apply filter
-        let filtered = projects;
-        if (this.filterText) {
-            const lower = this.filterText.toLowerCase();
-            filtered = projects.filter(p => p.name.toLowerCase().includes(lower));
-        }
-
         // Apply sort
-        filtered = [...filtered].sort((a, b) => {
+        const sortedProjects = [...projects].sort((a, b) => {
             let cmp = 0;
             switch (this.sortField) {
                 case 'name':
@@ -250,13 +256,13 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             return this.sortOrder === 'asc' ? cmp : -cmp;
         });
 
-        const listItems = filtered.length > 0
-            ? filtered.map(p => {
+        const listItems = sortedProjects.length > 0
+            ? sortedProjects.map(p => {
                 const date = p.lastUpdated ? new Date(p.lastUpdated).toLocaleDateString() : '';
                 const icon = accessIcon(p.accessLevel);
                 const escapedName = escapeHtml(p.name);
                 return /*html*/`
-                    <div class="project-item" onclick="postMessage({type:'openProject',projectId:'${p.id}'})">
+                    <div class="project-item remote-project" data-project-id="${escapeHtml(p.id)}" data-name="${escapeHtml(p.name.toLowerCase())}">
                         <span class="codicon codicon-${icon} project-icon"></span>
                         <div class="project-info">
                             <span class="project-name">${escapedName}</span>
@@ -264,7 +270,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                         </div>
                     </div>`;
             }).join('\n')
-            : /*html*/`<div class="center-message"><p>${this.filterText ? `No projects matching "${escapeHtml(this.filterText)}"` : 'No projects found'}</p></div>`;
+            : '';
 
         const sortIndicator = (field: ProjectSortField) => {
             if (this.sortField !== field) { return ''; }
@@ -283,6 +289,36 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             </div>
             <div id="project-list">
                 ${listItems}
+                <div id="empty-message" class="center-message" hidden><p></p></div>
+            </div>
+        `);
+    }
+
+    private getLocalProjectListHtml(projects: DetectedLocalLeafProject[]): string {
+        const listItems = projects.map(project => {
+            const settings = project.settings;
+            const title = escapeHtml(settings?.projectName || project.relativePath);
+            const detail = escapeHtml(project.relativePath);
+            const server = settings?.serverUrl ? escapeHtml(settings.serverUrl) : '';
+            return /*html*/`
+                <div class="project-item local-project" data-uri="${escapeHtml(project.uri.toString())}" data-name="${escapeHtml(`${settings?.projectName || ''} ${project.relativePath}`.toLowerCase())}">
+                    <span class="codicon codicon-root-folder project-icon"></span>
+                    <div class="project-info">
+                        <span class="project-name">${title}</span>
+                        <span class="project-date">${detail}${server ? ` • ${server}` : ''}</span>
+                    </div>
+                </div>`;
+        }).join('\n');
+
+        return this.wrapHtml(/*html*/`
+            <div class="search-container">
+                <span class="codicon codicon-search search-icon"></span>
+                <input type="text" id="search" placeholder="Search local projects..." value="${escapeHtml(this.filterText)}" />
+            </div>
+            <div class="section-caption">${projects.length} LocalLeaf project${projects.length === 1 ? '' : 's'} found</div>
+            <div id="project-list">
+                ${listItems}
+                <div id="empty-message" class="center-message" hidden><p></p></div>
             </div>
         `);
     }
@@ -439,6 +475,15 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         .project-date {
             font-size: 0.85em;
             color: var(--vscode-descriptionForeground);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .section-caption {
+            padding: 4px 12px;
+            color: var(--vscode-descriptionForeground);
+            border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+            font-size: 0.85em;
         }
     </style>
 </head>
@@ -450,9 +495,34 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
         // Search input with debounce
         const searchInput = document.getElementById('search');
+        const emptyMessage = document.getElementById('empty-message');
+
+        function applyProjectFilter() {
+            const query = (searchInput?.value || '').toLowerCase();
+            const items = Array.from(document.querySelectorAll('#project-list .project-item'));
+            let visibleCount = 0;
+            items.forEach(item => {
+                const isVisible = !query || (item.dataset.name || '').includes(query);
+                item.hidden = !isVisible;
+                if (isVisible) {
+                    visibleCount++;
+                }
+            });
+
+            if (emptyMessage) {
+                emptyMessage.hidden = visibleCount > 0;
+                const text = emptyMessage.querySelector('p');
+                if (text) {
+                    text.textContent = query ? 'No projects matching "' + searchInput.value + '"' : 'No projects found';
+                }
+            }
+        }
+
         if (searchInput) {
             let debounceTimer;
+            applyProjectFilter();
             searchInput.addEventListener('input', () => {
+                applyProjectFilter();
                 clearTimeout(debounceTimer);
                 debounceTimer = setTimeout(() => {
                     postMessage({ type: 'filterChanged', text: searchInput.value });
@@ -464,6 +534,18 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         document.querySelectorAll('.sort-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 postMessage({ type: 'sortChanged', field: btn.dataset.field });
+            });
+        });
+
+        document.querySelectorAll('.remote-project').forEach(item => {
+            item.addEventListener('click', () => {
+                postMessage({ type: 'openProject', projectId: item.dataset.projectId });
+            });
+        });
+
+        document.querySelectorAll('.local-project').forEach(item => {
+            item.addEventListener('click', () => {
+                postMessage({ type: 'selectLocalProject', uri: item.dataset.uri });
             });
         });
     </script>

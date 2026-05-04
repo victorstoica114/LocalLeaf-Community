@@ -50,6 +50,7 @@ let autoCompiler: AutoCompiler | undefined;
 let extensionContext: vscode.ExtensionContext;
 let scmBridge: LocalLeafScmBridge;
 let gitCommitHook: GitCommitHook | undefined;
+let settingsWatcher: vscode.FileSystemWatcher | undefined;
 
 /**
  * Extension activation
@@ -100,7 +101,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const hasCredential = !!(await credentialManager.getCredential(serverUrl));
     await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', hasCredential);
 
-    const initSettingsManager = SettingsManager.getCurrentInstance();
+    const initSettingsManager = await SettingsManager.resolveCurrentInstance();
     const isInitLinked = initSettingsManager && await initSettingsManager.isLinked();
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', !!isInitLinked);
     await vscode.commands.executeCommand('setContext', 'localleaf.scmActive', false);
@@ -142,8 +143,12 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     }));
 
+    context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+        await refreshWorkspaceProjectState(context);
+    }));
+
     // Check if current workspace is linked
-    const settingsManager = SettingsManager.getCurrentInstance();
+    const settingsManager = initSettingsManager ?? await SettingsManager.resolveCurrentInstance();
     if (settingsManager && await settingsManager.isLinked()) {
         await settingsManager.load();
         // Show status bar only when linked
@@ -158,15 +163,7 @@ export async function activate(context: vscode.ExtensionContext) {
     await refreshScmAndHookState();
 
     // Watch for settings changes
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
-    if (workspaceFolder) {
-        const settingsWatcher = createSettingsWatcher(workspaceFolder, async () => {
-            log('Settings changed, reloading...');
-            await settingsManager?.load();
-            await refreshScmAndHookState();
-        });
-        context.subscriptions.push(settingsWatcher);
-    }
+    updateSettingsWatcher(context, settingsManager);
 
     log('LocalLeaf activated');
 
@@ -197,6 +194,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.VERIFY_CREDENTIALS, cmdVerifyCredentials),
         vscode.commands.registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
         vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: ProjectInfo) => cmdOpenProject(context, project)),
+        vscode.commands.registerCommand(COMMANDS.OPEN_LOCAL_PROJECT, (workspaceUri: string) => cmdOpenLocalProject(context, workspaceUri)),
         vscode.commands.registerCommand(COMMANDS.REMOVE_COMMENTS, cmdRemoveComments),
         // Sync mode
         vscode.commands.registerCommand(COMMANDS.TOGGLE_SYNC_MODE, cmdToggleSyncMode),
@@ -597,6 +595,114 @@ function refreshSidebar(): void {
 }
 
 /**
+ * Stop the currently connected LocalLeaf project session.
+ */
+function disconnectCurrentProjectSession(): void {
+    if (syncEngine) {
+        syncEngine.disconnect();
+        syncEngine = undefined;
+    }
+
+    if (cursorTracker) {
+        cursorTracker.dispose();
+        cursorTracker = undefined;
+    }
+
+    stopStatusUpdates();
+    autoCompiler?.disable();
+    changesWebviewProvider?.setOnlineUsers([]);
+}
+
+/**
+ * Install a watcher for the active LocalLeaf project's settings file.
+ */
+function updateSettingsWatcher(
+    context: vscode.ExtensionContext,
+    settingsManager?: SettingsManager,
+): void {
+    settingsWatcher?.dispose();
+    settingsWatcher = undefined;
+
+    if (!settingsManager) {
+        return;
+    }
+
+    settingsWatcher = createSettingsWatcher(settingsManager.getWorkspaceFolder(), async () => {
+        log('Settings changed, reloading...');
+        const currentSettingsManager = await SettingsManager.resolveCurrentInstance();
+        if (!currentSettingsManager || !(await currentSettingsManager.isLinked())) {
+            await refreshWorkspaceProjectState(context);
+            return;
+        }
+
+        await currentSettingsManager.load();
+        await refreshScmAndHookState();
+        refreshSidebar();
+    });
+    context.subscriptions.push(settingsWatcher);
+}
+
+/**
+ * Activate a linked LocalLeaf project folder, including child folders discovered
+ * under an opened parent workspace.
+ */
+async function activateLinkedProject(
+    context: vscode.ExtensionContext,
+    settingsManager: SettingsManager,
+    message?: string,
+): Promise<void> {
+    disconnectCurrentProjectSession();
+    SettingsManager.setCurrentWorkspaceFolder(settingsManager.getWorkspaceFolder());
+
+    const settings = await settingsManager.load();
+    if (!settings) {
+        vscode.window.showErrorMessage('LocalLeaf: Selected folder is missing .localleaf/settings.json');
+        await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', false);
+        await refreshScmAndHookState();
+        refreshSidebar();
+        return;
+    }
+
+    if (message) {
+        vscode.window.showInformationMessage(message);
+    }
+
+    statusBarItem.show();
+    await updateLoginStatus();
+    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
+    updateSettingsWatcher(context, settingsManager);
+    await refreshScmAndHookState();
+    refreshSidebar();
+
+    await initializeSync(context, settingsManager);
+}
+
+/**
+ * Re-evaluate which LocalLeaf project should be active for the current VS Code
+ * workspace. A direct project folder wins; otherwise the only linked child
+ * folder is auto-selected. Multiple child projects are shown in the Projects view.
+ */
+async function refreshWorkspaceProjectState(context: vscode.ExtensionContext): Promise<void> {
+    disconnectCurrentProjectSession();
+    SettingsManager.clearCurrentWorkspaceFolder();
+
+    const settingsManager = await SettingsManager.resolveCurrentInstance();
+    if (settingsManager && await settingsManager.isLinked()) {
+        await activateLinkedProject(context, settingsManager);
+        return;
+    }
+
+    updateSettingsWatcher(context);
+    statusBarItem.hide();
+    collaboratorStatusItem.hide();
+    changesWebviewProvider.clearChanges();
+    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', false);
+    await refreshScmAndHookState();
+    await updateLoginStatus();
+    refreshSidebar();
+}
+
+/**
  * Whether git-commit-triggered Overleaf push is enabled.
  */
 function isGitCommitAutoPushEnabled(): boolean {
@@ -626,8 +732,9 @@ async function refreshScmAndHookState(): Promise<void> {
         return;
     }
 
-    const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
     const settingsManager = SettingsManager.getCurrentInstance();
+    const workspaceUri = settingsManager?.getWorkspaceFolder()
+        ?? vscode.workspace.workspaceFolders?.[0]?.uri;
     const isLinked = !!(settingsManager && await settingsManager.isLinked());
     const mode: SyncMode = syncEngine?.syncMode
         ?? (settingsManager?.getSettings()?.syncMode === 'realtime' ? 'realtime' : 'manual');
@@ -968,6 +1075,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
     const project = selected.project;
 
     // Create settings
+    SettingsManager.setCurrentWorkspaceFolder(workspaceFolder);
     const settingsManager = SettingsManager.getInstance(workspaceFolder);
     const settings = SettingsManager.createDefaultSettings(serverUrl, project.id, project.name);
     await settingsManager.save(settings);
@@ -978,17 +1086,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
         await ignoreParser.createDefault();
     }
 
-    vscode.window.showInformationMessage(`LocalLeaf: Linked to "${project.name}"`);
-
-    // Show status bars now that we're linked
-    statusBarItem.show();
-    await updateLoginStatus();
-    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
-    await refreshScmAndHookState();
-    refreshSidebar();
-
-    // Initialize sync (this will auto-pull)
-    await initializeSync(context, settingsManager);
+    await activateLinkedProject(context, settingsManager, `LocalLeaf: Linked to "${project.name}"`);
 }
 
 /**
@@ -1022,8 +1120,11 @@ async function cmdUnlinkFolder() {
 
     // Delete settings
     await settingsManager.delete();
+    SettingsManager.clearCurrentWorkspaceFolder();
+    updateSettingsWatcher(extensionContext);
 
-    updateStatusBar('disconnected');
+    statusBarItem.hide();
+    collaboratorStatusItem.hide();
     await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', false);
     await refreshScmAndHookState();
     changesWebviewProvider.clearChanges();
@@ -1121,7 +1222,8 @@ async function cmdPushToOverleaf() {
  * Edit ignore patterns
  */
 async function cmdEditIgnorePatterns() {
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const workspaceFolder = SettingsManager.getCurrentInstance()?.getWorkspaceFolder()
+        ?? vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!workspaceFolder) {
         vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
         return;
@@ -1437,7 +1539,8 @@ async function cmdRemoveComments() {
     try {
         log('Remove Comments: starting...');
 
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+        const workspaceFolder = SettingsManager.getCurrentInstance()?.getWorkspaceFolder()
+            ?? vscode.workspace.workspaceFolders?.[0]?.uri;
         if (!workspaceFolder) {
             vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
             return;
@@ -1465,7 +1568,9 @@ async function cmdRemoveComments() {
             const content = new TextDecoder().decode(bytes);
             const commentLines = countCommentLines(content);
             if (commentLines > 0) {
-                const relativePath = vscode.workspace.asRelativePath(uri);
+                const relativePath = path.relative(workspaceFolder.fsPath, uri.fsPath)
+                    .split(path.sep)
+                    .join('/');
                 fileSummaries.push({ uri, name: relativePath, commentLines });
                 totalCommentLines += commentLines;
             }
@@ -1909,6 +2014,32 @@ async function cmdDiscardChange(filePath: string) {
 }
 
 /**
+ * Open an existing LocalLeaf project discovered under the current workspace.
+ */
+async function cmdOpenLocalProject(context: vscode.ExtensionContext, workspaceUri: string) {
+    let projectUri: vscode.Uri;
+    try {
+        projectUri = vscode.Uri.parse(workspaceUri);
+    } catch {
+        vscode.window.showErrorMessage('LocalLeaf: Invalid project folder');
+        return;
+    }
+
+    const settingsManager = SettingsManager.getInstance(projectUri);
+    if (!(await settingsManager.isLinked())) {
+        vscode.window.showErrorMessage('LocalLeaf: Selected folder is not a LocalLeaf project');
+        return;
+    }
+
+    const settings = await settingsManager.load();
+    await activateLinkedProject(
+        context,
+        settingsManager,
+        `LocalLeaf: Opened "${settings?.projectName || projectUri.fsPath}"`
+    );
+}
+
+/**
  * Open a project from the sidebar (link + download)
  */
 async function cmdOpenProject(context: vscode.ExtensionContext, project: ProjectInfo) {
@@ -1926,6 +2057,7 @@ async function cmdOpenProject(context: vscode.ExtensionContext, project: Project
     }
 
     // Create settings
+    SettingsManager.setCurrentWorkspaceFolder(workspaceFolder);
     const settingsManager = SettingsManager.getInstance(workspaceFolder);
     const settings = SettingsManager.createDefaultSettings(serverUrl, project.id, project.name);
     await settingsManager.save(settings);
@@ -1936,17 +2068,7 @@ async function cmdOpenProject(context: vscode.ExtensionContext, project: Project
         await ignoreParser.createDefault();
     }
 
-    vscode.window.showInformationMessage(`LocalLeaf: Linked to "${project.name}"`);
-
-    // Show status bars now that we're linked
-    statusBarItem.show();
-    await updateLoginStatus();
-    await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
-    await refreshScmAndHookState();
-    refreshSidebar();
-
-    // Initialize sync (this will auto-pull)
-    await initializeSync(context, settingsManager);
+    await activateLinkedProject(context, settingsManager, `LocalLeaf: Linked to "${project.name}"`);
 }
 
 /**

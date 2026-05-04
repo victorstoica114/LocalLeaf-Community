@@ -24,6 +24,7 @@
   ],
   "activationEvents": [
     "workspaceContains:.localleaf",
+    "workspaceContains:**/.localleaf/settings.json",
     "onView:localleaf.projectsView"
   ],
   "extensionDependencies": [

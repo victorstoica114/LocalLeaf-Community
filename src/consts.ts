@@ -71,6 +71,7 @@ export const COMMANDS = {
     VERIFY_CREDENTIALS: 'localleaf.verifyCredentials',
     REFRESH_COOKIE: 'localleaf.refreshCookie',
     OPEN_PROJECT: 'localleaf.openProject',
+    OPEN_LOCAL_PROJECT: 'localleaf.openLocalProject',
     REMOVE_COMMENTS: 'localleaf.removeComments',
     // Sync mode
     TOGGLE_SYNC_MODE: 'localleaf.toggleSyncMode',

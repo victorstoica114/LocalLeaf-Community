@@ -11,6 +11,7 @@ import * as vscode from 'vscode';
 import { ChangeTracker, SyncMode, PendingChange } from '../sync/changeTracker';
 import { SyncStatus } from '../sync/syncEngine';
 import { changeTypeIcon, displayPath, formatTimeAgo, syncStatusDescription } from './sidebarProvider';
+import { SettingsManager } from '../utils/settingsManager';
 
 // ── State & message types ──────────────────────────────────────────
 
@@ -258,7 +259,8 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     private fileUri(relativePath: string): vscode.Uri | undefined {
-        const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+        const folder = SettingsManager.getCurrentInstance()?.getWorkspaceFolder()
+            ?? vscode.workspace.workspaceFolders?.[0]?.uri;
         if (!folder) { return undefined; }
         const clean = relativePath.replace(/^\/+/, '');
         return vscode.Uri.joinPath(folder, clean);
