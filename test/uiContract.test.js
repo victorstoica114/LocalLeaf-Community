@@ -116,6 +116,14 @@ test('main webview owns changes tools and details sections', () => {
   assert.match(changesProvider, /state\.details/);
 });
 
+test('realtime mode hides the changes section while keeping tools and details', () => {
+  const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+
+  assert.match(changesProvider, /function renderChangesSection\(\) \{[\s\S]*state\.syncMode === 'realtime'[\s\S]*return null/);
+  assert.match(changesProvider, /const changesEl = renderChangesSection\(\);[\s\S]*if \(changesEl\) root\.appendChild\(changesEl\)/);
+  assert.match(changesProvider, /root\.appendChild\(h\('div', \{className:'bottom-sections'\}/);
+});
+
 test('main webview section headers are rounded flush-left with tools and details anchored below', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
 

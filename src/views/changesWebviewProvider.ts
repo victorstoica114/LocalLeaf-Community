@@ -989,6 +989,10 @@ body{
         }
 
         function renderChangesSection() {
+            if (state.syncMode === 'realtime') {
+                return null;
+            }
+
             const conflictsEl = renderGroup('conflicts', 'Conflicts', '\u26A0', state.conflicts, 'conflict');
             const remoteEl = renderGroup('remote', 'Remote Changes', '\u2193', state.remoteChanges, 'remote');
             const localEl = renderGroup('local', 'Local Changes', '\u2191', state.localChanges, 'local');
@@ -1048,7 +1052,8 @@ body{
             const usersEl = renderOnlineUsers();
             if (usersEl) root.appendChild(usersEl);
 
-            root.appendChild(renderChangesSection());
+            const changesEl = renderChangesSection();
+            if (changesEl) root.appendChild(changesEl);
             root.appendChild(h('div', {className:'bottom-sections'},
                 renderToolsSection(),
                 renderDetailsSection(),
