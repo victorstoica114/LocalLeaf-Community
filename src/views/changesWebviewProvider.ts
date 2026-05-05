@@ -13,6 +13,8 @@ import { SyncStatus } from '../sync/syncEngine';
 import { changeTypeIcon, displayPath, formatTimeAgo, syncStatusDescription } from './sidebarProvider';
 import { SettingsManager } from '../utils/settingsManager';
 import { PanelNotificationCenter, PanelNotificationState } from './panelNotificationCenter';
+import { CredentialManager } from '../utils/credentialManager';
+import { COMMANDS } from '../consts';
 
 // ── State & message types ──────────────────────────────────────────
 
@@ -38,6 +40,12 @@ export interface OnlineUserInfo {
     row?: number;
 }
 
+interface DetailItem {
+    label: string;
+    description: string;
+    icon: string;
+}
+
 interface ChangesViewState {
     syncMode: SyncMode;
     syncStatus: SyncStatus;
@@ -47,6 +55,7 @@ interface ChangesViewState {
     localChanges: ChangeItem[];
     notifications: PanelNotificationState;
     onlineUsers: OnlineUserInfo[];
+    details: DetailItem[];
 }
 
 // Messages from webview → extension
@@ -58,12 +67,18 @@ type WebviewMessage =
     | { command: 'resolveConflictLocal'; path: string }
     | { command: 'confirmationResponse'; id: string; value: string }
     | { command: 'jumpToUser'; clientId: string }
-    | { command: 'toggleSyncMode' };
+    | { command: 'toggleSyncMode' }
+    | { command: 'removeComments' }
+    | { command: 'editIgnorePatterns' }
+    | { command: 'setMainDocument' }
+    | { command: 'configure' }
+    | { command: 'selectCompiler' }
+    | { command: 'toggleAutoCompile' };
 
 // ── Provider ───────────────────────────────────────────────────────
 
 export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
-    static readonly viewType = 'localleaf.changesView';
+    static readonly viewType = 'localleaf.mainView';
 
     private _view?: vscode.WebviewView;
     private changeTracker?: ChangeTracker;
@@ -76,6 +91,7 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
     constructor(
         private readonly extensionUri: vscode.Uri,
         private readonly notifications: PanelNotificationCenter,
+        private readonly credentialManager: CredentialManager,
     ) {
         this.notifications.subscribe(() => this.pushState());
     }
@@ -193,12 +209,30 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
                 this.runCommand('localleaf.jumpToCollaborator', msg.clientId);
                 break;
             case 'toggleSyncMode':
-                this.runCommand('localleaf.toggleSyncMode');
+                this.runCommand(COMMANDS.TOGGLE_SYNC_MODE);
+                break;
+            case 'removeComments':
+                this.runCommand(COMMANDS.REMOVE_COMMENTS);
+                break;
+            case 'editIgnorePatterns':
+                this.runCommand(COMMANDS.EDIT_IGNORE_PATTERNS);
+                break;
+            case 'setMainDocument':
+                this.runCommand(COMMANDS.SET_MAIN_DOCUMENT);
+                break;
+            case 'configure':
+                this.runCommand(COMMANDS.CONFIGURE);
+                break;
+            case 'selectCompiler':
+                this.runCommand(COMMANDS.SELECT_COMPILER);
+                break;
+            case 'toggleAutoCompile':
+                this.runCommand(COMMANDS.TOGGLE_AUTO_COMPILE);
                 break;
         }
     }
 
-    private buildState(): ChangesViewState {
+    private async buildState(): Promise<ChangesViewState> {
         const conflicts: ChangeItem[] = [];
         const remoteChanges: ChangeItem[] = [];
         const localChanges: ChangeItem[] = [];
@@ -219,6 +253,8 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
             }
         }
 
+        const details = await this.buildDetails();
+
         return {
             syncMode: this.syncMode,
             syncStatus: this.syncStatus,
@@ -228,12 +264,57 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
             localChanges,
             notifications: this.notifications.getState(),
             onlineUsers: this.onlineUsers,
+            details,
         };
     }
 
     private pushState(): void {
         if (!this._view) { return; }
-        this._view.webview.postMessage({ type: 'state', state: this.buildState() });
+        void this.buildState().then(state => {
+            this._view?.webview.postMessage({ type: 'state', state });
+        });
+    }
+
+    private async buildDetails(): Promise<DetailItem[]> {
+        const settingsManager = SettingsManager.getCurrentInstance();
+        const settings = settingsManager?.getSettings();
+        if (!settings) { return []; }
+
+        const details: DetailItem[] = [
+            { label: settings.serverUrl, description: 'Server', icon: '🌐' },
+        ];
+
+        const serverUrl = this.credentialManager.getDefaultServer();
+        const credential = await this.credentialManager.getCredential(serverUrl);
+        if (credential) {
+            details.push({ label: credential.userEmail, description: 'Account', icon: '👤' });
+        }
+
+        if (settings.mainTex) {
+            details.push({ label: settings.mainTex, description: 'Main document', icon: '📄' });
+        }
+
+        details.push({ label: settings.projectId, description: 'Project ID', icon: '🔑' });
+
+        details.push({
+            label: settings.syncMode === 'realtime' ? 'Real-time' : 'Manual',
+            description: 'Sync mode',
+            icon: settings.syncMode === 'realtime' ? '⚡' : '⇄',
+        });
+
+        if (settings.compiler) {
+            details.push({ label: settings.compiler, description: 'Compiler', icon: '⚙' });
+        }
+
+        if (settings.compileOnSave !== undefined) {
+            details.push({
+                label: settings.compileOnSave ? 'Enabled' : 'Disabled',
+                description: 'Auto-compile',
+                icon: settings.compileOnSave ? '✓' : '○',
+            });
+        }
+
+        return details;
     }
 
     private fileUri(relativePath: string): vscode.Uri | undefined {
@@ -266,6 +347,8 @@ body{
 }
 #root{
     height: 100vh;
+    display: flex;
+    flex-direction: column;
     overflow-y: auto;
     overflow-x: hidden;
 }
@@ -425,6 +508,84 @@ body{
 }
 
 /* ── Change groups ─────────────────────────────────── */
+.panel-section{
+    margin: 8px 8px 8px 0;
+    border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+    border-radius: 0 6px 6px 0;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+.changes-section{
+    flex: 1 1 auto;
+    min-height: 0;
+}
+.bottom-sections{
+    margin-top: auto;
+    flex-shrink: 0;
+}
+.panel-section-header{
+    display: flex;
+    align-items: center;
+    min-height: 28px;
+    padding: 6px 12px;
+    border-radius: 0 6px 6px 0;
+    background: #007acc;
+    color: #fff;
+    font-size: 0.82em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.panel-section-body{
+    padding: 0;
+}
+.tool-list,
+.detail-list{
+    padding: 4px 0;
+}
+.tool-item,
+.detail-item{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 28px;
+    padding: 4px 12px;
+}
+.tool-item{
+    width: 100%;
+    border: 0;
+    color: var(--vscode-foreground);
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+.tool-item:hover{
+    background: var(--vscode-list-hoverBackground);
+}
+.tool-icon,
+.detail-icon{
+    width: 18px;
+    text-align: center;
+    flex-shrink: 0;
+}
+.detail-text{
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+.detail-label{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.detail-desc{
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.85em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .group{
     border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
 }
@@ -768,6 +929,59 @@ body{
             return h('div', {className:'group'}, header, body);
         }
 
+        function renderSection(label, ...children) {
+            const cls = 'panel-section ' + label.toLowerCase() + '-section';
+            return h('section', {className:cls},
+                h('div', {className:'panel-section-header'}, label),
+                h('div', {className:'panel-section-body'}, ...children),
+            );
+        }
+
+        function renderChangesSection() {
+            const conflictsEl = renderGroup('conflicts', 'Conflicts', '\u26A0', state.conflicts, 'conflict');
+            const remoteEl = renderGroup('remote', 'Remote Changes', '\u2193', state.remoteChanges, 'remote');
+            const localEl = renderGroup('local', 'Local Changes', '\u2191', state.localChanges, 'local');
+            const children = [conflictsEl, remoteEl, localEl].filter(Boolean);
+
+            if (children.length === 0) {
+                children.push(h('div', {className:'empty'}, 'No file changes yet.\\nChanges will appear here as files are synced.'));
+            }
+
+            return renderSection('Changes', ...children);
+        }
+
+        function renderToolsSection() {
+            const tools = [
+                ['Remove LaTeX Comments', '%', 'removeComments'],
+                ['Edit Ignore Patterns', '≡', 'editIgnorePatterns'],
+                ['Set Main Document', '📄', 'setMainDocument'],
+                ['Select Compiler', '⚙', 'selectCompiler'],
+                ['Toggle Auto-Compile', '↻', 'toggleAutoCompile'],
+                ['Configure Settings', '⚙', 'configure'],
+            ];
+            const items = tools.map(([label, icon, command]) =>
+                h('button', {className:'tool-item', 'data-command':command, title:label},
+                    h('span', {className:'tool-icon'}, icon),
+                    h('span', {className:'tool-label'}, label),
+                ),
+            );
+            return renderSection('Tools', h('div', {className:'tool-list'}, ...items));
+        }
+
+        function renderDetailsSection() {
+            const items = (state.details || []).map(item =>
+                h('div', {className:'detail-item', title:item.description + ': ' + item.label},
+                    h('span', {className:'detail-icon'}, item.icon),
+                    h('span', {className:'detail-text'},
+                        h('span', {className:'detail-label'}, item.label),
+                        h('span', {className:'detail-desc'}, item.description),
+                    ),
+                ),
+            );
+
+            return renderSection('Details', h('div', {className:'detail-list'}, ...items));
+        }
+
         function renderTopStatusRegion() {
             return h('div', {className:'top-status-region'},
                 renderPrimaryStatusBar(),
@@ -783,18 +997,11 @@ body{
             const usersEl = renderOnlineUsers();
             if (usersEl) root.appendChild(usersEl);
 
-            // Change groups
-            const conflictsEl = renderGroup('conflicts', 'Conflicts', '\u26A0', state.conflicts, 'conflict');
-            const remoteEl = renderGroup('remote', 'Remote Changes', '\u2193', state.remoteChanges, 'remote');
-            const localEl = renderGroup('local', 'Local Changes', '\u2191', state.localChanges, 'local');
-
-            if (conflictsEl) root.appendChild(conflictsEl);
-            if (remoteEl) root.appendChild(remoteEl);
-            if (localEl) root.appendChild(localEl);
-
-            if (!conflictsEl && !remoteEl && !localEl) {
-                root.appendChild(h('div', {className:'empty'}, 'No file changes yet.\\nChanges will appear here as files are synced.'));
-            }
+            root.appendChild(renderChangesSection());
+            root.appendChild(h('div', {className:'bottom-sections'},
+                renderToolsSection(),
+                renderDetailsSection(),
+            ));
 
             const choiceEl = renderChoiceModal();
             if (choiceEl) root.appendChild(choiceEl);

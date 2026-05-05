@@ -27,10 +27,31 @@ test('ambiguous sync now command is not exposed in the VS Code UI', () => {
   assert.ok(titleCommands.includes('localleaf.pushToOverleaf'));
 });
 
-test('changes view activates the extension directly', () => {
+test('linked localleaf sidebar is a single webview instead of changes tools details foldouts', () => {
+  const manifest = require('../package.json');
+  const linkedViews = manifest.contributes.views.localleaf.filter(view => view.when === 'localleaf.isLinked');
+  const linkedIds = linkedViews.map(view => view.id);
+  const titleCommands = manifest.contributes.menus['view/title'];
+  const extension = fs.readFileSync(path.join(root, 'src/extension.ts'), 'utf8');
+
+  assert.deepEqual(linkedIds, ['localleaf.mainView']);
+  assert.equal(linkedViews[0].type, 'webview');
+  assert.equal(linkedViews[0].name, ' ');
+  assert.ok(manifest.activationEvents.includes('onView:localleaf.mainView'));
+  assert.ok(!manifest.activationEvents.includes('onView:localleaf.changesView'));
+  assert.ok(!linkedIds.includes('localleaf.changesView'));
+  assert.ok(!linkedIds.includes('localleaf.toolsView'));
+  assert.ok(!linkedIds.includes('localleaf.detailsView'));
+  assert.ok(titleCommands.some(item => item.when === 'view == localleaf.mainView'));
+  assert.ok(!titleCommands.some(item => item.when && item.when.includes('localleaf.changesView')));
+  assert.doesNotMatch(extension, /createTreeView\('localleaf\.toolsView'/);
+  assert.doesNotMatch(extension, /createTreeView\('localleaf\.detailsView'/);
+});
+
+test('main view activates the extension directly', () => {
   const manifest = require('../package.json');
 
-  assert.ok(manifest.activationEvents.includes('onView:localleaf.changesView'));
+  assert.ok(manifest.activationEvents.includes('onView:localleaf.mainView'));
 });
 
 test('clicking a change row opens a diff instead of the plain local file', () => {
@@ -48,6 +69,41 @@ test('every change item exposes a visible diff action', () => {
 
   assert.match(changesProvider, /const actions = \[\s*h\('button', \{className:'action-btn diff-btn'/);
   assert.match(changesProvider, /\.change-item \.actions\{[\s\S]*display:\s*flex/);
+});
+
+test('main webview owns changes tools and details sections', () => {
+  const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+
+  assert.match(changesProvider, /renderSection\('Changes'/);
+  assert.match(changesProvider, /renderSection\('Tools'/);
+  assert.match(changesProvider, /renderSection\('Details'/);
+  assert.match(changesProvider, /removeComments/);
+  assert.match(changesProvider, /state\.details/);
+});
+
+test('main webview section headers are rounded flush-left with tools and details anchored below', () => {
+  const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+
+  assert.match(changesProvider, /#root\{[\s\S]*display:\s*flex/);
+  assert.match(changesProvider, /\.panel-section\{[\s\S]*margin:\s*8px 8px 8px 0/);
+  assert.match(changesProvider, /\.panel-section-header\{[\s\S]*border-radius:\s*0 6px 6px 0/);
+  assert.match(changesProvider, /\.bottom-sections\{[\s\S]*margin-top:\s*auto/);
+  assert.match(changesProvider, /h\('div', \{className:'bottom-sections'\},/);
+});
+
+test('main webview puts the realtime switch at the top left instead of a localleaf title', () => {
+  const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+  const manifest = require('../package.json');
+  const mainView = manifest.contributes.views.localleaf.find(view => view.id === 'localleaf.mainView');
+  const realtimeIndex = changesProvider.indexOf("className:'realtime-control'");
+  const statusIndex = changesProvider.indexOf("className:'status-left'");
+
+  assert.equal(mainView.name, ' ');
+  assert.match(changesProvider, /\.status-strip\{[\s\S]*justify-content:\s*flex-start/);
+  assert.match(changesProvider, /\.realtime-control\{[\s\S]*display:\s*flex/);
+  assert.ok(realtimeIndex > -1);
+  assert.ok(statusIndex > -1);
+  assert.ok(realtimeIndex < statusIndex);
 });
 
 test('left panel status region is sticky at the top', () => {

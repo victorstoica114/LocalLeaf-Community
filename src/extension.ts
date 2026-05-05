@@ -13,7 +13,6 @@ import { IgnoreParser } from './sync/ignoreParser';
 import { PendingChange, SyncMode } from './sync/changeTracker';
 import { CursorTracker, TrackedUser, getInitials } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
-import { DetailsProvider, ToolsProvider } from './views/sidebarProvider';
 import { ChangesWebviewProvider } from './views/changesWebviewProvider';
 import { cleanChangePath, createChangeDiffPlan, DiffSide } from './views/changeDiffPlan';
 import { ProjectsWebviewProvider, ProjectSortField } from './views/projectsWebviewProvider';
@@ -54,7 +53,6 @@ let authState: AuthState = 'none';
 let panelNotifications: PanelNotificationCenter;
 let projectsWebviewProvider: ProjectsWebviewProvider;
 let changesWebviewProvider: ChangesWebviewProvider;
-let detailsProvider: DetailsProvider;
 let latexCompiler: LatexCompiler | undefined;
 let autoCompiler: AutoCompiler | undefined;
 let extensionContext: vscode.ExtensionContext;
@@ -85,9 +83,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize sidebar providers
     projectsWebviewProvider = new ProjectsWebviewProvider(context.extensionUri, credentialManager, panelNotifications);
-    changesWebviewProvider = new ChangesWebviewProvider(context.extensionUri, panelNotifications);
-    detailsProvider = new DetailsProvider(credentialManager);
-    const toolsProvider = new ToolsProvider();
+    changesWebviewProvider = new ChangesWebviewProvider(context.extensionUri, panelNotifications, credentialManager);
     PdfPreviewPanel.setNotificationHandler(message => showPanelNotice(message, 'warning'));
 
     // Projects view is now a webview
@@ -96,19 +92,12 @@ export async function activate(context: vscode.ExtensionContext) {
         projectsWebviewProvider,
         { webviewOptions: { retainContextWhenHidden: true } },
     );
-    // Changes view is now a webview
-    const changesViewDisposable = vscode.window.registerWebviewViewProvider(
+    const mainViewDisposable = vscode.window.registerWebviewViewProvider(
         ChangesWebviewProvider.viewType,
         changesWebviewProvider,
         { webviewOptions: { retainContextWhenHidden: true } },
     );
-    const toolsTreeView = vscode.window.createTreeView('localleaf.toolsView', {
-        treeDataProvider: toolsProvider,
-    });
-    const detailsTreeView = vscode.window.createTreeView('localleaf.detailsView', {
-        treeDataProvider: detailsProvider,
-    });
-    context.subscriptions.push(projectsViewDisposable, changesViewDisposable, toolsTreeView, detailsTreeView);
+    context.subscriptions.push(projectsViewDisposable, mainViewDisposable);
 
     // Set context for viewsWelcome / toolbar conditionals
     const serverUrl = credentialManager.getDefaultServer();
@@ -682,7 +671,6 @@ function log(message: string) {
 function refreshSidebar(): void {
     projectsWebviewProvider.refresh();
     changesWebviewProvider.refresh();
-    detailsProvider.refresh();
 }
 
 /**
@@ -820,7 +808,7 @@ function getPendingSyncCounts(engine: SyncEngine) {
  * Focus the LocalLeaf Changes view.
  */
 async function focusChangesView(): Promise<void> {
-    await vscode.commands.executeCommand('localleaf.changesView.focus');
+    await vscode.commands.executeCommand(`${ChangesWebviewProvider.viewType}.focus`);
 }
 
 async function runExclusiveSyncOperation<T>(
@@ -2088,7 +2076,7 @@ async function cmdSelectCompiler() {
     if (selected) {
         const settingsManager = SettingsManager.getCurrentInstance();
         await settingsManager?.update({ compiler: selected.label as any });
-        detailsProvider.refresh();
+        refreshSidebar();
         showPanelNotice(`LocalLeaf: Compiler set to ${selected.label}`, 'info', 4000);
     }
 }
@@ -2124,7 +2112,7 @@ async function cmdToggleAutoCompile() {
         showPanelNotice('Auto-compile disabled', 'info', 3000);
     }
 
-    detailsProvider.refresh();
+    refreshSidebar();
 }
 
 function cmdCancelCompilation() {
