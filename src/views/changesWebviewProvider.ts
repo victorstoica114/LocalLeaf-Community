@@ -369,25 +369,25 @@ body{
     border-left: 3px solid transparent;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 4px;
+    justify-content: flex-start;
+    gap: 8px;
 }
 .status-strip.info{ border-left-color: var(--vscode-editorInfo-foreground, #3794ff); }
 .status-strip.warning{ border-left-color: var(--vscode-editorWarning-foreground, #cca700); }
 .status-strip.error{ border-left-color: var(--vscode-editorError-foreground, #f14c4c); }
+.realtime-control{
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    font-size: 0.95em;
+}
 .status-left{
     flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-}
-.status-right{
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-    font-size: 0.95em;
 }
 .sync-mode-label{
     color: var(--vscode-descriptionForeground);
@@ -642,12 +642,6 @@ body{
     overflow: hidden;
     text-overflow: ellipsis;
 }
-.change-item .desc{
-    color: var(--vscode-descriptionForeground);
-    font-size: 0.85em;
-    margin-left: 6px;
-    flex-shrink: 0;
-}
 .change-item .actions{
     display: flex;
     gap: 2px;
@@ -656,9 +650,6 @@ body{
 }
 .change-item:hover .actions{
     display: flex;
-}
-.change-item:hover .desc{
-    display: none;
 }
 .action-btn{
     background: none;
@@ -670,12 +661,35 @@ body{
     font-size: 0.85em;
     opacity: 0.7;
 }
-.diff-btn{
-    opacity: 0.95;
-}
 .action-btn:hover{
     opacity: 1;
     background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31));
+}
+.context-menu{
+    position: fixed;
+    z-index: 40;
+    min-width: 120px;
+    padding: 4px;
+    border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, transparent));
+    border-radius: 4px;
+    background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+    color: var(--vscode-menu-foreground, var(--vscode-foreground));
+    box-shadow: 0 4px 12px rgba(0,0,0,.28);
+}
+.context-menu button{
+    width: 100%;
+    border: 0;
+    border-radius: 3px;
+    padding: 5px 8px;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+.context-menu button:hover{
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground));
+    color: var(--vscode-menu-selectionForeground, var(--vscode-foreground));
 }
 
 /* ── Empty state ───────────────────────────────────── */
@@ -755,6 +769,7 @@ body{
         const root = document.getElementById('root');
         let state = null;
         let collapsedGroups = {};
+        let contextMenu = null;
 
         window.addEventListener('message', e => {
             if (e.data.type === 'state') {
@@ -791,7 +806,25 @@ body{
             });
         });
 
+        root.addEventListener('contextmenu', event => {
+            const item = event.target.closest('.change-item[data-group="local"]');
+            if (!item || !root.contains(item)) {
+                hideChangeContextMenu();
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            showChangeContextMenu(event.clientX, event.clientY, item.dataset.path);
+        });
+
+        window.addEventListener('click', hideChangeContextMenu);
+        window.addEventListener('blur', hideChangeContextMenu);
+
         root.addEventListener('keydown', event => {
+            if (event.key === 'Escape') {
+                hideChangeContextMenu();
+                return;
+            }
             if (event.key !== 'Enter' && event.key !== ' ') return;
             const target = event.target.closest('.change-item[data-command]');
             if (!target || !root.contains(target)) return;
@@ -801,6 +834,31 @@ body{
                 path: target.dataset.path,
             });
         });
+
+        function hideChangeContextMenu() {
+            if (!contextMenu) return;
+            contextMenu.remove();
+            contextMenu = null;
+        }
+
+        function showChangeContextMenu(x, y, itemPath) {
+            hideChangeContextMenu();
+            contextMenu = h('div', {className:'context-menu'},
+                h('button', {
+                    title:'Discard local change',
+                    onClick: () => {
+                        hideChangeContextMenu();
+                        vscode.postMessage({command:'discardChange', path:itemPath});
+                    },
+                }, 'Discard'),
+            );
+            document.body.appendChild(contextMenu);
+            const rect = contextMenu.getBoundingClientRect();
+            const left = Math.min(x, window.innerWidth - rect.width - 4);
+            const top = Math.min(y, window.innerHeight - rect.height - 4);
+            contextMenu.style.left = Math.max(4, left) + 'px';
+            contextMenu.style.top = Math.max(4, top) + 'px';
+        }
 
         function changeIcon(type) {
             const map = {modified:'M', created:'+', deleted:'-', renamed:'R', moved:'V'};
@@ -857,16 +915,16 @@ body{
             const statusClass = 'status-strip ' + (notice ? notice.type : 'default');
 
             return h('div', {className:statusClass, title},
-                h('span', {className:'status-left'}, message),
-                count ? h('span', {className:'notice-count'}, count) : null,
-                h('span', {className:'status-right'},
-                    h('span', {className:'sync-mode-label'}, 'Real-time sync'),
+                h('span', {className:'realtime-control'},
+                    h('span', {className:'sync-mode-label'}, 'Real-time'),
                     h('button', {
                         className: toggleCls,
                         title: isRealtime ? 'Switch to manual sync' : 'Switch to real-time sync',
                         onClick: () => vscode.postMessage({command:'toggleSyncMode'}),
                     }, toggleLabel),
                 ),
+                h('span', {className:'status-left'}, message),
+                count ? h('span', {className:'notice-count'}, count) : null,
             );
         }
 
@@ -891,25 +949,18 @@ body{
         }
 
         function renderChangeItem(item, groupType) {
-            const actions = [
-                h('button', {className:'action-btn diff-btn', title:'View Diff', 'data-command':'viewDiff', 'data-path':item.path}, 'Diff'),
-            ];
+            const actions = [];
             if (groupType === 'conflict') {
                 actions.push(
                     h('button', {className:'action-btn', title:'Use Remote', 'data-command':'resolveConflictRemote', 'data-path':item.path}, 'Remote'),
                     h('button', {className:'action-btn', title:'Use Local', 'data-command':'resolveConflictLocal', 'data-path':item.path}, 'Local'),
                 );
-            } else {
-                actions.push(
-                    h('button', {className:'action-btn', title:'Discard', 'data-command':'discardChange', 'data-path':item.path}, 'Discard'),
-                );
             }
 
-            return h('div', {className:'change-item', title: item.path, role:'button', tabindex:'0', 'data-command':'viewDiff', 'data-path':item.path},
+            return h('div', {className:'change-item', title: item.path, role:'button', tabindex:'0', 'data-command':'viewDiff', 'data-path':item.path, 'data-group':groupType},
                 h('span', {className:'icon', style:'color:'+changeIconColor(item.type)}, changeIcon(item.type)),
                 h('span', {className:'name'}, fileName(item.path)),
-                h('span', {className:'desc'}, item.type),
-                h('span', {className:'actions'}, ...actions),
+                actions.length ? h('span', {className:'actions'}, ...actions) : null,
             );
         }
 

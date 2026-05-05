@@ -6,6 +6,7 @@ export interface ChangeDiffPlanInput {
     localChangeType?: ChangeType;
     remoteChangeType?: ChangeType;
     hasRemoteContent: boolean;
+    hasBaseContent?: boolean;
 }
 
 export interface ChangeDiffPlan {
@@ -19,13 +20,19 @@ export function cleanChangePath(path: string): string {
     return path.replace(/^\/+/, '');
 }
 
+export function getChangePathCandidates(path: string): string[] {
+    const cleanPath = cleanChangePath(path);
+    const syncPath = cleanPath ? `/${cleanPath}` : path;
+    return Array.from(new Set([path, cleanPath, syncPath].filter(Boolean)));
+}
+
 export function createChangeDiffPlan(input: ChangeDiffPlanInput): ChangeDiffPlan {
     if (input.localChangeType && !input.remoteChangeType) {
         return {
             left: 'base',
             right: input.localChangeType === 'deleted' ? 'empty' : 'local',
             titleKind: 'Base ↔ Local',
-            requiresRemoteContent: false,
+            requiresRemoteContent: input.hasBaseContent === false && input.localChangeType !== 'created',
         };
     }
 

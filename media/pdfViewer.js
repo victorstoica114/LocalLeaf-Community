@@ -305,10 +305,34 @@ function quickResizePages() {
     }
 }
 
-function applyZoom(newZoom, immediate) {
+function getWheelDeltaPixels(e) {
+    if (e.deltaMode === 1) return e.deltaY * 16;
+    if (e.deltaMode === 2) return e.deltaY * viewerContainer.clientHeight;
+    return e.deltaY;
+}
+
+function captureZoomAnchor(clientX, clientY) {
+    var rect = viewerContainer.getBoundingClientRect();
+    return {
+        contentX: viewerContainer.scrollLeft + clientX - rect.left,
+        contentY: viewerContainer.scrollTop + clientY - rect.top,
+        viewportX: clientX - rect.left,
+        viewportY: clientY - rect.top,
+    };
+}
+
+function restoreZoomAnchor(anchor, oldZoom, newZoom) {
+    if (!anchor || oldZoom <= 0) return;
+    var scaleRatio = newZoom / oldZoom;
+    viewerContainer.scrollLeft = Math.max(0, anchor.contentX * scaleRatio - anchor.viewportX);
+    viewerContainer.scrollTop = Math.max(0, anchor.contentY * scaleRatio - anchor.viewportY);
+}
+
+function applyZoom(newZoom, immediate, anchor) {
     newZoom = Math.min(Math.max(newZoom, 0.1), 10.0);
     if (Math.abs(newZoom - zoomLevel) < 0.001) return;
 
+    var oldZoom = zoomLevel;
     var scrollRatio = viewerContainer.scrollHeight > 0
         ? viewerContainer.scrollTop / viewerContainer.scrollHeight : 0;
 
@@ -317,14 +341,22 @@ function applyZoom(newZoom, immediate) {
 
     if (immediate) {
         renderAllPages().then(function () {
-            viewerContainer.scrollTop = scrollRatio * viewerContainer.scrollHeight;
+            if (anchor) {
+                restoreZoomAnchor(anchor, oldZoom, newZoom);
+            } else {
+                viewerContainer.scrollTop = scrollRatio * viewerContainer.scrollHeight;
+            }
         });
         return;
     }
 
     // Instant CSS resize for smooth visual feedback
     quickResizePages();
-    viewerContainer.scrollTop = scrollRatio * viewerContainer.scrollHeight;
+    if (anchor) {
+        restoreZoomAnchor(anchor, oldZoom, newZoom);
+    } else {
+        viewerContainer.scrollTop = scrollRatio * viewerContainer.scrollHeight;
+    }
 
     // Debounce the expensive full-quality re-render
     if (zoomDebounceTimer) clearTimeout(zoomDebounceTimer);
@@ -333,7 +365,11 @@ function applyZoom(newZoom, immediate) {
         var r = viewerContainer.scrollHeight > 0
             ? viewerContainer.scrollTop / viewerContainer.scrollHeight : 0;
         renderAllPages().then(function () {
-            viewerContainer.scrollTop = r * viewerContainer.scrollHeight;
+            if (anchor) {
+                restoreZoomAnchor(anchor, oldZoom, newZoom);
+            } else {
+                viewerContainer.scrollTop = r * viewerContainer.scrollHeight;
+            }
         });
     }, 300);
 }
@@ -342,8 +378,10 @@ function applyZoom(newZoom, immediate) {
 viewerContainer.addEventListener('wheel', function (e) {
     if (!e.ctrlKey && !e.metaKey) return;
     e.preventDefault();
-    var delta = e.deltaY > 0 ? -0.1 : 0.1;
-    applyZoom(zoomLevel + delta);
+    var wheelDelta = getWheelDeltaPixels(e);
+    var zoomFactor = Math.exp(-wheelDelta * 0.0025);
+    var anchor = captureZoomAnchor(e.clientX, e.clientY);
+    applyZoom(zoomLevel * zoomFactor, false, anchor);
 }, { passive: false });
 
 // ─── Recompile button ────────────────────────────────────────────

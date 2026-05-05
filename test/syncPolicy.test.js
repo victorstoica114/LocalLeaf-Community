@@ -8,6 +8,7 @@ const {
   shouldTrackLocalModification,
   shouldPushAfterManualPull,
   getManualSyncCompletionState,
+  getRestoredLocalChangeType,
 } = require('../out/sync/syncPolicy');
 
 test('manual startup skips auto-pull when a persisted baseline exists', () => {
@@ -124,4 +125,53 @@ test('manual local modification is tracked when current content differs from bas
     currentContent: Buffer.from('changed'),
     baseContent: Buffer.from('same'),
   }), true);
+});
+
+test('manual startup restores local changes from persisted baseline state', () => {
+  assert.equal(getRestoredLocalChangeType({
+    currentExists: true,
+    hasRemoteEntry: true,
+    hasBaseContent: true,
+    currentContent: Buffer.from('same plus a'),
+    baseContent: Buffer.from('same'),
+  }), 'modified');
+
+  assert.equal(getRestoredLocalChangeType({
+    currentExists: true,
+    hasRemoteEntry: false,
+    hasBaseContent: false,
+    currentContent: Buffer.from('new local file'),
+  }), 'created');
+
+  assert.equal(getRestoredLocalChangeType({
+    currentExists: false,
+    hasRemoteEntry: true,
+    hasBaseContent: true,
+  }), 'deleted');
+
+  assert.equal(getRestoredLocalChangeType({
+    currentExists: true,
+    hasRemoteEntry: true,
+    hasBaseContent: true,
+    currentContent: Buffer.from('same'),
+    baseContent: Buffer.from('same'),
+  }), undefined);
+});
+
+test('manual startup restores modified files by comparing remote content when baseline is missing', () => {
+  assert.equal(getRestoredLocalChangeType({
+    currentExists: true,
+    hasRemoteEntry: true,
+    hasBaseContent: false,
+    currentContent: Buffer.from('remote plus local edit'),
+    remoteContent: Buffer.from('remote'),
+  }), 'modified');
+
+  assert.equal(getRestoredLocalChangeType({
+    currentExists: true,
+    hasRemoteEntry: true,
+    hasBaseContent: false,
+    currentContent: Buffer.from('remote'),
+    remoteContent: Buffer.from('remote'),
+  }), undefined);
 });

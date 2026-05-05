@@ -54,6 +54,16 @@ test('main view activates the extension directly', () => {
   assert.ok(manifest.activationEvents.includes('onView:localleaf.mainView'));
 });
 
+test('manual startup restores local change rows from disk after skipping auto-pull', () => {
+  const extension = fs.readFileSync(path.join(root, 'src/extension.ts'), 'utf8');
+  const syncEngine = fs.readFileSync(path.join(root, 'src/sync/syncEngine.ts'), 'utf8');
+
+  assert.match(syncEngine, /async refreshLocalChangesFromDisk\(\)/);
+  assert.match(syncEngine, /this\.fileTreeByPath[\s\S]*this\.baseContent\.has\(relativePath\)[\s\S]*await this\.getRemoteContent\(relativePath\)/);
+  assert.match(extension, /const restoredLocalCount = syncMode === 'manual'[\s\S]*refreshLocalChangesFromDisk\(\)/);
+  assert.match(extension, /shouldAutoPull && !\(syncMode === 'manual' && restoredLocalCount > 0\)/);
+});
+
 test('clicking a change row opens a diff instead of the plain local file', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
 
@@ -64,11 +74,36 @@ test('clicking a change row opens a diff instead of the plain local file', () =>
   assert.match(changesProvider, /data-path':item\.path/);
 });
 
-test('every change item exposes a visible diff action', () => {
+test('virtual diff documents use safe internal URIs instead of encoded file paths', () => {
+  const extension = fs.readFileSync(path.join(root, 'src/extension.ts'), 'utf8');
+
+  assert.doesNotMatch(extension, /Uri\.parse\(`\$\{scheme\}:\/\$\{encodeURIComponent\(label\)\}`\)/);
+  assert.match(extension, /vscode\.Uri\.from\(\{\s*scheme,\s*path:\s*'\/content'/);
+});
+
+test('change rows open diffs directly without a visible diff button', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
 
-  assert.match(changesProvider, /const actions = \[\s*h\('button', \{className:'action-btn diff-btn'/);
-  assert.match(changesProvider, /\.change-item \.actions\{[\s\S]*display:\s*flex/);
+  assert.doesNotMatch(changesProvider, /diff-btn/);
+  assert.doesNotMatch(changesProvider, /title:'View Diff'/);
+  assert.match(changesProvider, /className:'change-item'[\s\S]*'data-command':'viewDiff'/);
+});
+
+test('change rows do not render trailing change type labels', () => {
+  const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+
+  assert.doesNotMatch(changesProvider, /className:'desc'/);
+  assert.doesNotMatch(changesProvider, /\.change-item \.desc/);
+  assert.doesNotMatch(changesProvider, /h\('span', \{className:'desc'\}, item\.type\)/);
+});
+
+test('local changes expose discard from the row context menu instead of inline actions', () => {
+  const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+
+  assert.match(changesProvider, /root\.addEventListener\('contextmenu'/);
+  assert.match(changesProvider, /\.change-item\[data-group="local"\]/);
+  assert.match(changesProvider, /showChangeContextMenu\(event\.clientX,\s*event\.clientY,\s*item\.dataset\.path\)/);
+  assert.doesNotMatch(changesProvider, /title:'Discard', 'data-command':'discardChange'/);
 });
 
 test('main webview owns changes tools and details sections', () => {
@@ -95,9 +130,11 @@ test('main webview puts the realtime switch at the top left instead of a localle
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
   const manifest = require('../package.json');
   const mainView = manifest.contributes.views.localleaf.find(view => view.id === 'localleaf.mainView');
+  const localleafContainer = manifest.contributes.viewsContainers.activitybar.find(container => container.id === 'localleaf');
   const realtimeIndex = changesProvider.indexOf("className:'realtime-control'");
   const statusIndex = changesProvider.indexOf("className:'status-left'");
 
+  assert.equal(localleafContainer.title, ' ');
   assert.equal(mainView.name, ' ');
   assert.match(changesProvider, /\.status-strip\{[\s\S]*justify-content:\s*flex-start/);
   assert.match(changesProvider, /\.realtime-control\{[\s\S]*display:\s*flex/);
@@ -136,4 +173,15 @@ test('panel notices do not auto-dismiss through timers', () => {
   assert.doesNotMatch(changesProvider, /this\.notifications\.dismissNotice\(id, revision\)/);
   assert.doesNotMatch(projectsProvider, /this\.notifications\.dismissNotice\(id, revision\)/);
   assert.doesNotMatch(extension, /setTimeout\(\(\) => dismissPanelNotice\(token\), autoDismissMs\)/);
+});
+
+test('pdf viewer uses continuous anchored wheel zoom for mac trackpad gestures', () => {
+  const pdfViewer = fs.readFileSync(path.join(root, 'media/pdfViewer.js'), 'utf8');
+
+  assert.doesNotMatch(pdfViewer, /e\.deltaY > 0 \? -0\.1 : 0\.1/);
+  assert.match(pdfViewer, /function getWheelDeltaPixels\(e\)/);
+  assert.match(pdfViewer, /Math\.exp\(-wheelDelta \* 0\.0025\)/);
+  assert.match(pdfViewer, /function captureZoomAnchor\(clientX, clientY\)/);
+  assert.match(pdfViewer, /restoreZoomAnchor\(anchor, oldZoom, newZoom\)/);
+  assert.match(pdfViewer, /viewerContainer\.scrollLeft/);
 });

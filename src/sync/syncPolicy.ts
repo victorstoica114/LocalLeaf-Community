@@ -1,4 +1,4 @@
-import { SyncMode } from './changeTracker';
+import { ChangeType, SyncMode } from './changeTracker';
 
 export interface StartupSyncState {
     syncMode: SyncMode;
@@ -38,6 +38,16 @@ export interface LocalDeleteTrackingState {
 export interface LocalModificationTrackingState {
     currentContent: Uint8Array;
     baseContent?: Uint8Array;
+}
+
+export interface LocalChangeRestorationState {
+    currentExists: boolean;
+    hasRemoteEntry: boolean;
+    hasBaseContent: boolean;
+    currentContent?: Uint8Array;
+    baseContent?: Uint8Array;
+    remoteContent?: Uint8Array;
+    lastSynced?: string;
 }
 
 export function shouldAutoPullOnProjectLoad(state: StartupSyncState): boolean {
@@ -97,4 +107,28 @@ export function shouldTrackLocalModification(state: LocalModificationTrackingSta
         }
     }
     return false;
+}
+
+export function getRestoredLocalChangeType(state: LocalChangeRestorationState): ChangeType | undefined {
+    if (!state.currentExists) {
+        return shouldTrackLocalDelete({
+            hasRemoteEntry: state.hasRemoteEntry,
+            hasBaseContent: state.hasBaseContent,
+            lastSynced: state.lastSynced,
+        }) ? 'deleted' : undefined;
+    }
+
+    if (!state.hasRemoteEntry && !state.hasBaseContent) {
+        return 'created';
+    }
+
+    const comparisonContent = state.baseContent ?? state.remoteContent;
+    if (!state.currentContent || !comparisonContent) {
+        return undefined;
+    }
+
+    return shouldTrackLocalModification({
+        currentContent: state.currentContent,
+        baseContent: comparisonContent,
+    }) ? 'modified' : undefined;
 }

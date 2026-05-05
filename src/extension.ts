@@ -14,7 +14,7 @@ import { PendingChange, SyncMode } from './sync/changeTracker';
 import { CursorTracker, TrackedUser, getInitials } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
 import { ChangesWebviewProvider } from './views/changesWebviewProvider';
-import { cleanChangePath, createChangeDiffPlan, DiffSide } from './views/changeDiffPlan';
+import { cleanChangePath, createChangeDiffPlan, DiffSide, getChangePathCandidates } from './views/changeDiffPlan';
 import { ProjectsWebviewProvider, ProjectSortField } from './views/projectsWebviewProvider';
 import { PanelNotificationCenter, PanelNoticeType, PanelModalRequest } from './views/panelNotificationCenter';
 import { LatexCompiler, CompilerType, CompilationResult } from './compilation/latexCompiler';
@@ -357,12 +357,18 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         // On project load: pull only for never-synced projects or realtime catch-up.
         try {
             const hasBaseContent = syncEngine.hasBaseContent();
+            const restoredLocalCount = syncMode === 'manual'
+                ? await syncEngine.refreshLocalChangesFromDisk()
+                : 0;
+            if (syncMode === 'manual') {
+                changesWebviewProvider.refresh();
+            }
             const shouldAutoPull = shouldAutoPullOnProjectLoad({
                 syncMode,
                 hasBaseContent,
                 lastSynced: projectSettings.lastSynced,
             });
-            if (shouldAutoPull) {
+            if (shouldAutoPull && !(syncMode === 'manual' && restoredLocalCount > 0)) {
                 const isFirstSync = !hasBaseContent && !projectSettings.lastSynced;
                 log(isFirstSync
                     ? 'First sync — downloading project files...'
@@ -370,7 +376,9 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
                 await syncEngine.pullAll();
                 log('Auto-pull complete');
             } else {
-                log('Manual mode — skipping auto-pull (use Pull to sync)');
+                log(syncMode === 'manual' && restoredLocalCount > 0
+                    ? 'Manual mode — restored pending local changes; skipping auto-pull'
+                    : 'Manual mode — skipping auto-pull (use Pull to sync)');
             }
 
             // Join all docs to receive real-time OT updates (both modes need this for change tracking)
@@ -2135,6 +2143,7 @@ async function cmdViewDiff(filePath: string) {
         showPanelNotice('Cannot open diff: sync engine is not ready', 'warning');
         return;
     }
+    const engine = syncEngine;
 
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager) {
@@ -2143,22 +2152,36 @@ async function cmdViewDiff(filePath: string) {
     }
 
     const localPath = cleanChangePath(filePath);
-    const tracker = syncEngine.changeTracker;
-    const localChange = tracker.getLocalChange(filePath)
-        ?? (localPath !== filePath ? tracker.getLocalChange(localPath) : undefined);
-    const remoteChange = tracker.getRemoteChange(filePath)
-        ?? (localPath !== filePath ? tracker.getRemoteChange(localPath) : undefined);
+    const pathCandidates = getChangePathCandidates(filePath);
+    const tracker = engine.changeTracker;
+    const findForChangePath = <T>(lookup: (path: string) => T | undefined): T | undefined => {
+        for (const candidate of pathCandidates) {
+            const result = lookup(candidate);
+            if (result !== undefined) {
+                return result;
+            }
+        }
+        return undefined;
+    };
+    const localChange = findForChangePath(path => tracker.getLocalChange(path));
+    const remoteChange = findForChangePath(path => tracker.getRemoteChange(path));
     let remoteContent = remoteChange?.remoteContent;
+    let baseContent = findForChangePath(path => engine.getBaseContent(path));
     const plan = createChangeDiffPlan({
         localChangeType: localChange?.type,
         remoteChangeType: remoteChange?.type,
         hasRemoteContent: !!remoteContent,
+        hasBaseContent: baseContent !== undefined,
     });
 
     if (plan.requiresRemoteContent) {
         try {
-            remoteContent = await syncEngine.getRemoteContent(filePath)
-                ?? (localPath !== filePath ? await syncEngine.getRemoteContent(localPath) : undefined);
+            for (const candidate of pathCandidates) {
+                remoteContent = await engine.getRemoteContent(candidate);
+                if (remoteContent !== undefined) {
+                    break;
+                }
+            }
         } catch (error) {
             changesWebviewProvider.showNotice(`Cannot fetch remote content for ${filePath}: ${error}`, 'error');
             return;
@@ -2169,11 +2192,11 @@ async function cmdViewDiff(filePath: string) {
         }
     }
 
-    const baseContent = syncEngine.getBaseContent(filePath) ?? syncEngine.getBaseContent(localPath);
+    baseContent = baseContent ?? (!remoteChange ? remoteContent : undefined);
     const localUri = settingsManager.getFilePath(localPath);
     const disposables: vscode.Disposable[] = [];
 
-    const virtualUri = (label: string, content: Uint8Array | undefined): vscode.Uri => {
+    const virtualUri = (content: Uint8Array | undefined): vscode.Uri => {
         const scheme = `localleaf-diff-${Date.now()}-${disposables.length}`;
         const text = new TextDecoder().decode(content ?? new Uint8Array(0));
         const provider = new (class implements vscode.TextDocumentContentProvider {
@@ -2182,19 +2205,19 @@ async function cmdViewDiff(filePath: string) {
             }
         })();
         disposables.push(vscode.workspace.registerTextDocumentContentProvider(scheme, provider));
-        return vscode.Uri.parse(`${scheme}:/${encodeURIComponent(label)}`);
+        return vscode.Uri.from({ scheme, path: '/content' });
     };
 
     const sideUri = (side: DiffSide): vscode.Uri => {
         switch (side) {
             case 'base':
-                return virtualUri(`${filePath} (base)`, baseContent);
+                return virtualUri(baseContent);
             case 'local':
                 return localUri;
             case 'remote':
-                return virtualUri(`${filePath} (remote)`, remoteContent);
+                return virtualUri(remoteContent);
             case 'empty':
-                return virtualUri(`${filePath} (empty)`, undefined);
+                return virtualUri(undefined);
         }
     };
 

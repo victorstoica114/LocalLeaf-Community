@@ -10,7 +10,12 @@ import { SettingsManager } from '../utils/settingsManager';
 import { IgnoreParser } from './ignoreParser';
 import { ChangeTracker, SyncMode } from './changeTracker';
 import { BaselineReplacement, SyncBaselineStore } from './syncBaseline';
-import { getManualSyncCompletionState, shouldTrackLocalDelete, shouldTrackLocalModification } from './syncPolicy';
+import {
+    getManualSyncCompletionState,
+    getRestoredLocalChangeType,
+    shouldTrackLocalDelete,
+    shouldTrackLocalModification,
+} from './syncPolicy';
 import { DEBOUNCE_DELAY } from '../consts';
 
 /**
@@ -2106,6 +2111,159 @@ export class SyncEngine {
         } catch {
             return false;
         }
+    }
+
+    private async scanLocalFilePaths(dirUri: vscode.Uri, basePath: string = '/'): Promise<string[]> {
+        const paths: string[] = [];
+        try {
+            const entries = await vscode.workspace.fs.readDirectory(dirUri);
+            for (const [name, type] of entries) {
+                const relativePath = basePath + name;
+                const fullPath = type === vscode.FileType.Directory
+                    ? relativePath + '/'
+                    : relativePath;
+
+                if (!this.shouldSync(fullPath)) {
+                    continue;
+                }
+
+                if (type === vscode.FileType.Directory) {
+                    paths.push(...await this.scanLocalFilePaths(vscode.Uri.joinPath(dirUri, name), fullPath));
+                } else {
+                    paths.push(fullPath);
+                }
+            }
+        } catch (error) {
+            debugLog(`Error scanning directory: ${basePath}`, error);
+        }
+        return paths;
+    }
+
+    /**
+     * Rebuild pending local changes after a VS Code restart.
+     * The tracker is in-memory, while local files and baseline content persist.
+     */
+    async refreshLocalChangesFromDisk(): Promise<number> {
+        if (this._syncMode !== 'manual') {
+            return 0;
+        }
+
+        const projectSettings = this.settings.getSettings();
+        const now = Date.now();
+        this._changeTracker.clearLocal();
+
+        for (const [relativePath, baseContent] of this.baseContent) {
+            if (!this.shouldSync(relativePath)) {
+                continue;
+            }
+
+            const entry = this.fileTreeByPath.get(relativePath);
+            const isFolder = entry?.type === 'folder' || relativePath.endsWith('/');
+            const localUri = this.settings.getFilePath(relativePath);
+            const currentExists = await this.localFileExists(localUri);
+            let currentContent: Uint8Array | undefined;
+
+            if (currentExists && !isFolder) {
+                try {
+                    currentContent = await vscode.workspace.fs.readFile(localUri);
+                } catch (error) {
+                    if (!isFileNotFoundError(error)) {
+                        throw error;
+                    }
+                }
+            }
+
+            const type = getRestoredLocalChangeType({
+                currentExists,
+                hasRemoteEntry: !!entry,
+                hasBaseContent: true,
+                currentContent,
+                baseContent,
+                lastSynced: projectSettings?.lastSynced,
+            });
+            if (!type) {
+                continue;
+            }
+
+            this._changeTracker.addLocalChange({
+                path: relativePath,
+                type,
+                source: 'local',
+                timestamp: now,
+                entityId: entry?.id,
+                entityType: entry?.type,
+            });
+        }
+
+        for (const [relativePath, entry] of this.fileTreeByPath) {
+            if (this.baseContent.has(relativePath) || !this.shouldSync(relativePath)) {
+                continue;
+            }
+            const isFolder = entry.type === 'folder' || relativePath.endsWith('/');
+            const localUri = this.settings.getFilePath(relativePath);
+            const currentExists = await this.localFileExists(localUri);
+            let currentContent: Uint8Array | undefined;
+            let remoteContent: Uint8Array | undefined;
+
+            if (currentExists && !isFolder) {
+                try {
+                    currentContent = await vscode.workspace.fs.readFile(localUri);
+                    remoteContent = await this.getRemoteContent(relativePath);
+                } catch (error) {
+                    if (!isFileNotFoundError(error)) {
+                        throw error;
+                    }
+                }
+            }
+
+            const type = getRestoredLocalChangeType({
+                currentExists,
+                hasRemoteEntry: true,
+                hasBaseContent: false,
+                currentContent,
+                remoteContent,
+                lastSynced: projectSettings?.lastSynced,
+            });
+            if (!type) {
+                continue;
+            }
+
+            this._changeTracker.addLocalChange({
+                path: relativePath,
+                type,
+                source: 'local',
+                timestamp: now,
+                entityId: entry.id,
+                entityType: entry.type,
+            });
+        }
+
+        const localPaths = await this.scanLocalFilePaths(this.settings.getWorkspaceFolder());
+        for (const relativePath of localPaths) {
+            if (this.fileTreeByPath.has(relativePath) || this.baseContent.has(relativePath)) {
+                continue;
+            }
+            const type = getRestoredLocalChangeType({
+                currentExists: true,
+                hasRemoteEntry: false,
+                hasBaseContent: false,
+            });
+            if (!type) {
+                continue;
+            }
+            this._changeTracker.addLocalChange({
+                path: relativePath,
+                type,
+                source: 'local',
+                timestamp: now,
+            });
+        }
+
+        const count = this._changeTracker.getLocalChangeCount();
+        if (count > 0) {
+            this.log(`Restored ${count} pending local change${count === 1 ? '' : 's'} from disk`);
+        }
+        return count;
     }
 
     /**
