@@ -8,7 +8,7 @@ import { COMMANDS, EXTENSION_NAME, STATUS_BAR_PRIORITY, CONFIG_DIR, IGNORE_FILE 
 import { CredentialManager, ServerCredential, Identity } from './utils/credentialManager';
 import { SettingsManager, createSettingsWatcher } from './utils/settingsManager';
 import { BaseAPI, ProjectInfo } from './api/base';
-import { SyncEngine, SyncStatus } from './sync/syncEngine';
+import { SyncEngine, SyncEngineUi, SyncStatus } from './sync/syncEngine';
 import { IgnoreParser } from './sync/ignoreParser';
 import { PendingChange, SyncMode } from './sync/changeTracker';
 import { CursorTracker, TrackedUser, getInitials } from './collaboration/cursorTracker';
@@ -16,6 +16,7 @@ import { setOutputChannel } from './api/socketio';
 import { DetailsProvider, ToolsProvider } from './views/sidebarProvider';
 import { ChangesWebviewProvider } from './views/changesWebviewProvider';
 import { ProjectsWebviewProvider, ProjectSortField } from './views/projectsWebviewProvider';
+import { PanelNotificationCenter, PanelNoticeType, PanelModalRequest } from './views/panelNotificationCenter';
 import { LatexCompiler, CompilerType, CompilationResult } from './compilation/latexCompiler';
 import * as path from 'path';
 import { AutoCompiler } from './compilation/autoCompiler';
@@ -24,6 +25,13 @@ import { BrowserPreference, captureCookiesViaBrowserLogin } from './auth/browser
 import { AccountPanel, AccountPanelAction, AccountPanelState } from './views/accountPanel';
 import { LocalLeafScmBridge } from './scm/localLeafScmBridge';
 import { GitCommitHook } from './integrations/gitCommitHook';
+import {
+    getManualPushPlan,
+    getManualSyncCompletionState,
+    shouldAutoPullOnProjectLoad,
+    shouldPushAfterManualPull,
+} from './sync/syncPolicy';
+import { SyncOperationGate } from './sync/syncOperationGate';
 
 /**
  * Auth state type
@@ -42,6 +50,7 @@ let collaboratorStatusItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
 let authState: AuthState = 'none';
+let panelNotifications: PanelNotificationCenter;
 let projectsWebviewProvider: ProjectsWebviewProvider;
 let changesWebviewProvider: ChangesWebviewProvider;
 let detailsProvider: DetailsProvider;
@@ -51,6 +60,7 @@ let extensionContext: vscode.ExtensionContext;
 let scmBridge: LocalLeafScmBridge;
 let gitCommitHook: GitCommitHook | undefined;
 let settingsWatcher: vscode.FileSystemWatcher | undefined;
+let syncOperationGate: SyncOperationGate;
 
 /**
  * Extension activation
@@ -70,11 +80,14 @@ export async function activate(context: vscode.ExtensionContext) {
     // Initialize credential manager
     credentialManager = CredentialManager.initialize(context);
 
+    panelNotifications = new PanelNotificationCenter();
+
     // Initialize sidebar providers
-    projectsWebviewProvider = new ProjectsWebviewProvider(context.extensionUri, credentialManager);
-    changesWebviewProvider = new ChangesWebviewProvider(context.extensionUri);
+    projectsWebviewProvider = new ProjectsWebviewProvider(context.extensionUri, credentialManager, panelNotifications);
+    changesWebviewProvider = new ChangesWebviewProvider(context.extensionUri, panelNotifications);
     detailsProvider = new DetailsProvider(credentialManager);
     const toolsProvider = new ToolsProvider();
+    PdfPreviewPanel.setNotificationHandler(message => showPanelNotice(message, 'warning'));
 
     // Projects view is now a webview
     const projectsViewDisposable = vscode.window.registerWebviewViewProvider(
@@ -109,6 +122,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Initialize SCM bridge and Git commit hook integration
     scmBridge = new LocalLeafScmBridge();
+    syncOperationGate = new SyncOperationGate();
     gitCommitHook = new GitCommitHook(runCommitTriggeredOverleafPush, log);
     context.subscriptions.push(scmBridge, gitCommitHook);
 
@@ -169,7 +183,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     } catch (error) {
         console.error('[LocalLeaf] Activation error:', error);
-        vscode.window.showErrorMessage(`LocalLeaf failed to activate: ${error}`);
+        showPanelNotice(`LocalLeaf failed to activate: ${error}`, 'error');
     }
 }
 
@@ -217,6 +231,79 @@ function registerCommands(context: vscode.ExtensionContext) {
     );
 }
 
+interface NoticeToken {
+    id: string;
+    revision?: number;
+}
+
+function panelUi(): SyncEngineUi {
+    return {
+        showModal: request => showPanelModal(request),
+        showNotice: (message, type, autoDismissMs) => showPanelNotice(message, type, autoDismissMs),
+    };
+}
+
+async function focusNotificationPanel(): Promise<void> {
+    let isLinked = false;
+    try {
+        const settingsManager = SettingsManager.getCurrentInstance();
+        isLinked = !!settingsManager && await settingsManager.isLinked();
+    } catch {
+        isLinked = false;
+    }
+
+    const command = isLinked ? `${ChangesWebviewProvider.viewType}.focus` : `${ProjectsWebviewProvider.viewType}.focus`;
+    await vscode.commands.executeCommand(command).then(undefined, () => undefined);
+}
+
+async function showPanelModal(request: PanelModalRequest): Promise<string> {
+    if (!panelNotifications) {
+        return 'dismiss';
+    }
+    await focusNotificationPanel();
+    return panelNotifications.showModal(request);
+}
+
+function showPanelNotice(
+    message: string,
+    type: PanelNoticeType = 'info',
+    autoDismissMs?: number,
+    options?: { reveal?: boolean },
+): NoticeToken | undefined {
+    if (!panelNotifications) {
+        return undefined;
+    }
+    if (options?.reveal ?? type !== 'info') {
+        void focusNotificationPanel();
+    }
+
+    const id = panelNotifications.showNotice(message, type);
+    const revision = panelNotifications.getState().notice?.revision;
+    const token = { id, revision };
+
+    if (autoDismissMs && autoDismissMs > 0) {
+        setTimeout(() => dismissPanelNotice(token), autoDismissMs);
+    }
+
+    return token;
+}
+
+function dismissPanelNotice(token: NoticeToken | undefined): void {
+    if (!token || !panelNotifications) {
+        return;
+    }
+    panelNotifications.dismissNotice(token.id, token.revision);
+}
+
+async function withPanelProgress<T>(message: string, task: () => Promise<T>): Promise<T> {
+    const token = showPanelNotice(message, 'info', undefined, { reveal: false });
+    try {
+        return await task();
+    } finally {
+        dismissPanelNotice(token);
+    }
+}
+
 /**
  * Initialize sync engine for linked folder
  */
@@ -229,7 +316,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     if (!credential) {
         updateStatusBar('disconnected', 'Not logged in');
         await refreshScmAndHookState();
-        vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
+        showPanelNotice('LocalLeaf: Please login to Overleaf first', 'warning');
         return;
     }
 
@@ -238,7 +325,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     api.setIdentity(credential.identity);
 
     // Create sync engine
-    syncEngine = new SyncEngine(api, settings, log);
+    syncEngine = new SyncEngine(api, settings, log, panelUi());
 
     // Listen to status changes
     syncEngine.onStatusChange(async event => {
@@ -268,7 +355,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         // Initialize cursor tracker
         const socket = syncEngine.getSocket();
         if (socket) {
-            cursorTracker = new CursorTracker(socket, settings);
+            cursorTracker = new CursorTracker(socket, settings, panelUi());
             await cursorTracker.initialize();
             cursorTracker.onDidChangeUsers(() => pushOnlineUsersToWebview());
             pushOnlineUsersToWebview();
@@ -283,10 +370,16 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         // Auto-detect main document from project settings
         await syncEngine.detectMainDocument();
 
-        // On project load: always pull on first link (empty workspace); otherwise only in realtime mode
+        // On project load: pull only for never-synced projects or realtime catch-up.
         try {
-            const isFirstSync = !syncEngine.hasBaseContent();
-            if (isFirstSync || syncMode === 'realtime') {
+            const hasBaseContent = syncEngine.hasBaseContent();
+            const shouldAutoPull = shouldAutoPullOnProjectLoad({
+                syncMode,
+                hasBaseContent,
+                lastSynced: projectSettings.lastSynced,
+            });
+            if (shouldAutoPull) {
+                const isFirstSync = !hasBaseContent && !projectSettings.lastSynced;
                 log(isFirstSync
                     ? 'First sync — downloading project files...'
                     : 'Auto-pulling files from Overleaf (realtime mode)...');
@@ -343,7 +436,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     } catch (error) {
         log(`Failed to connect: ${error}`);
         await refreshScmAndHookState();
-        vscode.window.showErrorMessage(`LocalLeaf: Failed to connect - ${error}`);
+        showPanelNotice(`LocalLeaf: Failed to connect - ${error}`, 'error');
     }
 }
 
@@ -463,13 +556,16 @@ async function updateLoginStatus() {
  * Show session expired notification with action buttons
  */
 async function showSessionExpiredNotification(): Promise<void> {
-    const action = await vscode.window.showWarningMessage(
-        'LocalLeaf: Your Overleaf session has expired.',
-        'Open Account Panel',
-        'Dismiss'
-    );
+    const action = await showPanelModal({
+        message: 'LocalLeaf: Your Overleaf session has expired.',
+        type: 'warning',
+        buttons: [
+            { label: 'Open Account Panel', value: 'open', primary: true },
+            { label: 'Dismiss', value: 'dismiss' },
+        ],
+    });
 
-    if (action === 'Open Account Panel') {
+    if (action === 'open') {
         await cmdShowAccountPanel();
     }
 }
@@ -597,9 +693,9 @@ function refreshSidebar(): void {
 /**
  * Stop the currently connected LocalLeaf project session.
  */
-function disconnectCurrentProjectSession(): void {
+async function disconnectCurrentProjectSession(): Promise<void> {
     if (syncEngine) {
-        syncEngine.disconnect();
+        await syncEngine.disconnect();
         syncEngine = undefined;
     }
 
@@ -651,12 +747,12 @@ async function activateLinkedProject(
     settingsManager: SettingsManager,
     message?: string,
 ): Promise<void> {
-    disconnectCurrentProjectSession();
+    await disconnectCurrentProjectSession();
     SettingsManager.setCurrentWorkspaceFolder(settingsManager.getWorkspaceFolder());
 
     const settings = await settingsManager.load();
     if (!settings) {
-        vscode.window.showErrorMessage('LocalLeaf: Selected folder is missing .localleaf/settings.json');
+        showPanelNotice('LocalLeaf: Selected folder is missing .localleaf/settings.json', 'error');
         await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', false);
         await refreshScmAndHookState();
         refreshSidebar();
@@ -664,7 +760,7 @@ async function activateLinkedProject(
     }
 
     if (message) {
-        vscode.window.showInformationMessage(message);
+        showPanelNotice(message, 'info', 4000);
     }
 
     statusBarItem.show();
@@ -683,7 +779,7 @@ async function activateLinkedProject(
  * folder is auto-selected. Multiple child projects are shown in the Projects view.
  */
 async function refreshWorkspaceProjectState(context: vscode.ExtensionContext): Promise<void> {
-    disconnectCurrentProjectSession();
+    await disconnectCurrentProjectSession();
     SettingsManager.clearCurrentWorkspaceFolder();
 
     const settingsManager = await SettingsManager.resolveCurrentInstance();
@@ -717,11 +813,37 @@ function isSyncEngineConnected(engine: SyncEngine | undefined): boolean {
     return engine.status !== 'disconnected' && engine.status !== 'error';
 }
 
+function getPendingSyncCounts(engine: SyncEngine) {
+    return {
+        localChangeCount: engine.changeTracker.getLocalChangeCount(),
+        remoteChangeCount: engine.changeTracker.getRemoteChangeCount(),
+        conflictCount: engine.changeTracker.getConflictCount(),
+    };
+}
+
 /**
  * Focus the LocalLeaf Changes view.
  */
 async function focusChangesView(): Promise<void> {
     await vscode.commands.executeCommand('localleaf.changesView.focus');
+}
+
+async function runExclusiveSyncOperation<T>(
+    operationName: string,
+    operation: () => Promise<T>,
+    options?: { showBusyNotice?: boolean },
+): Promise<T | undefined> {
+    const result = await syncOperationGate.tryRun(operationName, operation);
+    if (result.started) {
+        return result.result;
+    }
+
+    const message = `LocalLeaf is busy with ${result.activeOperation}.`;
+    log(`${operationName}: skipped because ${message}`);
+    if (options?.showBusyNotice !== false) {
+        changesWebviewProvider.showNotice(message, 'warning', 4000);
+    }
+    return undefined;
 }
 
 /**
@@ -764,18 +886,22 @@ async function handleCommitHookConflicts(conflicts: PendingChange[]): Promise<vo
     const firstConflictPath = conflicts[0]?.path;
 
     await focusChangesView();
-    const action = await vscode.window.showErrorMessage(
-        `LocalLeaf: Auto-push after Git commit was skipped because ${conflicts.length} conflict(s) need resolution.`,
-        'Open Changes',
-        'View First Diff',
-    );
+    const action = await showPanelModal({
+        message: `LocalLeaf: Auto-push after Git commit was skipped because ${conflicts.length} conflict(s) need resolution.`,
+        type: 'error',
+        buttons: [
+            { label: 'Open Changes', value: 'open', primary: true },
+            { label: 'View First Diff', value: 'diff' },
+            { label: 'Dismiss', value: 'dismiss' },
+        ],
+    });
 
-    if (action === 'View First Diff' && firstConflictPath) {
+    if (action === 'diff' && firstConflictPath) {
         await cmdViewDiff(firstConflictPath);
         return;
     }
 
-    if (action === 'Open Changes') {
+    if (action === 'open') {
         await focusChangesView();
     }
 }
@@ -802,32 +928,42 @@ async function runCommitTriggeredOverleafPush(): Promise<void> {
         return;
     }
 
-    const localPendingCount = syncEngine.changeTracker.getLocalChangeCount();
-    if (localPendingCount === 0) {
-        log('Commit hook: no pending LocalLeaf changes to push.');
-        return;
-    }
-
-    const conflicts = syncEngine.changeTracker.getConflicts();
-    if (conflicts.length > 0) {
-        log(`Commit hook: aborted due to ${conflicts.length} pending conflict(s).`);
-        await handleCommitHookConflicts(conflicts);
-        return;
-    }
-
-    try {
-        await syncEngine.pushChanges({ force: true });
-        log(`Commit hook: pushed ${localPendingCount} LocalLeaf change(s) after Git commit.`);
-    } catch (error) {
-        log(`Commit hook: auto-push failed - ${error}`);
-        const action = await vscode.window.showErrorMessage(
-            `LocalLeaf: Auto-push after Git commit failed - ${error}`,
-            'Open Changes',
-        );
-        if (action === 'Open Changes') {
-            await focusChangesView();
+    await runExclusiveSyncOperation('Git commit auto-push', async () => {
+        if (!syncEngine) {
+            return;
         }
-    }
+
+        const localPendingCount = syncEngine.changeTracker.getLocalChangeCount();
+        if (localPendingCount === 0) {
+            log('Commit hook: no pending LocalLeaf changes to push.');
+            return;
+        }
+
+        const conflicts = syncEngine.changeTracker.getConflicts();
+        if (conflicts.length > 0) {
+            log(`Commit hook: aborted due to ${conflicts.length} pending conflict(s).`);
+            await handleCommitHookConflicts(conflicts);
+            return;
+        }
+
+        try {
+            await syncEngine.pushChanges();
+            log(`Commit hook: pushed ${localPendingCount} LocalLeaf change(s) after Git commit.`);
+        } catch (error) {
+            log(`Commit hook: auto-push failed - ${error}`);
+            const action = await showPanelModal({
+                message: `LocalLeaf: Auto-push after Git commit failed - ${error}`,
+                type: 'error',
+                buttons: [
+                    { label: 'Open Changes', value: 'open', primary: true },
+                    { label: 'Dismiss', value: 'dismiss' },
+                ],
+            });
+            if (action === 'open') {
+                await focusChangesView();
+            }
+        }
+    }, { showBusyNotice: false });
 }
 
 // === Command Implementations ===
@@ -898,7 +1034,7 @@ async function handleAccountPanelAction(action: AccountPanelAction): Promise<voi
 
     const normalizedServer = normalizeServerUrlInput(action.serverUrl);
     if (!normalizedServer) {
-        vscode.window.showErrorMessage('LocalLeaf: Invalid Overleaf server URL');
+        showPanelNotice('LocalLeaf: Invalid Overleaf server URL', 'error');
         return;
     }
 
@@ -919,11 +1055,7 @@ async function loginViaBrowserAndStore(
     serverUrl: string,
     browserPreference: BrowserPreference,
 ): Promise<boolean> {
-    const browserResult = await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: 'LocalLeaf: Waiting for browser login...',
-        cancellable: false,
-    }, async () => {
+    const browserResult = await withPanelProgress('LocalLeaf: Waiting for browser login...', async () => {
         return captureCookiesViaBrowserLogin(
             serverUrl,
             browserPreference,
@@ -932,7 +1064,7 @@ async function loginViaBrowserAndStore(
     });
 
     if (browserResult.type === 'error') {
-        vscode.window.showErrorMessage(`LocalLeaf: Browser login failed - ${browserResult.message}`);
+        showPanelNotice(`LocalLeaf: Browser login failed - ${browserResult.message}`, 'error');
         return false;
     }
 
@@ -948,13 +1080,13 @@ async function loginWithCookiesAndStore(
     options?: { successMessage?: string; reconnect?: boolean },
 ): Promise<boolean> {
     const api = new BaseAPI(serverUrl);
-    const result = await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: 'LocalLeaf: Validating session...',
-    }, async () => api.cookiesLogin(cookies));
+    const result = await withPanelProgress(
+        'LocalLeaf: Validating session...',
+        async () => api.cookiesLogin(cookies),
+    );
 
     if (result.type !== 'success' || !result.userInfo || !result.identity) {
-        vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${result.message}`);
+        showPanelNotice(`LocalLeaf: Login failed - ${result.message}`, 'error');
         return false;
     }
 
@@ -974,7 +1106,7 @@ async function loginWithCookiesAndStore(
     const state = await getAccountPanelState(serverUrl);
     AccountPanel.updateIfOpen(state);
 
-    vscode.window.showInformationMessage(options?.successMessage || `LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
+    showPanelNotice(options?.successMessage || `LocalLeaf: Logged in as ${result.userInfo.userEmail}`, 'info', 4000);
 
     if (options?.reconnect) {
         await cmdReconnect();
@@ -995,20 +1127,23 @@ async function cmdLogin() {
  * Logout from Overleaf
  */
 async function cmdLogout() {
-    const confirm = await vscode.window.showWarningMessage(
-        'Are you sure you want to logout from Overleaf?',
-        'Logout',
-        'Cancel'
-    );
+    const confirm = await showPanelModal({
+        message: 'Are you sure you want to logout from Overleaf?',
+        type: 'warning',
+        buttons: [
+            { label: 'Logout', value: 'logout', danger: true },
+            { label: 'Cancel', value: 'cancel' },
+        ],
+    });
 
-    if (confirm !== 'Logout') return;
+    if (confirm !== 'logout') return;
 
     const serverUrl = credentialManager.getDefaultServer();
     await credentialManager.deleteCredential(serverUrl);
 
     // Disconnect sync engine but keep settings
     if (syncEngine) {
-        syncEngine.disconnect();
+        await syncEngine.disconnect();
         syncEngine = undefined;
     }
 
@@ -1022,7 +1157,7 @@ async function cmdLogout() {
     await updateLoginStatus();
     await vscode.commands.executeCommand('setContext', 'localleaf.loggedIn', false);
     refreshSidebar();
-    vscode.window.showInformationMessage('LocalLeaf: Logged out');
+    showPanelNotice('LocalLeaf: Logged out', 'info', 4000);
 }
 
 /**
@@ -1031,7 +1166,7 @@ async function cmdLogout() {
 async function cmdLinkFolder(context: vscode.ExtensionContext) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!workspaceFolder) {
-        vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+        showPanelNotice('LocalLeaf: No workspace folder open', 'error');
         return;
     }
 
@@ -1041,7 +1176,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
     // Check if logged in
     const credential = await credentialManager.getCredential(serverUrl);
     if (!credential) {
-        vscode.window.showWarningMessage('LocalLeaf: Please login first');
+        showPanelNotice('LocalLeaf: Please login first', 'warning');
         await cmdLogin();
         return;
     }
@@ -1052,7 +1187,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
 
     const projectsResult = await api.getProjects();
     if (projectsResult.type !== 'success' || !projectsResult.projects) {
-        vscode.window.showErrorMessage(`LocalLeaf: Failed to get projects - ${projectsResult.message}`);
+        showPanelNotice(`LocalLeaf: Failed to get projects - ${projectsResult.message}`, 'error');
         return;
     }
 
@@ -1095,21 +1230,24 @@ async function cmdLinkFolder(context: vscode.ExtensionContext) {
 async function cmdUnlinkFolder() {
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager || !(await settingsManager.isLinked())) {
-        vscode.window.showInformationMessage('LocalLeaf: This folder is not linked');
+        showPanelNotice('LocalLeaf: This folder is not linked', 'info', 4000);
         return;
     }
 
-    const confirm = await vscode.window.showWarningMessage(
-        'Are you sure you want to unlink this folder from Overleaf?',
-        { modal: true },
-        'Unlink'
-    );
+    const confirm = await showPanelModal({
+        message: 'Are you sure you want to unlink this folder from Overleaf?',
+        type: 'warning',
+        buttons: [
+            { label: 'Unlink', value: 'unlink', danger: true },
+            { label: 'Cancel', value: 'cancel' },
+        ],
+    });
 
-    if (confirm !== 'Unlink') return;
+    if (confirm !== 'unlink') return;
 
     // Disconnect
     if (syncEngine) {
-        syncEngine.disconnect();
+        await syncEngine.disconnect();
         syncEngine = undefined;
     }
 
@@ -1129,7 +1267,7 @@ async function cmdUnlinkFolder() {
     await refreshScmAndHookState();
     changesWebviewProvider.clearChanges();
     refreshSidebar();
-    vscode.window.showInformationMessage('LocalLeaf: Folder unlinked');
+    showPanelNotice('LocalLeaf: Folder unlinked', 'info', 4000);
 }
 
 /**
@@ -1137,25 +1275,52 @@ async function cmdUnlinkFolder() {
  */
 async function cmdSyncNow() {
     if (!syncEngine) {
-        vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
+        showPanelNotice('LocalLeaf: Not connected. Please link a folder first.', 'warning');
         return;
     }
 
-    if (syncEngine.syncMode === 'manual') {
-        // In manual mode: full pull (non-blocking conflicts) then push
-        try {
-            await syncEngine.pullAll();
-            await syncEngine.pushChanges({ force: true });
-            // All changes have been synced — clear any remaining tracker entries
-            syncEngine.changeTracker.clearAll();
-            changesWebviewProvider.showToast('Sync complete', 'info', 4000);
-        } catch (error) {
-            changesWebviewProvider.showToast(`Sync failed: ${error}`, 'error');
+    await runExclusiveSyncOperation('Sync Now', async () => {
+        if (!syncEngine) {
+            return;
         }
-    } else {
-        // In realtime mode: do a full pull to catch up
-        await cmdPullFromOverleaf();
-    }
+
+        if (syncEngine.syncMode === 'manual') {
+            // In manual mode: reconcile remote first, then push only when no remote/conflict work remains.
+            try {
+                await syncEngine.pullAll();
+
+                let counts = getPendingSyncCounts(syncEngine);
+                const completionAfterPull = getManualSyncCompletionState(counts);
+                if (!completionAfterPull.canComplete && !shouldPushAfterManualPull(counts)) {
+                    await focusChangesView();
+                    const reason = completionAfterPull.reason === 'conflict'
+                        ? 'conflicts need resolution'
+                        : 'remote changes still need review';
+                    changesWebviewProvider.showNotice(`Sync paused: ${reason}`, 'warning');
+                    return;
+                }
+
+                if (shouldPushAfterManualPull(counts)) {
+                    await syncEngine.pushChanges();
+                }
+
+                counts = getPendingSyncCounts(syncEngine);
+                const finalCompletion = getManualSyncCompletionState(counts);
+                if (!finalCompletion.canComplete) {
+                    await focusChangesView();
+                    changesWebviewProvider.showNotice('Sync paused: pending changes remain', 'warning');
+                    return;
+                }
+
+                changesWebviewProvider.showNotice('Sync complete', 'info', 4000);
+            } catch (error) {
+                changesWebviewProvider.showNotice(`Sync failed: ${error}`, 'error');
+            }
+        } else {
+            // In realtime mode: do a full pull to catch up.
+            await pullFromOverleafInternal();
+        }
+    });
 }
 
 /**
@@ -1163,7 +1328,15 @@ async function cmdSyncNow() {
  */
 async function cmdPullFromOverleaf() {
     if (!syncEngine) {
-        vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
+        showPanelNotice('LocalLeaf: Not connected. Please link a folder first.', 'warning');
+        return;
+    }
+
+    await runExclusiveSyncOperation('Pull from Overleaf', pullFromOverleafInternal);
+}
+
+async function pullFromOverleafInternal() {
+    if (!syncEngine) {
         return;
     }
 
@@ -1172,9 +1345,17 @@ async function cmdPullFromOverleaf() {
         // In manual mode, conflicts are auto-skipped and recorded
         // in the change tracker (no blocking popups).
         await syncEngine!.pullAll();
-        changesWebviewProvider.showToast('Pull complete', 'info', 4000);
+        if (syncEngine.syncMode === 'manual') {
+            const completion = getManualSyncCompletionState(getPendingSyncCounts(syncEngine));
+            if (!completion.canComplete) {
+                await focusChangesView();
+                changesWebviewProvider.showNotice('Pull paused: pending changes need review', 'warning');
+                return;
+            }
+        }
+        changesWebviewProvider.showNotice('Pull complete', 'info', 4000);
     } catch (error) {
-        changesWebviewProvider.showToast(`Pull failed: ${error}`, 'error');
+        changesWebviewProvider.showNotice(`Pull failed: ${error}`, 'error');
     }
 }
 
@@ -1183,38 +1364,53 @@ async function cmdPullFromOverleaf() {
  */
 async function cmdPushToOverleaf() {
     if (!syncEngine) {
-        vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
+        showPanelNotice('LocalLeaf: Not connected. Please link a folder first.', 'warning');
         return;
     }
 
     if (syncEngine.syncMode === 'manual') {
-        try {
-            // Check for conflicts before pushing
-            const conflicts = syncEngine.changeTracker.getConflicts();
-            if (conflicts.length > 0) {
-                const choice = await changesWebviewProvider.showConfirmation({
-                    message: `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
-                    buttons: [
-                        { label: 'Pull First', value: 'pull', primary: true },
-                        { label: 'Force Push', value: 'force', danger: true },
-                        { label: 'Cancel', value: 'cancel' },
-                    ],
+        await runExclusiveSyncOperation('Push to Overleaf', async () => {
+            if (!syncEngine) {
+                return;
+            }
+
+            try {
+                // Check for conflicts before pushing.
+                const conflicts = syncEngine.changeTracker.getConflicts();
+                let conflictChoice: 'pull' | 'force' | 'cancel' | undefined;
+                if (conflicts.length > 0) {
+                    const choice = await changesWebviewProvider.showConfirmation({
+                        message: `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
+                        buttons: [
+                            { label: 'Pull First', value: 'pull', primary: true },
+                            { label: 'Force Push', value: 'force', danger: true },
+                            { label: 'Cancel', value: 'cancel' },
+                        ],
+                    });
+                    conflictChoice = choice === 'pull' || choice === 'force' ? choice : 'cancel';
+                }
+
+                const plan = getManualPushPlan({
+                    conflictCount: conflicts.length,
+                    conflictChoice,
                 });
-                if (choice === 'pull') {
+
+                if (plan.action === 'pull') {
                     await syncEngine.pullChanges();
                     return;
                 }
-                if (choice !== 'force') {
+                if (plan.action === 'cancel') {
                     return;
                 }
+
+                await syncEngine.pushChanges({ force: plan.force });
+                changesWebviewProvider.showNotice('Push complete', 'info', 4000);
+            } catch (error) {
+                changesWebviewProvider.showNotice(`Push failed: ${error}`, 'error');
             }
-            await syncEngine.pushChanges({ force: true });
-            changesWebviewProvider.showToast('Push complete', 'info', 4000);
-        } catch (error) {
-            changesWebviewProvider.showToast(`Push failed: ${error}`, 'error');
-        }
+        });
     } else {
-        changesWebviewProvider.showToast('Push is automatic in real-time mode', 'info', 4000);
+        changesWebviewProvider.showNotice('Push is automatic in real-time mode', 'info', 4000);
     }
 }
 
@@ -1225,7 +1421,7 @@ async function cmdEditIgnorePatterns() {
     const workspaceFolder = SettingsManager.getCurrentInstance()?.getWorkspaceFolder()
         ?? vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!workspaceFolder) {
-        vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+        showPanelNotice('LocalLeaf: No workspace folder open', 'error');
         return;
     }
 
@@ -1356,13 +1552,13 @@ async function cmdShowSyncStatus() {
 async function cmdReconnect() {
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager || !(await settingsManager.isLinked())) {
-        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        showPanelNotice('LocalLeaf: No linked project', 'warning');
         return;
     }
 
     // Disconnect existing sync engine
     if (syncEngine) {
-        syncEngine.disconnect();
+        await syncEngine.disconnect();
         syncEngine = undefined;
     }
 
@@ -1381,14 +1577,14 @@ async function cmdReconnect() {
     if (!credential) {
         updateStatusBar('disconnected', 'Not logged in');
         await refreshScmAndHookState();
-        vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
+        showPanelNotice('LocalLeaf: Please login to Overleaf first', 'warning');
         return;
     }
 
     const api = new BaseAPI(projectSettings.serverUrl);
     api.setIdentity(credential.identity);
 
-    syncEngine = new SyncEngine(api, settingsManager, log);
+    syncEngine = new SyncEngine(api, settingsManager, log, panelUi());
 
     // Wire up change tracker
     changesWebviewProvider.setChangeTracker(syncEngine.changeTracker);
@@ -1413,7 +1609,7 @@ async function cmdReconnect() {
 
         const socket = syncEngine.getSocket();
         if (socket) {
-            cursorTracker = new CursorTracker(socket, settingsManager);
+            cursorTracker = new CursorTracker(socket, settingsManager, panelUi());
             await cursorTracker.initialize();
             cursorTracker.onDidChangeUsers(() => pushOnlineUsersToWebview());
             pushOnlineUsersToWebview();
@@ -1427,10 +1623,10 @@ async function cmdReconnect() {
             await syncEngine.pullAll();
         }
         await syncEngine.joinAllDocsForWatching();
-        changesWebviewProvider.showToast(`Reconnected to "${projectSettings.projectName}"`, 'info', 4000);
+        changesWebviewProvider.showNotice(`Reconnected to "${projectSettings.projectName}"`, 'info', 4000);
     } catch (error) {
         log(`Failed to reconnect: ${error}`);
-        changesWebviewProvider.showToast(`Failed to reconnect: ${error}`, 'error');
+        changesWebviewProvider.showNotice(`Failed to reconnect: ${error}`, 'error');
     } finally {
         await refreshScmAndHookState();
     }
@@ -1442,7 +1638,7 @@ async function cmdReconnect() {
 async function cmdSetMainDocument() {
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager || !(await settingsManager.isLinked())) {
-        vscode.window.showErrorMessage('LocalLeaf: No linked project');
+        showPanelNotice('LocalLeaf: No linked project', 'error');
         return;
     }
 
@@ -1456,7 +1652,7 @@ async function cmdSetMainDocument() {
     const mainPdf = mainTex.replace(/\.tex$/, '.pdf');
 
     await settingsManager.update({ mainTex, mainPdf });
-    vscode.window.showInformationMessage(`LocalLeaf: Main document set to ${mainTex}`);
+    showPanelNotice(`LocalLeaf: Main document set to ${mainTex}`, 'info', 4000);
 }
 
 /**
@@ -1465,7 +1661,7 @@ async function cmdSetMainDocument() {
 async function cmdConfigure() {
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager || !(await settingsManager.isLinked())) {
-        vscode.window.showInformationMessage('LocalLeaf: No linked project');
+        showPanelNotice('LocalLeaf: No linked project', 'info', 4000);
         return;
     }
 
@@ -1479,7 +1675,7 @@ async function cmdConfigure() {
  */
 async function cmdJumpToCollaborator(clientId?: string) {
     if (!cursorTracker) {
-        vscode.window.showWarningMessage('LocalLeaf: Not connected');
+        showPanelNotice('LocalLeaf: Not connected', 'warning');
         return;
     }
 
@@ -1492,7 +1688,7 @@ async function cmdJumpToCollaborator(clientId?: string) {
 async function cmdVerifyCredentials() {
     const settingsManager = SettingsManager.getCurrentInstance();
     if (!settingsManager || !(await settingsManager.isLinked())) {
-        vscode.window.showInformationMessage('LocalLeaf: No linked project');
+        showPanelNotice('LocalLeaf: No linked project', 'info', 4000);
         return;
     }
 
@@ -1502,23 +1698,20 @@ async function cmdVerifyCredentials() {
     const credential = await credentialManager.getCredential(projectSettings.serverUrl);
     if (!credential) {
         await setAuthState('none');
-        vscode.window.showWarningMessage('LocalLeaf: Not logged in');
+        showPanelNotice('LocalLeaf: Not logged in', 'warning');
         return;
     }
 
     const api = new BaseAPI(projectSettings.serverUrl);
     api.setIdentity(credential.identity);
 
-    const result = await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: 'LocalLeaf: Verifying credentials...',
-    }, async () => {
+    const result = await withPanelProgress('LocalLeaf: Verifying credentials...', async () => {
         return api.verifyCredentials();
     });
 
     if (result.type === 'success') {
         await setAuthState('valid');
-        vscode.window.showInformationMessage('LocalLeaf: Credentials are valid');
+        showPanelNotice('LocalLeaf: Credentials are valid', 'info', 4000);
     } else {
         await setAuthState('expired');
         showSessionExpiredNotification();
@@ -1542,7 +1735,7 @@ async function cmdRemoveComments() {
         const workspaceFolder = SettingsManager.getCurrentInstance()?.getWorkspaceFolder()
             ?? vscode.workspace.workspaceFolders?.[0]?.uri;
         if (!workspaceFolder) {
-            vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+            showPanelNotice('LocalLeaf: No workspace folder open', 'error');
             return;
         }
 
@@ -1555,7 +1748,7 @@ async function cmdRemoveComments() {
         log(`Remove Comments: found ${texFiles.length} .tex files`);
 
         if (texFiles.length === 0) {
-            vscode.window.showInformationMessage('LocalLeaf: No .tex files found in workspace');
+            showPanelNotice('LocalLeaf: No .tex files found in workspace', 'info', 4000);
             return;
         }
 
@@ -1579,30 +1772,28 @@ async function cmdRemoveComments() {
         log(`Remove Comments: ${totalCommentLines} comment lines in ${fileSummaries.length} files`);
 
         if (totalCommentLines === 0) {
-            vscode.window.showInformationMessage('LocalLeaf: No comments found in any .tex files');
+            showPanelNotice('LocalLeaf: No comments found in any .tex files', 'info', 4000);
             return;
         }
 
         // Confirmation dialog
         const fileList = fileSummaries.map(f => `${f.name}: ${f.commentLines} lines`).join('\n');
-        const confirm = await vscode.window.showWarningMessage(
-            `Remove ${totalCommentLines} comment lines from ${fileSummaries.length} file(s)?`,
-            { modal: true, detail: `This cannot be undone (except via sync/git).\n\n${fileList}` },
-            'Remove All Comments'
-        );
+        const confirm = await showPanelModal({
+            message: `Remove ${totalCommentLines} comment lines from ${fileSummaries.length} file(s)?\n\nThis cannot be undone (except via sync/git).\n\n${fileList}`,
+            type: 'warning',
+            buttons: [
+                { label: 'Remove All Comments', value: 'remove', danger: true },
+                { label: 'Cancel', value: 'cancel' },
+            ],
+        });
 
-        if (confirm !== 'Remove All Comments') { return; }
+        if (confirm !== 'remove') { return; }
 
         // Process each file
         let totalRemoved = 0;
-        await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: 'LocalLeaf: Removing comments...',
-            cancellable: false,
-        }, async (progress) => {
+        await withPanelProgress('LocalLeaf: Removing comments...', async () => {
             for (let i = 0; i < fileSummaries.length; i++) {
                 const f = fileSummaries[i];
-                progress.report({ message: f.name, increment: (100 / fileSummaries.length) });
 
                 const bytes = await vscode.workspace.fs.readFile(f.uri);
                 const original = new TextDecoder().decode(bytes);
@@ -1616,12 +1807,14 @@ async function cmdRemoveComments() {
             }
         });
 
-        vscode.window.showInformationMessage(
-            `LocalLeaf: Removed ${totalRemoved} comment lines from ${fileSummaries.length} file(s)`
+        showPanelNotice(
+            `LocalLeaf: Removed ${totalRemoved} comment lines from ${fileSummaries.length} file(s)`,
+            'info',
+            4000,
         );
     } catch (error) {
         log(`Remove Comments error: ${error}`);
-        vscode.window.showErrorMessage(`LocalLeaf: Remove comments failed — ${error}`);
+        showPanelNotice(`LocalLeaf: Remove comments failed - ${error}`, 'error');
     }
 }
 
@@ -1694,7 +1887,7 @@ function removeLatexComments(content: string): string {
  */
 async function cmdToggleSyncMode() {
     if (!syncEngine) {
-        vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
+        showPanelNotice('LocalLeaf: Not connected. Please link a folder first.', 'warning');
         return;
     }
 
@@ -1718,8 +1911,23 @@ async function cmdToggleSyncMode() {
                 return;
             }
             if (choice === 'apply') {
-                if (hasRemote) { await syncEngine.pullChanges(); }
-                if (hasLocal) { await syncEngine.pushChanges({ force: true }); }
+                const applied = await runExclusiveSyncOperation('Switch sync mode', async () => {
+                    if (!syncEngine) {
+                        return false;
+                    }
+                    if (hasRemote) { await syncEngine.pullChanges(); }
+                    if (hasLocal) { await syncEngine.pushChanges(); }
+                    const completion = getManualSyncCompletionState(getPendingSyncCounts(syncEngine));
+                    if (!completion.canComplete) {
+                        await focusChangesView();
+                        changesWebviewProvider.showNotice('Resolve pending changes before switching to real-time mode', 'warning');
+                        return false;
+                    }
+                    return true;
+                });
+                if (!applied) {
+                    return;
+                }
             } else {
                 syncEngine.changeTracker.clearAll();
             }
@@ -1734,7 +1942,7 @@ async function cmdToggleSyncMode() {
     refreshSidebar();
 
     const label = newMode === 'manual' ? 'Manual' : 'Real-time';
-    changesWebviewProvider.showToast(`Sync mode set to ${label}`, 'info', 4000);
+    changesWebviewProvider.showNotice(`Sync mode set to ${label}`, 'info', 4000);
 }
 
 /**
@@ -1773,7 +1981,7 @@ async function cmdCompileLaTeX() {
     const settingsManager = SettingsManager.getCurrentInstance();
     const settings = settingsManager?.getSettings();
     if (!settingsManager || !settings) {
-        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        showPanelNotice('LocalLeaf: No linked project', 'warning');
         return;
     }
 
@@ -1796,38 +2004,29 @@ async function cmdCompileLaTeX() {
     handleCompilationResult(result);
 }
 
-/** Resolve function for the current compilation progress notification */
-let compilingProgressResolve: (() => void) | undefined;
+/** Token for the current compilation notice */
+let compilingNoticeToken: NoticeToken | undefined;
 
 function handleCompilationStarted() {
-    // If a previous progress notification is still open, close it
-    compilingProgressResolve?.();
-    compilingProgressResolve = undefined;
+    dismissPanelNotice(compilingNoticeToken);
+    compilingNoticeToken = undefined;
 
     // Update PDF preview tab title
     PdfPreviewPanel.setCompiling(true);
 
-    // Show bottom-right progress notification
-    vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: 'LaTeX: Compiling...',
-        cancellable: false,
-    }, () => new Promise<void>(resolve => {
-        compilingProgressResolve = resolve;
-    }));
+    compilingNoticeToken = showPanelNotice('LaTeX: Compiling...', 'info');
 }
 
 function handleCompilationResult(result: CompilationResult) {
-    // Close the "Compiling..." progress notification
-    compilingProgressResolve?.();
-    compilingProgressResolve = undefined;
+    dismissPanelNotice(compilingNoticeToken);
+    compilingNoticeToken = undefined;
 
     // Restore PDF preview tab title
     PdfPreviewPanel.setCompiling(false);
 
     if (result.success) {
         const duration = (result.duration / 1000).toFixed(1);
-        vscode.window.showInformationMessage(`LaTeX: Compiled successfully (${duration}s)`);
+        showPanelNotice(`LaTeX: Compiled successfully (${duration}s)`, 'info', 4000);
 
         // Auto-open / refresh PDF preview
         if (result.pdfPath) {
@@ -1837,8 +2036,9 @@ function handleCompilationResult(result: CompilationResult) {
     } else {
         const errorCount = result.errors.length;
         const warningCount = result.warnings.length;
-        vscode.window.showWarningMessage(
-            `LaTeX: Compilation failed (${errorCount} error(s), ${warningCount} warning(s))`
+        showPanelNotice(
+            `LaTeX: Compilation failed (${errorCount} error(s), ${warningCount} warning(s))`,
+            'warning',
         );
     }
 
@@ -1849,7 +2049,7 @@ async function cmdShowPdfPreview() {
     const settingsManager = SettingsManager.getCurrentInstance();
     const settings = settingsManager?.getSettings();
     if (!settingsManager || !settings) {
-        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        showPanelNotice('LocalLeaf: No linked project', 'warning');
         return;
     }
 
@@ -1874,7 +2074,7 @@ async function cmdSelectCompiler() {
     const available = await latexCompiler.detectCompilers();
 
     if (available.length === 0) {
-        vscode.window.showErrorMessage('LocalLeaf: No LaTeX compilers found. Please install TeX Live or MiKTeX.');
+        showPanelNotice('LocalLeaf: No LaTeX compilers found. Please install TeX Live or MiKTeX.', 'error');
         return;
     }
 
@@ -1894,7 +2094,7 @@ async function cmdSelectCompiler() {
         const settingsManager = SettingsManager.getCurrentInstance();
         await settingsManager?.update({ compiler: selected.label as any });
         detailsProvider.refresh();
-        vscode.window.showInformationMessage(`LocalLeaf: Compiler set to ${selected.label}`);
+        showPanelNotice(`LocalLeaf: Compiler set to ${selected.label}`, 'info', 4000);
     }
 }
 
@@ -1902,7 +2102,7 @@ async function cmdToggleAutoCompile() {
     const settingsManager = SettingsManager.getCurrentInstance();
     const settings = settingsManager?.getSettings();
     if (!settingsManager || !settings) {
-        vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        showPanelNotice('LocalLeaf: No linked project', 'warning');
         return;
     }
 
@@ -1923,10 +2123,10 @@ async function cmdToggleAutoCompile() {
         autoCompiler.enable(settingsManager.getWorkspaceFolder(), mainTex, delay);
         autoCompiler.onWillCompile(() => handleCompilationStarted());
         autoCompiler.onDidCompile(result => handleCompilationResult(result));
-        vscode.window.setStatusBarMessage('$(check) Auto-compile enabled', 3000);
+        showPanelNotice('Auto-compile enabled', 'info', 3000);
     } else {
         autoCompiler?.disable();
-        vscode.window.setStatusBarMessage('$(x) Auto-compile disabled', 3000);
+        showPanelNotice('Auto-compile disabled', 'info', 3000);
     }
 
     detailsProvider.refresh();
@@ -1935,9 +2135,9 @@ async function cmdToggleAutoCompile() {
 function cmdCancelCompilation() {
     if (latexCompiler?.isCompiling) {
         latexCompiler.cancel();
-        vscode.window.showInformationMessage('LocalLeaf: Compilation cancelled');
+        showPanelNotice('LocalLeaf: Compilation cancelled', 'info', 4000);
     } else {
-        vscode.window.showInformationMessage('LocalLeaf: No compilation in progress');
+        showPanelNotice('LocalLeaf: No compilation in progress', 'info', 4000);
     }
 }
 
@@ -1952,7 +2152,7 @@ async function cmdViewDiff(filePath: string) {
     // Fetch remote content first
     const remoteContent = await syncEngine.getRemoteContent(filePath);
     if (remoteContent === undefined) {
-        changesWebviewProvider.showToast(`Cannot fetch remote content for ${filePath}`, 'error');
+        changesWebviewProvider.showNotice(`Cannot fetch remote content for ${filePath}`, 'error');
         return;
     }
 
@@ -1984,18 +2184,19 @@ async function cmdViewDiff(filePath: string) {
 async function cmdResolveConflict(filePath: string, resolution: 'remote' | 'local') {
     if (!syncEngine || !filePath) return;
 
-    const tracker = syncEngine.changeTracker;
-
-    if (resolution === 'remote') {
-        // Clear local change, keep remote
-        tracker.clearLocal(filePath);
-    } else {
-        // Clear remote change, keep local
-        tracker.clearRemote(filePath);
+    try {
+        if (resolution === 'remote') {
+            await syncEngine.resolveConflictWithRemote(filePath);
+        } else {
+            await syncEngine.resolveConflictWithLocal(filePath);
+        }
+    } catch (error) {
+        changesWebviewProvider.showNotice(`Failed to resolve "${filePath}": ${error}`, 'error');
+        return;
     }
 
     const label = resolution === 'remote' ? 'remote' : 'local';
-    changesWebviewProvider.showToast(`Resolved "${filePath}" using ${label} version`, 'info', 4000);
+    changesWebviewProvider.showNotice(`Resolved "${filePath}" using ${label} version`, 'info', 4000);
 }
 
 async function cmdDiscardChange(filePath: string) {
@@ -2021,13 +2222,13 @@ async function cmdOpenLocalProject(context: vscode.ExtensionContext, workspaceUr
     try {
         projectUri = vscode.Uri.parse(workspaceUri);
     } catch {
-        vscode.window.showErrorMessage('LocalLeaf: Invalid project folder');
+        showPanelNotice('LocalLeaf: Invalid project folder', 'error');
         return;
     }
 
     const settingsManager = SettingsManager.getInstance(projectUri);
     if (!(await settingsManager.isLinked())) {
-        vscode.window.showErrorMessage('LocalLeaf: Selected folder is not a LocalLeaf project');
+        showPanelNotice('LocalLeaf: Selected folder is not a LocalLeaf project', 'error');
         return;
     }
 
@@ -2045,14 +2246,14 @@ async function cmdOpenLocalProject(context: vscode.ExtensionContext, workspaceUr
 async function cmdOpenProject(context: vscode.ExtensionContext, project: ProjectInfo) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!workspaceFolder) {
-        vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
+        showPanelNotice('LocalLeaf: No workspace folder open', 'error');
         return;
     }
 
     const serverUrl = credentialManager.getDefaultServer();
     const credential = await credentialManager.getCredential(serverUrl);
     if (!credential) {
-        vscode.window.showWarningMessage('LocalLeaf: Please login first');
+        showPanelNotice('LocalLeaf: Please login first', 'warning');
         return;
     }
 
@@ -2074,7 +2275,7 @@ async function cmdOpenProject(context: vscode.ExtensionContext, project: Project
 /**
  * Extension deactivation
  */
-export function deactivate() {
+export async function deactivate() {
     stopStatusUpdates();
     gitCommitHook?.dispose();
     scmBridge?.dispose();
@@ -2086,7 +2287,7 @@ export function deactivate() {
         latexCompiler.dispose();
     }
     if (syncEngine) {
-        syncEngine.disconnect();
+        await syncEngine.disconnect();
     }
     if (cursorTracker) {
         cursorTracker.dispose();

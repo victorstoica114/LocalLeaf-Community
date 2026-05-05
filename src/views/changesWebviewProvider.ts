@@ -4,7 +4,7 @@
  * Uses a state-push model: the extension sends a JSON state object via
  * `postMessage` and the webview JS renders it.  Replaces the old
  * TreeDataProvider-based ChangesProvider and moves all sync-related
- * notifications (confirmations / toasts) inline.
+ * notifications (confirmations / notices) inline.
  */
 
 import * as vscode from 'vscode';
@@ -12,6 +12,7 @@ import { ChangeTracker, SyncMode, PendingChange } from '../sync/changeTracker';
 import { SyncStatus } from '../sync/syncEngine';
 import { changeTypeIcon, displayPath, formatTimeAgo, syncStatusDescription } from './sidebarProvider';
 import { SettingsManager } from '../utils/settingsManager';
+import { PanelNotificationCenter, PanelNotificationState } from './panelNotificationCenter';
 
 // ── State & message types ──────────────────────────────────────────
 
@@ -26,12 +27,6 @@ export interface ConfirmationRequest {
     id: string;
     message: string;
     buttons: { label: string; value: string; primary?: boolean; danger?: boolean }[];
-}
-
-export interface ToastMessage {
-    id: string;
-    message: string;
-    type: 'info' | 'warning' | 'error';
 }
 
 export interface OnlineUserInfo {
@@ -50,8 +45,7 @@ interface ChangesViewState {
     conflicts: ChangeItem[];
     remoteChanges: ChangeItem[];
     localChanges: ChangeItem[];
-    confirmation: ConfirmationRequest | null;
-    toasts: ToastMessage[];
+    notifications: PanelNotificationState;
     onlineUsers: OnlineUserInfo[];
 }
 
@@ -63,7 +57,7 @@ type WebviewMessage =
     | { command: 'resolveConflictRemote'; path: string }
     | { command: 'resolveConflictLocal'; path: string }
     | { command: 'confirmationResponse'; id: string; value: string }
-    | { command: 'dismissToast'; id: string }
+    | { command: 'dismissNotice'; id: string }
     | { command: 'jumpToUser'; clientId: string }
     | { command: 'toggleSyncMode' };
 
@@ -78,13 +72,14 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
     private syncMode: SyncMode = 'manual';
     private syncStatus: SyncStatus = 'disconnected';
     private lastSynced?: string;
-    private toasts: ToastMessage[] = [];
-    private confirmation: ConfirmationRequest | null = null;
-    private confirmationResolve?: (value: string) => void;
-    private toastCounter = 0;
     private onlineUsers: OnlineUserInfo[] = [];
 
-    constructor(private readonly extensionUri: vscode.Uri) {}
+    constructor(
+        private readonly extensionUri: vscode.Uri,
+        private readonly notifications: PanelNotificationCenter,
+    ) {
+        this.notifications.subscribe(() => this.pushState());
+    }
 
     // ── WebviewViewProvider ────────────────────────────────────────
 
@@ -139,7 +134,7 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     /**
-     * Show an inline confirmation banner and wait for the user's choice.
+     * Show a choice modal and wait for the user's choice.
      * Resolves with the `value` of the button the user clicked.
      */
     showConfirmation(request: Omit<ConfirmationRequest, 'id'>): Promise<string> {
@@ -148,25 +143,19 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
             this._view.show?.(true);
         }
 
-        return new Promise<string>(resolve => {
-            this.confirmation = { ...request, id: String(Date.now()) };
-            this.confirmationResolve = resolve;
-            this.pushState();
-        });
+        return this.notifications.showModal({ ...request, type: 'warning' });
     }
 
     /**
-     * Show an auto-dismissing toast in the sidebar.
+     * Show a coalesced notice in the sidebar.
      */
-    showToast(message: string, type: 'info' | 'warning' | 'error', autoDismissMs?: number): void {
-        const id = `toast-${++this.toastCounter}`;
-        this.toasts.push({ id, message, type });
-        this.pushState();
+    showNotice(message: string, type: 'info' | 'warning' | 'error', autoDismissMs?: number): void {
+        const id = this.notifications.showNotice(message, type);
+        const revision = this.notifications.getState().notice?.revision;
 
         if (autoDismissMs && autoDismissMs > 0) {
             setTimeout(() => {
-                this.toasts = this.toasts.filter(t => t.id !== id);
-                this.pushState();
+                this.notifications.dismissNotice(id, revision);
             }, autoDismissMs);
         }
     }
@@ -199,16 +188,10 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
                 vscode.commands.executeCommand('localleaf.resolveConflictLocal', msg.path);
                 break;
             case 'confirmationResponse':
-                if (this.confirmationResolve && this.confirmation?.id === msg.id) {
-                    this.confirmationResolve(msg.value);
-                    this.confirmationResolve = undefined;
-                    this.confirmation = null;
-                    this.pushState();
-                }
+                this.notifications.respondToModal(msg.id, msg.value);
                 break;
-            case 'dismissToast':
-                this.toasts = this.toasts.filter(t => t.id !== msg.id);
-                this.pushState();
+            case 'dismissNotice':
+                this.notifications.dismissNotice(msg.id);
                 break;
             case 'jumpToUser':
                 vscode.commands.executeCommand('localleaf.jumpToCollaborator', msg.clientId);
@@ -247,8 +230,7 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
             conflicts,
             remoteChanges,
             localChanges,
-            confirmation: this.confirmation,
-            toasts: this.toasts,
+            notifications: this.notifications.getState(),
             onlineUsers: this.onlineUsers,
         };
     }
@@ -335,44 +317,98 @@ body{
     background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31));
 }
 
-/* ── Confirmation banner ───────────────────────────── */
-.confirmation{
-    padding: 10px 12px;
-    background: var(--vscode-editorWidget-background, var(--vscode-notifications-background));
+/* ── Notifications ─────────────────────────────────── */
+.notice-status-bar{
+    margin: 0;
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px;
     border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+    border-left: 3px solid transparent;
+    border-radius: 0;
+    background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+    animation: noticeIn 0.14s ease-out;
+    contain: layout paint;
 }
-.confirmation-message{
-    margin-bottom: 8px;
+.notice-status-bar.info{ border-left-color: var(--vscode-editorInfo-foreground, #3794ff); }
+.notice-status-bar.warning{ border-left-color: var(--vscode-editorWarning-foreground, #cca700); }
+.notice-status-bar.error{ border-left-color: var(--vscode-editorError-foreground, #f14c4c); }
+.notice-msg{
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.86em;
+}
+.notice-count{
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.78em;
+    flex-shrink: 0;
+}
+.notice-dismiss{
+    background: none;
+    border: none;
+    color: var(--vscode-foreground);
+    cursor: pointer;
+    opacity: 0.65;
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+.notice-dismiss:hover{ opacity:1; background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31)); }
+.choice-modal-backdrop{
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    align-items: flex-start;
+    padding: 12px 8px;
+    background: rgba(0,0,0,.28);
+    animation: fadeIn 0.12s ease-out;
+}
+.choice-modal{
+    width: 100%;
+    border: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+    border-top: 3px solid transparent;
+    border-radius: 6px;
+    background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+    box-shadow: 0 8px 24px rgba(0,0,0,.32);
+    overflow: hidden;
+}
+.choice-modal.info{ border-top-color: var(--vscode-editorInfo-foreground, #3794ff); }
+.choice-modal.warning{ border-top-color: var(--vscode-editorWarning-foreground, #cca700); }
+.choice-modal.error{ border-top-color: var(--vscode-editorError-foreground, #f14c4c); }
+.choice-message{
+    padding: 12px;
+    line-height: 1.45;
     font-size: 0.9em;
-    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
 }
-.confirmation-buttons{
+.choice-buttons{
     display: flex;
     gap: 6px;
+    padding: 0 12px 12px;
     flex-wrap: wrap;
 }
-.confirmation-buttons button{
+.choice-buttons button{
     padding: 4px 10px;
     font-size: 0.82em;
     border: none;
-    border-radius: 2px;
+    border-radius: 3px;
     cursor: pointer;
     color: var(--vscode-button-foreground);
     background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
 }
-.confirmation-buttons button:hover{
-    background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground));
-}
-.confirmation-buttons button.primary{
-    background: var(--vscode-button-background);
-    color: var(--vscode-button-foreground);
-}
-.confirmation-buttons button.primary:hover{
-    background: var(--vscode-button-hoverBackground);
-}
-.confirmation-buttons button.danger{
-    background: var(--vscode-inputValidation-errorBackground, #c53030);
-    color: var(--vscode-inputValidation-errorForeground, #fff);
+.choice-buttons button:hover{ background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground)); }
+.choice-buttons button.primary{ background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.choice-buttons button.primary:hover{ background: var(--vscode-button-hoverBackground); }
+.choice-buttons button.danger{ background: var(--vscode-inputValidation-errorBackground, #c53030); color: var(--vscode-inputValidation-errorForeground, #fff); }
+
+.notice-history{
+    display: none;
 }
 
 /* ── Change groups ─────────────────────────────────── */
@@ -465,44 +501,6 @@ body{
     background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31));
 }
 
-/* ── Toasts ────────────────────────────────────────── */
-.toasts{
-    padding: 0 8px;
-}
-.toast{
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 8px;
-    margin: 4px 0;
-    border-radius: 4px;
-    font-size: 0.85em;
-    animation: fadeIn 0.2s;
-}
-.toast.info{
-    background: var(--vscode-editorInfo-background, rgba(0,120,212,.15));
-    color: var(--vscode-editorInfo-foreground, var(--vscode-foreground));
-}
-.toast.warning{
-    background: var(--vscode-editorWarning-background, rgba(255,204,0,.15));
-    color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
-}
-.toast.error{
-    background: var(--vscode-editorError-background, rgba(255,18,18,.15));
-    color: var(--vscode-editorError-foreground, var(--vscode-foreground));
-}
-.toast .toast-msg{ flex:1; }
-.toast .dismiss{
-    background: none;
-    border: none;
-    color: inherit;
-    cursor: pointer;
-    padding: 0 2px;
-    opacity: 0.6;
-    font-size: 1em;
-}
-.toast .dismiss:hover{ opacity:1; }
-
 /* ── Empty state ───────────────────────────────────── */
 .empty{
     padding: 20px 12px;
@@ -568,7 +566,8 @@ body{
 }
 
 /* ── Animations ────────────────────────────────────── */
-@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes noticeIn{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:translateY(0)}}
 </style>
 </head>
 <body>
@@ -664,9 +663,9 @@ body{
             );
         }
 
-        function renderConfirmation() {
-            if (!state.confirmation) return null;
-            const c = state.confirmation;
+        function renderChoiceModal() {
+            const c = state.notifications && state.notifications.modal;
+            if (!c) return null;
             const btns = c.buttons.map(b => {
                 let cls = '';
                 if (b.primary) cls = 'primary';
@@ -676,9 +675,11 @@ body{
                     onClick: () => vscode.postMessage({command:'confirmationResponse', id:c.id, value:b.value}),
                 }, b.label);
             });
-            return h('div', {className:'confirmation'},
-                h('div', {className:'confirmation-message'}, c.message),
-                h('div', {className:'confirmation-buttons'}, ...btns),
+            return h('div', {className:'choice-modal-backdrop'},
+                h('div', {className:'choice-modal ' + c.type},
+                    h('div', {className:'choice-message'}, c.message),
+                    h('div', {className:'choice-buttons'}, ...btns),
+                ),
             );
         }
 
@@ -721,15 +722,19 @@ body{
             return h('div', {className:'group'}, header, body);
         }
 
-        function renderToasts() {
-            if (!state.toasts || state.toasts.length === 0) return null;
-            return h('div', {className:'toasts'},
-                ...state.toasts.map(t =>
-                    h('div', {className:'toast ' + t.type},
-                        h('span', {className:'toast-msg'}, t.message),
-                        h('button', {className:'dismiss', title:'Dismiss', onClick:()=>vscode.postMessage({command:'dismissToast',id:t.id})}, '\u00d7'),
-                    )
-                ),
+        function renderPanelNotice() {
+            const n = state.notifications && state.notifications.notice;
+            if (!n) return null;
+            const count = n.count > 1 ? 'x' + n.count : '';
+            const title = n.history && n.history.length > 1 ? n.history.join('\\n') : n.message;
+            return h('div', {className:'notice-status-bar ' + n.type, title},
+                h('span', {className:'notice-msg'}, n.message),
+                count ? h('span', {className:'notice-count'}, count) : null,
+                h('button', {
+                    className:'notice-dismiss',
+                    title:'Dismiss',
+                    onClick:()=>vscode.postMessage({command:'dismissNotice',id:n.id}),
+                }, '\u00d7'),
             );
         }
 
@@ -737,19 +742,13 @@ body{
             if (!state) { root.innerHTML = ''; return; }
             root.innerHTML = '';
 
+            const noticeEl = renderPanelNotice();
+            if (noticeEl) root.appendChild(noticeEl);
+
             root.appendChild(renderStatusStrip());
 
-            // Online users
             const usersEl = renderOnlineUsers();
             if (usersEl) root.appendChild(usersEl);
-
-            // Toasts (top, below status)
-            const toastsEl = renderToasts();
-            if (toastsEl) root.appendChild(toastsEl);
-
-            // Confirmation banner
-            const confEl = renderConfirmation();
-            if (confEl) root.appendChild(confEl);
 
             // Change groups
             const conflictsEl = renderGroup('conflicts', 'Conflicts', '\u26A0', state.conflicts, 'conflict');
@@ -760,9 +759,12 @@ body{
             if (remoteEl) root.appendChild(remoteEl);
             if (localEl) root.appendChild(localEl);
 
-            if (!conflictsEl && !remoteEl && !localEl && !confEl) {
+            if (!conflictsEl && !remoteEl && !localEl) {
                 root.appendChild(h('div', {className:'empty'}, 'No file changes yet.\\nChanges will appear here as files are synced.'));
             }
+
+            const choiceEl = renderChoiceModal();
+            if (choiceEl) root.appendChild(choiceEl);
         }
     })();
     </script>

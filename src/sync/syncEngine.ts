@@ -6,9 +6,11 @@
 import * as vscode from 'vscode';
 import { BaseAPI, ProjectEntity, FileEntity, FolderEntity } from '../api/base';
 import { SocketIOAPI, DocumentUpdate } from '../api/socketio';
-import { SettingsManager, ProjectSettings } from '../utils/settingsManager';
+import { SettingsManager } from '../utils/settingsManager';
 import { IgnoreParser } from './ignoreParser';
-import { ChangeTracker, PendingChange, SyncMode } from './changeTracker';
+import { ChangeTracker, SyncMode } from './changeTracker';
+import { BaselineReplacement, SyncBaselineStore } from './syncBaseline';
+import { getManualSyncCompletionState, shouldTrackLocalDelete } from './syncPolicy';
 import { DEBOUNCE_DELAY } from '../consts';
 
 /**
@@ -32,6 +34,22 @@ export interface SyncStatusEvent {
     message?: string;
     file?: string;
     authError?: boolean;
+}
+
+export interface SyncEngineUiButton {
+    label: string;
+    value: string;
+    primary?: boolean;
+    danger?: boolean;
+}
+
+export interface SyncEngineUi {
+    showModal(request: {
+        message: string;
+        type?: 'info' | 'warning' | 'error';
+        buttons: SyncEngineUiButton[];
+    }): Promise<string>;
+    showNotice(message: string, type: 'info' | 'warning' | 'error', autoDismissMs?: number): void;
 }
 
 /**
@@ -129,6 +147,9 @@ export class SyncEngine {
     private fileTreeByPath: Map<string, FileTreeEntry> = new Map();
     private fileCache: Map<string, FileCache> = new Map();
     private baseContent: Map<string, Uint8Array> = new Map();
+    private readonly baselineStore: SyncBaselineStore;
+    private baselineSaveTimer?: NodeJS.Timeout;
+    private baselineSavePromise: Promise<void> = Promise.resolve();
     private pendingRemoteDocContent: Map<string, Uint8Array> = new Map();
     private docPushTimers: Map<string, NodeJS.Timeout> = new Map();
     private pendingRemoteApplyTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -157,10 +178,12 @@ export class SyncEngine {
     constructor(
         private readonly api: BaseAPI,
         private readonly settings: SettingsManager,
-        logFn?: (message: string) => void
+        logFn?: (message: string) => void,
+        private readonly ui?: SyncEngineUi,
     ) {
         const workspaceFolder = settings.getWorkspaceFolder();
         this.ignoreParser = new IgnoreParser(workspaceFolder, settings.getSettings());
+        this.baselineStore = new SyncBaselineStore(workspaceFolder.fsPath);
         this.logFn = logFn;
 
         // Initialize sync mode from settings
@@ -172,6 +195,133 @@ export class SyncEngine {
 
     private log(message: string): void {
         this.logFn?.(message);
+    }
+
+    private async showModalChoice(request: {
+        message: string;
+        type?: 'info' | 'warning' | 'error';
+        buttons: SyncEngineUiButton[];
+    }, fallbackValue: string = 'cancel'): Promise<string> {
+        if (!this.ui) {
+            return fallbackValue;
+        }
+        return this.ui.showModal(request);
+    }
+
+    private setBaseContent(path: string, content: Uint8Array): void {
+        this.baseContent.set(path, content);
+        this.scheduleBaselineSave();
+    }
+
+    private deleteBaseContent(path: string): void {
+        this.baseContent.delete(path);
+        this.scheduleBaselineSave();
+    }
+
+    private scheduleBaselineSave(): void {
+        if (this.baselineSaveTimer) {
+            clearTimeout(this.baselineSaveTimer);
+        }
+        this.baselineSaveTimer = setTimeout(() => {
+            this.baselineSaveTimer = undefined;
+            void this.flushPersistedBaseline();
+        }, DEBOUNCE_DELAY);
+    }
+
+    private async loadPersistedBaseline(): Promise<void> {
+        const snapshot = await this.baselineStore.load();
+        let loadedCount = 0;
+
+        for (const entry of snapshot.entries) {
+            const content = entry.entityType === 'folder'
+                ? new Uint8Array(0)
+                : await this.baselineStore.getContent(entry.path);
+            if (!content) {
+                continue;
+            }
+            this.baseContent.set(entry.path, content);
+            this.fileCache.set(entry.path, {
+                hash: entry.hash,
+                timestamp: entry.timestamp,
+            });
+            loadedCount++;
+        }
+
+        if (loadedCount > 0) {
+            this.log(`Loaded ${loadedCount} persisted sync baseline entr${loadedCount === 1 ? 'y' : 'ies'}`);
+        }
+    }
+
+    private buildBaselineReplacements(): BaselineReplacement[] {
+        const replacements: BaselineReplacement[] = [];
+        const now = Date.now();
+
+        for (const [path, content] of this.baseContent) {
+            const entry = this.fileTreeByPath.get(path);
+            const cache = this.fileCache.get(path);
+            const entityType = entry?.type ?? (path.endsWith('/') ? 'folder' : undefined);
+
+            replacements.push({
+                entry: {
+                    path,
+                    entityId: entry?.id,
+                    entityType,
+                    hash: cache?.hash ?? hashContent(content),
+                    timestamp: cache?.timestamp ?? now,
+                },
+                content: entityType === 'folder' ? undefined : content,
+            });
+        }
+
+        return replacements;
+    }
+
+    private async flushPersistedBaseline(): Promise<void> {
+        if (this.baselineSaveTimer) {
+            clearTimeout(this.baselineSaveTimer);
+            this.baselineSaveTimer = undefined;
+        }
+
+        const replacements = this.buildBaselineReplacements();
+        this.baselineSavePromise = this.baselineSavePromise
+            .catch(() => undefined)
+            .then(() => this.baselineStore.replaceAll(replacements))
+            .catch(error => {
+                this.log(`Failed to persist sync baseline: ${error}`);
+            });
+        await this.baselineSavePromise;
+    }
+
+    private getPendingCounts(): { localChangeCount: number; remoteChangeCount: number; conflictCount: number } {
+        return {
+            localChangeCount: this._changeTracker.getLocalChangeCount(),
+            remoteChangeCount: this._changeTracker.getRemoteChangeCount(),
+            conflictCount: this._changeTracker.getConflictCount(),
+        };
+    }
+
+    private getPendingSummary(): string {
+        const counts = this.getPendingCounts();
+        if (counts.conflictCount > 0) {
+            return `${counts.conflictCount} conflict(s) need resolution`;
+        }
+        if (counts.remoteChangeCount > 0) {
+            return `${counts.remoteChangeCount} remote change(s) still pending`;
+        }
+        if (counts.localChangeCount > 0) {
+            return `${counts.localChangeCount} local change(s) ready to push`;
+        }
+        return '';
+    }
+
+    private async updateLastSyncedIfFullySynced(): Promise<boolean> {
+        await this.flushPersistedBaseline();
+        const completion = getManualSyncCompletionState(this.getPendingCounts());
+        if (!completion.canComplete) {
+            return false;
+        }
+        await this.settings.updateLastSynced();
+        return true;
     }
 
     /**
@@ -226,19 +376,22 @@ export class SyncEngine {
             const hasRemote = this._changeTracker.getRemoteChangeCount() > 0;
 
             if (hasLocal || hasRemote) {
-                const choice = await vscode.window.showWarningMessage(
-                    `You have pending changes. Apply them before switching to real-time mode?`,
-                    'Apply & Switch',
-                    'Discard & Switch',
-                    'Cancel'
-                );
+                const choice = await this.showModalChoice({
+                    message: 'You have pending changes. Apply them before switching to real-time mode?',
+                    type: 'warning',
+                    buttons: [
+                        { label: 'Apply & Switch', value: 'apply', primary: true },
+                        { label: 'Discard & Switch', value: 'discard', danger: true },
+                        { label: 'Cancel', value: 'cancel' },
+                    ],
+                });
 
-                if (choice === 'Cancel') {
+                if (choice === 'cancel') {
                     this._syncMode = oldMode;
                     return;
                 }
 
-                if (choice === 'Apply & Switch') {
+                if (choice === 'apply') {
                     if (hasRemote) await this.pullChanges();
                     if (hasLocal) await this.pushChanges();
                 } else {
@@ -264,6 +417,7 @@ export class SyncEngine {
 
         // Load ignore patterns
         await this.ignoreParser.load();
+        await this.loadPersistedBaseline();
 
         // Create socket connection
         const identity = this.api.getIdentity();
@@ -696,7 +850,7 @@ export class SyncEngine {
                     this.log(`Pushed to Overleaf: ${relativePath}`);
                 }
 
-                this.baseContent.set(relativePath, content);
+                this.setBaseContent(relativePath, content);
                 this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
                 this.setStatus('idle');
             } catch (error) {
@@ -826,7 +980,7 @@ export class SyncEngine {
                 }
             }
 
-            this.baseContent.set(path, latest);
+            this.setBaseContent(path, latest);
             this.fileCache.set(path, { hash: hashContent(latest), timestamp: Date.now() });
             this.pendingRemoteDocContent.delete(path);
         } catch (error) {
@@ -941,10 +1095,10 @@ export class SyncEngine {
             contentMoves.push({ oldPath: path, newPath, content });
         }
         for (const move of contentMoves) {
-            this.baseContent.delete(move.oldPath);
+            this.deleteBaseContent(move.oldPath);
         }
         for (const move of contentMoves) {
-            this.baseContent.set(move.newPath, move.content);
+            this.setBaseContent(move.newPath, move.content);
         }
 
         const cacheMoves: Array<{ oldPath: string; newPath: string; cache: FileCache }> = [];
@@ -1025,7 +1179,7 @@ export class SyncEngine {
             if (matches) baseToDelete.push(path);
         }
         for (const p of baseToDelete) {
-            this.baseContent.delete(p);
+            this.deleteBaseContent(p);
         }
 
         const cacheToDelete: string[] = [];
@@ -1140,7 +1294,7 @@ export class SyncEngine {
                 this.log(`Uploaded to Overleaf: ${relativePath}`);
             }
 
-            this.baseContent.set(relativePath, content);
+            this.setBaseContent(relativePath, content);
             this.setStatus('idle');
         } catch (error) {
             // Don't show error for file-not-found during rapid operations
@@ -1336,7 +1490,7 @@ export class SyncEngine {
                 }
 
                 // Track folder in baseContent so delete/rename operations work
-                this.baseContent.set(folderPath, new Uint8Array(0));
+                this.setBaseContent(folderPath, new Uint8Array(0));
                 this.log(`Created folder on Overleaf: ${folderPath}`);
             } else {
                 // Read file content - may throw if file was deleted
@@ -1365,7 +1519,7 @@ export class SyncEngine {
                     await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
                 }
 
-                this.baseContent.set(relativePath, content);
+                this.setBaseContent(relativePath, content);
                 this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
             }
 
@@ -1401,7 +1555,14 @@ export class SyncEngine {
             if (!entry) return;
             // Only track if file was previously synced
             const pathToUse = entry.path;
-            if (!this.baseContent.has(pathToUse)) return;
+            const projectSettings = this.settings.getSettings();
+            if (!shouldTrackLocalDelete({
+                hasRemoteEntry: true,
+                hasBaseContent: this.baseContent.has(pathToUse),
+                lastSynced: projectSettings?.lastSynced,
+            })) {
+                return;
+            }
             this._changeTracker.addLocalChange({
                 path: pathToUse,
                 type: 'deleted',
@@ -1522,7 +1683,7 @@ export class SyncEngine {
             if (type === 'folder') {
                 await vscode.workspace.fs.createDirectory(localUri);
                 // Track folders in baseContent with empty content
-                this.baseContent.set(path, new Uint8Array(0));
+                this.setBaseContent(path, new Uint8Array(0));
             } else {
                 // Download content - use correct API based on type
                 const projectSettings = this.settings.getSettings()!;
@@ -1553,7 +1714,7 @@ export class SyncEngine {
                     }
 
                     await vscode.workspace.fs.writeFile(localUri, content);
-                    this.baseContent.set(path, content);
+                    this.setBaseContent(path, content);
                     this.fileCache.set(path, { hash: hashContent(content), timestamp: Date.now() });
                     this.log(`Downloaded new file from Overleaf: ${path}`);
                 }
@@ -1812,7 +1973,7 @@ export class SyncEngine {
                     try {
                         localPushed = await this.pushDocumentChanges(entry.id, entry.path, localDocBytes);
                         if (localPushed) {
-                            this.baseContent.set(entry.path, localDocBytes);
+                            this.setBaseContent(entry.path, localDocBytes);
                             this.fileCache.set(entry.path, { hash: hashContent(localDocBytes), timestamp: Date.now() });
                         }
                     } catch {
@@ -1850,7 +2011,7 @@ export class SyncEngine {
                 }
             }
 
-            this.baseContent.set(entry.path, appliedBytes);
+            this.setBaseContent(entry.path, appliedBytes);
             this.fileCache.set(entry.path, { hash: hashContent(appliedBytes), timestamp: Date.now() });
 
             this.setStatus('idle');
@@ -2211,28 +2372,32 @@ export class SyncEngine {
         }
 
         // Realtime mode: show interactive dialog
-        const firstChoice = await vscode.window.showWarningMessage(
-            `Conflict: "${filePath}"`,
-            'Diff',
-            'Remote',
-            'Local',
-            'All Remote',
-            'All Local'
-        );
+        const firstChoice = await this.showModalChoice({
+            message: `Conflict: "${filePath}"`,
+            type: 'warning',
+            buttons: [
+                { label: 'Diff', value: 'diff', primary: true },
+                { label: 'Remote', value: 'remote' },
+                { label: 'Local', value: 'local' },
+                { label: 'All Remote', value: 'allRemote' },
+                { label: 'All Local', value: 'allLocal' },
+                { label: 'Skip', value: 'skip' },
+            ],
+        }, 'skip');
 
         switch (firstChoice) {
-            case 'Diff':
+            case 'diff':
                 await this.showDiff(filePath, localUri, remoteContent);
                 return this.askConflictResolutionAfterDiff(filePath);
-            case 'Remote':
+            case 'remote':
                 return 'useRemote';
-            case 'Local':
+            case 'local':
                 return 'useLocal';
-            case 'All Remote':
+            case 'allRemote':
                 this.conflictResolution = 'useRemote';
                 this.applyToAll = true;
                 return 'useRemote';
-            case 'All Local':
+            case 'allLocal':
                 this.conflictResolution = 'useLocal';
                 this.applyToAll = true;
                 return 'useLocal';
@@ -2245,18 +2410,20 @@ export class SyncEngine {
      * Ask after viewing diff
      */
     private async askConflictResolutionAfterDiff(filePath: string): Promise<'useRemote' | 'useLocal' | 'skip'> {
-        const result = await vscode.window.showWarningMessage(
-            `After reviewing diff for "${filePath}", what would you like to do?`,
-            { modal: false },
-            'Use Remote',
-            'Keep Local',
-            'Skip'
-        );
+        const result = await this.showModalChoice({
+            message: `After reviewing diff for "${filePath}", what would you like to do?`,
+            type: 'warning',
+            buttons: [
+                { label: 'Use Remote', value: 'remote', primary: true },
+                { label: 'Keep Local', value: 'local' },
+                { label: 'Skip', value: 'skip' },
+            ],
+        }, 'skip');
 
         switch (result) {
-            case 'Use Remote':
+            case 'remote':
                 return 'useRemote';
-            case 'Keep Local':
+            case 'local':
                 return 'useLocal';
             default:
                 return 'skip';
@@ -2280,7 +2447,7 @@ export class SyncEngine {
 
         // Auto-keep: just clear from sync tracking so they aren't flagged again
         for (const p of orphanedPaths) {
-            this.baseContent.delete(p);
+            this.deleteBaseContent(p);
             debugLog(`Keeping local file (deleted on Overleaf): ${p}`);
         }
         this.log(`${orphanedPaths.length} file(s) deleted on Overleaf, kept locally`);
@@ -2378,7 +2545,7 @@ export class SyncEngine {
                 };
                 this.fileTree.set(result.folder._id, folderEntry);
                 this.fileTreeByPath.set(folderPath, folderEntry);
-                this.baseContent.set(folderPath, new Uint8Array(0));
+                this.setBaseContent(folderPath, new Uint8Array(0));
 
                 this.log(`Created folder on Overleaf: ${folderPath}`);
 
@@ -2467,7 +2634,7 @@ export class SyncEngine {
             await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
         }
 
-        this.baseContent.set(relativePath, content);
+        this.setBaseContent(relativePath, content);
         this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
     }
 
@@ -2505,7 +2672,7 @@ export class SyncEngine {
                     const localUri = this.settings.getFilePath(entry.path);
                     await vscode.workspace.fs.createDirectory(localUri);
                     // Track folders in baseContent with empty content
-                    this.baseContent.set(entry.path, new Uint8Array(0));
+                    this.setBaseContent(entry.path, new Uint8Array(0));
                     return;
                 }
 
@@ -2558,7 +2725,7 @@ export class SyncEngine {
                                     await vscode.workspace.fs.writeFile(localUri, merged);
                                 }
                                 // Remote baseline moved; keep local as pending delta for later push.
-                                this.baseContent.set(entry.path, remoteContent);
+                                this.setBaseContent(entry.path, remoteContent);
                                 this.fileCache.set(entry.path, { hash: hashContent(merged), timestamp: Date.now() });
                                 if (!this._changeTracker.hasLocalChange(entry.path)) {
                                     this._changeTracker.addLocalChange({
@@ -2604,7 +2771,7 @@ export class SyncEngine {
                                 );
                             }
 
-                            this.baseContent.set(entry.path, localContent);
+                            this.setBaseContent(entry.path, localContent);
                             this.fileCache.set(entry.path, { hash: hashContent(localContent), timestamp: Date.now() });
                             return;
                         }
@@ -2636,14 +2803,14 @@ export class SyncEngine {
                 // Skip write if content is identical
                 if (contentEquals(localContent, remoteContent)) {
                     // Content is the same, just update cache
-                    this.baseContent.set(entry.path, remoteContent);
+                    this.setBaseContent(entry.path, remoteContent);
                     this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                     return;
                 }
 
                 this.setStatus('pulling', `Downloading ${entry.path}`, entry.path);
                 await vscode.workspace.fs.writeFile(localUri, remoteContent);
-                this.baseContent.set(entry.path, remoteContent);
+                this.setBaseContent(entry.path, remoteContent);
                 this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                 downloadedCount++;
             };
@@ -2706,8 +2873,6 @@ export class SyncEngine {
                 await this.handleLocalOnlyFiles(localOnlyPaths);
             }
 
-            await this.settings.updateLastSynced();
-
             if (this._syncMode === 'manual') {
                 // In manual mode, clear remote changes; they've been reconciled by pullAll.
                 // Local changes are kept since they still need to be pushed.
@@ -2725,8 +2890,10 @@ export class SyncEngine {
                 // In realtime mode, everything was applied, so clear all.
                 this._changeTracker.clearAll();
             }
-
-            const message = `Pull complete: ${downloadedCount} downloaded, ${skippedCount} skipped, ${conflictCount} conflicts`;
+            const fullySynced = await this.updateLastSyncedIfFullySynced();
+            const message = fullySynced
+                ? `Pull complete: ${downloadedCount} downloaded, ${skippedCount} skipped, ${conflictCount} conflicts`
+                : `Pull paused: ${downloadedCount} downloaded, ${skippedCount} skipped, ${conflictCount} conflicts; ${this.getPendingSummary()}`;
             debugLog('pullAll:', message);
             this.setStatus('idle', message);
         } catch (error) {
@@ -2794,7 +2961,7 @@ export class SyncEngine {
 
                         if (entry.type === 'folder') {
                             await vscode.workspace.fs.createDirectory(localUri);
-                            this.baseContent.set(change.path, new Uint8Array(0));
+                            this.setBaseContent(change.path, new Uint8Array(0));
                         } else {
                             // Download content
                             let remoteContent: Uint8Array | undefined;
@@ -2827,7 +2994,7 @@ export class SyncEngine {
                                 }
 
                                 await vscode.workspace.fs.writeFile(localUri, remoteContent);
-                                this.baseContent.set(change.path, remoteContent);
+                                this.setBaseContent(change.path, remoteContent);
                                 this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                             }
                         }
@@ -2866,12 +3033,28 @@ export class SyncEngine {
                         const localChanged = localContent && base ? !contentEquals(localContent, base) : false;
                         const remoteChanged = base ? !contentEquals(remoteContent, base) : true;
 
-                        if (!localChanged && !remoteChanged) {
+                        if (!base && localContent && !contentEquals(localContent, remoteContent)) {
+                            conflictCount++;
+                            const resolution = await this.askConflictResolution(change.path, localUri, remoteContent);
+                            if (resolution === 'useRemote') {
+                                await vscode.workspace.fs.writeFile(localUri, remoteContent);
+                                this.setBaseContent(change.path, remoteContent);
+                                this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                                appliedCount++;
+                            } else if (resolution === 'useLocal') {
+                                // Keep local; user can push.
+                            } else {
+                                if (this._syncMode === 'manual') {
+                                    keepRemoteChange = true;
+                                }
+                                skippedCount++;
+                            }
+                        } else if (!localChanged && !remoteChanged) {
                             // No changes; skip
                         } else if (!localChanged && remoteChanged) {
                             // Only remote changed; safe to pull
                             await vscode.workspace.fs.writeFile(localUri, remoteContent);
-                            this.baseContent.set(change.path, remoteContent);
+                            this.setBaseContent(change.path, remoteContent);
                             this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                             appliedCount++;
                         } else if (localChanged && !remoteChanged) {
@@ -2879,7 +3062,7 @@ export class SyncEngine {
                             skippedCount++;
                         } else if (localContent && contentEquals(localContent, remoteContent)) {
                             // Both changed to same content; update base
-                            this.baseContent.set(change.path, remoteContent);
+                            this.setBaseContent(change.path, remoteContent);
                             this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                         } else {
                             // Try non-overlapping auto-merge for text docs.
@@ -2890,7 +3073,7 @@ export class SyncEngine {
                                         await vscode.workspace.fs.writeFile(localUri, merged);
                                     }
                                     // Remote baseline moved; keep local as pending delta for later push.
-                                    this.baseContent.set(change.path, remoteContent);
+                                    this.setBaseContent(change.path, remoteContent);
                                     this.fileCache.set(change.path, { hash: hashContent(merged), timestamp: Date.now() });
                                     if (this._syncMode === 'manual' && !this._changeTracker.hasLocalChange(change.path)) {
                                         this._changeTracker.addLocalChange({
@@ -2912,7 +3095,7 @@ export class SyncEngine {
                             const resolution = await this.askConflictResolution(change.path, localUri, remoteContent);
                             if (resolution === 'useRemote') {
                                 await vscode.workspace.fs.writeFile(localUri, remoteContent);
-                                this.baseContent.set(change.path, remoteContent);
+                                this.setBaseContent(change.path, remoteContent);
                                 this.fileCache.set(change.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
                                 appliedCount++;
                             } else if (resolution === 'useLocal') {
@@ -2988,8 +3171,10 @@ export class SyncEngine {
                 }
             }
 
-            await this.settings.updateLastSynced();
-            const message = `Pull complete: ${appliedCount} applied, ${skippedCount} skipped, ${conflictCount} conflicts`;
+            const fullySynced = await this.updateLastSyncedIfFullySynced();
+            const message = fullySynced
+                ? `Pull complete: ${appliedCount} applied, ${skippedCount} skipped, ${conflictCount} conflicts`
+                : `Pull paused: ${appliedCount} applied, ${skippedCount} skipped, ${conflictCount} conflicts; ${this.getPendingSummary()}`;
             this.log(message);
             this.setStatus('idle', message);
         } catch (error) {
@@ -3004,12 +3189,15 @@ export class SyncEngine {
     /**
      * Push buffered local changes in manual mode.
      */
-    async pushChanges(options?: { force?: boolean }): Promise<void> {
+    async pushChanges(options?: { force?: boolean; paths?: string[] }): Promise<void> {
         if (!this.project) {
             throw new Error('Not connected');
         }
 
-        const localChanges = this._changeTracker.getLocalChanges();
+        const pathFilter = options?.paths ? new Set(options.paths) : undefined;
+        const localChanges = pathFilter
+            ? this._changeTracker.getLocalChanges().filter(change => pathFilter.has(change.path))
+            : this._changeTracker.getLocalChanges();
         if (localChanges.length === 0) {
             this.log('Push: No local changes to push');
             return;
@@ -3019,16 +3207,20 @@ export class SyncEngine {
         if (!options?.force) {
             const conflicts = this._changeTracker.getConflicts();
             if (conflicts.length > 0) {
-                const choice = await vscode.window.showWarningMessage(
-                    `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
-                    'Pull First',
-                    'Force Push'
-                );
-                if (choice === 'Pull First') {
+                const choice = await this.showModalChoice({
+                    message: `${conflicts.length} file(s) have both local and remote changes. Pull first to resolve conflicts.`,
+                    type: 'warning',
+                    buttons: [
+                        { label: 'Pull First', value: 'pull', primary: true },
+                        { label: 'Force Push', value: 'force', danger: true },
+                        { label: 'Cancel', value: 'cancel' },
+                    ],
+                });
+                if (choice === 'pull') {
                     await this.pullChanges();
                     return;
                 }
-                if (choice !== 'Force Push') {
+                if (choice !== 'force') {
                     return;
                 }
             }
@@ -3053,6 +3245,7 @@ export class SyncEngine {
                     this._changeTracker.clearLocal(change.path);
                     continue;
                 }
+                let clearProcessedChange = false;
                 switch (change.type) {
                     case 'modified': {
                         const entry = this.fileTreeByPath.get(change.path);
@@ -3079,9 +3272,10 @@ export class SyncEngine {
                             );
                         }
 
-                        this.baseContent.set(change.path, content);
+                        this.setBaseContent(change.path, content);
                         this.fileCache.set(change.path, { hash: hashContent(content), timestamp: Date.now() });
                         pushedCount++;
+                        clearProcessedChange = true;
                         break;
                     }
 
@@ -3091,6 +3285,7 @@ export class SyncEngine {
                         try {
                             stat = await vscode.workspace.fs.stat(localUri);
                         } catch {
+                            clearProcessedChange = true;
                             break; // File no longer exists
                         }
 
@@ -3111,7 +3306,7 @@ export class SyncEngine {
                                 };
                                 this.fileTree.set(result.folder._id, folderEntry);
                                 this.fileTreeByPath.set(folderPath, folderEntry);
-                                this.baseContent.set(folderPath, new Uint8Array(0));
+                                this.setBaseContent(folderPath, new Uint8Array(0));
                             }
                         } else {
                             const content = await vscode.workspace.fs.readFile(localUri);
@@ -3129,16 +3324,20 @@ export class SyncEngine {
                                 await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
                             }
 
-                            this.baseContent.set(change.path, content);
+                            this.setBaseContent(change.path, content);
                             this.fileCache.set(change.path, { hash: hashContent(content), timestamp: Date.now() });
                         }
                         pushedCount++;
+                        clearProcessedChange = true;
                         break;
                     }
 
                     case 'deleted': {
                         const entry = change.entityId ? this.fileTree.get(change.entityId) : this.fileTreeByPath.get(change.path);
-                        if (!entry) break;
+                        if (!entry) {
+                            clearProcessedChange = true;
+                            break;
+                        }
 
                         this.setStatus('pushing', `Deleting ${change.path}`, change.path);
                         await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
@@ -3154,16 +3353,21 @@ export class SyncEngine {
                             this.joinedDocs.delete(removed.id);
                         }
                         pushedCount++;
+                        clearProcessedChange = true;
                         break;
                     }
                 }
 
                 // Clear processed change
-                this._changeTracker.clearLocal(change.path);
+                if (clearProcessedChange) {
+                    this._changeTracker.clearLocal(change.path);
+                }
             }
 
-            await this.settings.updateLastSynced();
-            const message = `Push complete: ${pushedCount} files pushed`;
+            const fullySynced = await this.updateLastSyncedIfFullySynced();
+            const message = fullySynced
+                ? `Push complete: ${pushedCount} files pushed`
+                : `Push finished: ${pushedCount} files pushed; ${this.getPendingSummary()}`;
             this.log(message);
             this.setStatus('idle', message);
         } catch (error) {
@@ -3221,6 +3425,84 @@ export class SyncEngine {
     }
 
     /**
+     * Resolve a tracked conflict by applying the current remote version locally.
+     */
+    async resolveConflictWithRemote(relativePath: string): Promise<void> {
+        const remoteChange = this._changeTracker.getRemoteChange(relativePath);
+        if (!remoteChange && !this.fileTreeByPath.has(relativePath)) {
+            throw new Error(`No remote change found for ${relativePath}`);
+        }
+
+        this._isPulling = true;
+        try {
+            if (remoteChange?.type === 'deleted') {
+                const localUri = this.settings.getFilePath(relativePath);
+                try {
+                    await vscode.workspace.fs.delete(localUri, { recursive: true });
+                } catch {
+                    // File may already be gone.
+                }
+                const includeDescendants = remoteChange.entityType === 'folder' || relativePath.endsWith('/');
+                this.removePathTracking(relativePath, includeDescendants);
+            } else if (remoteChange?.entityType === 'folder' || relativePath.endsWith('/')) {
+                const localUri = this.settings.getFilePath(relativePath);
+                await vscode.workspace.fs.createDirectory(localUri);
+                this.setBaseContent(relativePath, new Uint8Array(0));
+            } else {
+                const remoteContent = await this.getRemoteContent(relativePath);
+                if (!remoteContent) {
+                    throw new Error(`Cannot fetch remote content for ${relativePath}`);
+                }
+
+                const localUri = this.settings.getFilePath(relativePath);
+                this._remoteUpdatingPaths.add(relativePath);
+                try {
+                    await vscode.workspace.fs.writeFile(localUri, remoteContent);
+                } finally {
+                    this._remoteUpdatingPaths.delete(relativePath);
+                }
+
+                this.setBaseContent(relativePath, remoteContent);
+                this.fileCache.set(relativePath, {
+                    hash: hashContent(remoteContent),
+                    timestamp: Date.now(),
+                });
+            }
+
+            this._changeTracker.clearLocal(relativePath);
+            this._changeTracker.clearRemote(relativePath);
+            await this.updateLastSyncedIfFullySynced();
+        } finally {
+            this._isPulling = false;
+        }
+    }
+
+    /**
+     * Resolve a tracked conflict by pushing the current local version remotely.
+     */
+    async resolveConflictWithLocal(relativePath: string): Promise<void> {
+        if (!this._changeTracker.hasLocalChange(relativePath)) {
+            throw new Error(`No local change found for ${relativePath}`);
+        }
+
+        const remoteChange = this._changeTracker.getRemoteChange(relativePath);
+        if (remoteChange?.type === 'deleted' && !this.fileTreeByPath.has(relativePath)) {
+            this._changeTracker.addLocalChange({
+                path: relativePath,
+                type: 'created',
+                source: 'local',
+                timestamp: Date.now(),
+            });
+        }
+
+        await this.pushChanges({ force: true, paths: [relativePath] });
+        if (!this._changeTracker.hasLocalChange(relativePath)) {
+            this._changeTracker.clearRemote(relativePath);
+            await this.updateLastSyncedIfFullySynced();
+        }
+    }
+
+    /**
      * Get the socket instance
      */
     getSocket(): SocketIOAPI | undefined {
@@ -3230,8 +3512,9 @@ export class SyncEngine {
     /**
      * Disconnect and cleanup
      */
-    disconnect(): void {
+    async disconnect(): Promise<void> {
         this._changeTracker.dispose();
+        await this.flushPersistedBaseline();
         this.socket?.disconnect();
         this.socket = undefined;
         for (const timer of this.docPushTimers.values()) {
@@ -3255,4 +3538,3 @@ export class SyncEngine {
         return this.fileTree;
     }
 }
-

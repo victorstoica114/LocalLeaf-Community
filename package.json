@@ -97,11 +97,6 @@
         "icon": "$(debug-disconnect)"
       },
       {
-        "command": "localleaf.syncNow",
-        "title": "LocalLeaf: Sync Now",
-        "icon": "$(sync)"
-      },
-      {
         "command": "localleaf.pullFromOverleaf",
         "title": "LocalLeaf: Pull from Overleaf",
         "icon": "$(cloud-download)"
@@ -217,24 +212,19 @@
     "menus": {
       "view/title": [
         {
-          "command": "localleaf.syncNow",
+          "command": "localleaf.pullFromOverleaf",
           "when": "view == localleaf.changesView",
           "group": "navigation@1"
         },
         {
-          "command": "localleaf.pullFromOverleaf",
+          "command": "localleaf.pushToOverleaf",
           "when": "view == localleaf.changesView",
           "group": "navigation@2"
         },
         {
-          "command": "localleaf.pushToOverleaf",
-          "when": "view == localleaf.changesView",
-          "group": "navigation@3"
-        },
-        {
           "command": "localleaf.compileLaTeX",
           "when": "view == localleaf.changesView",
-          "group": "navigation@4"
+          "group": "navigation@3"
         },
         {
           "command": "localleaf.showPdfPreview",
@@ -398,7 +388,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js",
+    "test": "node --test test/*.test.js",
     "postinstall": "patch-package",
     "website:dev": "npm run dev --prefix docs/website",
     "website:build": "npm run build --prefix docs/website"

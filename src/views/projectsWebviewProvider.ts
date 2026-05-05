@@ -13,6 +13,7 @@ import { BaseAPI, ProjectInfo } from '../api/base';
 import { CredentialManager } from '../utils/credentialManager';
 import { DetectedLocalLeafProject, SettingsManager } from '../utils/settingsManager';
 import { CONFIG_DIR, COMMANDS } from '../consts';
+import { PanelNotificationCenter } from './panelNotificationCenter';
 
 export type ProjectSortField = 'name' | 'lastUpdated' | 'accessLevel';
 export type SortOrder = 'asc' | 'desc';
@@ -32,7 +33,10 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     constructor(
         private readonly extensionUri: vscode.Uri,
         private readonly credentialManager: CredentialManager,
-    ) {}
+        private readonly notifications: PanelNotificationCenter,
+    ) {
+        this.notifications.subscribe(() => this.postNotificationState());
+    }
 
     // ── WebviewViewProvider ────────────────────────────────────────
 
@@ -150,6 +154,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         }
 
         this._view.webview.html = this.getHtml(state, this.cachedProjects);
+        this.postNotificationState();
     }
 
     // ── Message handling ───────────────────────────────────────────
@@ -191,7 +196,22 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             case 'openFolder':
                 vscode.commands.executeCommand('vscode.openFolder');
                 break;
+
+            case 'confirmationResponse':
+                this.notifications.respondToModal(msg.id, msg.value);
+                break;
+
+            case 'dismissNotice':
+                this.notifications.dismissNotice(msg.id);
+                break;
         }
+    }
+
+    private postNotificationState(): void {
+        this._view?.webview.postMessage({
+            type: 'notificationState',
+            state: this.notifications.getState(),
+        });
     }
 
     // ── HTML generation ────────────────────────────────────────────
@@ -324,6 +344,8 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     private wrapHtml(body: string): string {
+        const initialNotificationState = escapeScriptJson(JSON.stringify(this.notifications.getState()));
+
         return /*html*/`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -341,6 +363,95 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             padding: 0;
             overflow-x: hidden;
         }
+
+        .notice-status-bar{
+            margin: 0;
+            min-height: 34px;
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            padding: 7px 10px;
+            border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+            border-left: 3px solid transparent;
+            border-radius: 0;
+            background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+            animation: noticeIn 0.14s ease-out;
+            contain: layout paint;
+        }
+        .notice-status-bar.info{ border-left-color: var(--vscode-editorInfo-foreground, #3794ff); }
+        .notice-status-bar.warning{ border-left-color: var(--vscode-editorWarning-foreground, #cca700); }
+        .notice-status-bar.error{ border-left-color: var(--vscode-editorError-foreground, #f14c4c); }
+        .notice-msg{
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 0.86em;
+        }
+        .notice-count{
+            color: var(--vscode-descriptionForeground);
+            font-size: 0.78em;
+            flex-shrink: 0;
+        }
+        .notice-dismiss{
+            background: none;
+            border: none;
+            color: var(--vscode-foreground);
+            cursor: pointer;
+            opacity: 0.65;
+            padding: 1px 4px;
+            border-radius: 3px;
+        }
+        .notice-dismiss:hover{ opacity:1; background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31)); }
+        .choice-modal-backdrop{
+            position: fixed;
+            inset: 0;
+            z-index: 20;
+            display: flex;
+            align-items: flex-start;
+            padding: 12px 8px;
+            background: rgba(0,0,0,.28);
+            animation: fadeIn 0.12s ease-out;
+        }
+        .choice-modal{
+            width: 100%;
+            border: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+            border-top: 3px solid transparent;
+            border-radius: 6px;
+            background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+            box-shadow: 0 8px 24px rgba(0,0,0,.32);
+            overflow: hidden;
+        }
+        .choice-modal.info{ border-top-color: var(--vscode-editorInfo-foreground, #3794ff); }
+        .choice-modal.warning{ border-top-color: var(--vscode-editorWarning-foreground, #cca700); }
+        .choice-modal.error{ border-top-color: var(--vscode-editorError-foreground, #f14c4c); }
+        .choice-message{
+            padding: 12px;
+            line-height: 1.45;
+            font-size: 0.9em;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .choice-buttons{
+            display: flex;
+            gap: 6px;
+            padding: 0 12px 12px;
+            flex-wrap: wrap;
+        }
+        .choice-buttons button{
+            padding: 4px 10px;
+            font-size: 0.82em;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            color: var(--vscode-button-foreground);
+            background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+        }
+        .choice-buttons button:hover{ background: var(--vscode-button-secondaryHoverBackground, var(--vscode-button-hoverBackground)); }
+        .choice-buttons button.primary{ background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+        .choice-buttons button.primary:hover{ background: var(--vscode-button-hoverBackground); }
+        .choice-buttons button.danger{ background: var(--vscode-inputValidation-errorBackground, #c53030); color: var(--vscode-inputValidation-errorForeground, #fff); }
 
         /* Centered message screens */
         .center-message {
@@ -485,13 +596,88 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
             font-size: 0.85em;
         }
+
+        @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+        @keyframes noticeIn{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:translateY(0)}}
     </style>
 </head>
 <body>
+    <div id="notification-root"></div>
     ${body}
     <script>
         const vscode = acquireVsCodeApi();
         function postMessage(msg) { vscode.postMessage(msg); }
+        const notificationRoot = document.getElementById('notification-root');
+        let notificationState = ${initialNotificationState};
+
+        function h(tag, attrs, ...children) {
+            const el = document.createElement(tag);
+            if (attrs) {
+                Object.entries(attrs).forEach(([key, value]) => {
+                    if (key === 'className') el.className = value;
+                    else if (key.startsWith('on')) el.addEventListener(key.slice(2).toLowerCase(), value);
+                    else if (key === 'title') el.title = value;
+                    else el.setAttribute(key, value);
+                });
+            }
+            children.forEach(child => {
+                if (typeof child === 'string') el.appendChild(document.createTextNode(child));
+                else if (child) el.appendChild(child);
+            });
+            return el;
+        }
+
+        function renderPanelNotice() {
+            const n = notificationState && notificationState.notice;
+            if (!n) return null;
+            const count = n.count > 1 ? 'x' + n.count : '';
+            const title = n.history && n.history.length > 1 ? n.history.join('\\n') : n.message;
+            return h('div', {className:'notice-status-bar ' + n.type, title},
+                h('span', {className:'notice-msg'}, n.message),
+                count ? h('span', {className:'notice-count'}, count) : null,
+                h('button', {
+                    className:'notice-dismiss',
+                    title:'Dismiss',
+                    onClick:()=>postMessage({type:'dismissNotice', id:n.id}),
+                }, '\u00d7'),
+            );
+        }
+
+        function renderChoiceModal() {
+            const c = notificationState && notificationState.modal;
+            if (!c) return null;
+            const buttons = c.buttons.map(button => {
+                let cls = '';
+                if (button.primary) cls = 'primary';
+                if (button.danger) cls = 'danger';
+                return h('button', {
+                    className: cls,
+                    onClick: () => postMessage({type:'confirmationResponse', id:c.id, value:button.value}),
+                }, button.label);
+            });
+            return h('div', {className:'choice-modal-backdrop'},
+                h('div', {className:'choice-modal ' + c.type},
+                    h('div', {className:'choice-message'}, c.message),
+                    h('div', {className:'choice-buttons'}, ...buttons),
+                ),
+            );
+        }
+
+        function renderNotifications() {
+            notificationRoot.innerHTML = '';
+            const notice = renderPanelNotice();
+            if (notice) notificationRoot.appendChild(notice);
+            const choice = renderChoiceModal();
+            if (choice) notificationRoot.appendChild(choice);
+        }
+
+        window.addEventListener('message', event => {
+            if (event.data && event.data.type === 'notificationState') {
+                notificationState = event.data.state || { modal: null, notice: null };
+                renderNotifications();
+            }
+        });
+        renderNotifications();
 
         // Search input with debounce
         const searchInput = document.getElementById('search');
@@ -572,4 +758,13 @@ function escapeHtml(text: string): string {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+
+function escapeScriptJson(json: string): string {
+    return json
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
 }

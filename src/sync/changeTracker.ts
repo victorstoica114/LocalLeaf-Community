@@ -114,6 +114,14 @@ export class ChangeTracker {
         return this.remoteChanges.has(path);
     }
 
+    getLocalChange(path: string): PendingChange | undefined {
+        return this.localChanges.get(path);
+    }
+
+    getRemoteChange(path: string): PendingChange | undefined {
+        return this.remoteChanges.get(path);
+    }
+
     clearLocal(path?: string): void {
         if (path) {
             this.localChanges.delete(path);

@@ -1,0 +1,80 @@
+import { SyncMode } from './changeTracker';
+
+export interface StartupSyncState {
+    syncMode: SyncMode;
+    hasBaseContent: boolean;
+    lastSynced?: string;
+}
+
+export interface PendingSyncCounts {
+    localChangeCount: number;
+    remoteChangeCount: number;
+    conflictCount: number;
+}
+
+export interface ManualSyncCompletionState {
+    canComplete: boolean;
+    reason?: 'conflict' | 'remote' | 'local';
+}
+
+export type ManualPushConflictChoice = 'pull' | 'force' | 'cancel';
+
+export interface ManualPushPlanInput {
+    conflictCount: number;
+    conflictChoice?: ManualPushConflictChoice;
+}
+
+export interface ManualPushPlan {
+    action: 'push' | 'pull' | 'cancel';
+    force: boolean;
+}
+
+export interface LocalDeleteTrackingState {
+    hasRemoteEntry: boolean;
+    hasBaseContent: boolean;
+    lastSynced?: string;
+}
+
+export function shouldAutoPullOnProjectLoad(state: StartupSyncState): boolean {
+    if (state.syncMode === 'realtime') {
+        return true;
+    }
+    return !state.hasBaseContent && !state.lastSynced;
+}
+
+export function shouldPushAfterManualPull(counts: PendingSyncCounts): boolean {
+    return counts.localChangeCount > 0 &&
+        counts.remoteChangeCount === 0 &&
+        counts.conflictCount === 0;
+}
+
+export function getManualSyncCompletionState(counts: PendingSyncCounts): ManualSyncCompletionState {
+    if (counts.conflictCount > 0) {
+        return { canComplete: false, reason: 'conflict' };
+    }
+    if (counts.remoteChangeCount > 0) {
+        return { canComplete: false, reason: 'remote' };
+    }
+    if (counts.localChangeCount > 0) {
+        return { canComplete: false, reason: 'local' };
+    }
+    return { canComplete: true };
+}
+
+export function getManualPushPlan(input: ManualPushPlanInput): ManualPushPlan {
+    if (input.conflictCount === 0) {
+        return { action: 'push', force: false };
+    }
+
+    if (input.conflictChoice === 'force') {
+        return { action: 'push', force: true };
+    }
+    if (input.conflictChoice === 'pull') {
+        return { action: 'pull', force: false };
+    }
+    return { action: 'cancel', force: false };
+}
+
+export function shouldTrackLocalDelete(state: LocalDeleteTrackingState): boolean {
+    return state.hasRemoteEntry && (state.hasBaseContent || !!state.lastSynced);
+}

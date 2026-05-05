@@ -81,6 +81,15 @@ export interface TrackedUser {
     hoverMessage: vscode.MarkdownString;
 }
 
+export interface CursorTrackerUi {
+    showNotice(message: string, type: 'info' | 'warning' | 'error', autoDismissMs?: number): void;
+    showModal(request: {
+        message: string;
+        type?: 'info' | 'warning' | 'error';
+        buttons: Array<{ label: string; value: string; primary?: boolean; danger?: boolean }>;
+    }): Promise<string>;
+}
+
 /**
  * Cursor Tracker - manages collaborator cursor display
  */
@@ -96,7 +105,8 @@ export class CursorTracker {
 
     constructor(
         private readonly socket: SocketIOAPI,
-        private readonly settings: SettingsManager
+        private readonly settings: SettingsManager,
+        private readonly ui?: CursorTrackerUi,
     ) {
         this._publicId = socket.publicId;
         this.buildDocIdToPathMap();
@@ -419,7 +429,7 @@ export class CursorTracker {
                 user = selected.user;
             }
         } else {
-            vscode.window.showInformationMessage('No collaborators online');
+            this.ui?.showNotice('No collaborators online', 'info', 4000);
             return;
         }
 
@@ -434,17 +444,21 @@ export class CursorTracker {
                     preview: false,
                 });
             } catch (error) {
-                vscode.window.showWarningMessage(
-                    `Cannot open ${user.docPath}. The file may not exist locally. Try pulling from Overleaf.`,
-                    'Pull Now'
-                ).then(choice => {
-                    if (choice === 'Pull Now') {
+                this.ui?.showModal({
+                    message: `Cannot open ${user.docPath}. The file may not exist locally. Try pulling from Overleaf.`,
+                    type: 'warning',
+                    buttons: [
+                        { label: 'Pull Now', value: 'pull', primary: true },
+                        { label: 'Cancel', value: 'cancel' },
+                    ],
+                }).then(choice => {
+                    if (choice === 'pull') {
                         vscode.commands.executeCommand('localleaf.pullFromOverleaf');
                     }
                 });
             }
         } else if (user) {
-            vscode.window.showInformationMessage(`${user.name} is not currently editing a document`);
+            this.ui?.showNotice(`${user.name} is not currently editing a document`, 'info', 4000);
         }
     }
 

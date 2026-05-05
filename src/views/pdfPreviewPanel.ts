@@ -19,6 +19,7 @@ const synctexHighlight = vscode.window.createTextEditorDecorationType({
 export class PdfPreviewPanel {
     static readonly viewType = 'localleaf.pdfPreview';
     private static instance: PdfPreviewPanel | undefined;
+    private static notifyWarning: ((message: string) => void) | undefined;
     private panel: vscode.WebviewPanel;
     private extensionUri: vscode.Uri;
     private currentPdfPath?: string;
@@ -64,6 +65,13 @@ export class PdfPreviewPanel {
 
         // Pin the tab so it doesn't get replaced
         this.pinTab();
+    }
+
+    /**
+     * Route preview warnings through the sidebar notification surface.
+     */
+    static setNotificationHandler(handler: (message: string) => void): void {
+        PdfPreviewPanel.notifyWarning = handler;
     }
 
     /**
@@ -161,16 +169,16 @@ export class PdfPreviewPanel {
             if (result) {
                 this.openSourceLocation(result.file, result.line, result.column);
             } else if (code !== 0) {
-                vscode.window.showWarningMessage(
-                    'LocalLeaf: SyncTeX inverse search failed. Make sure synctex is installed (comes with TeX Live / MiKTeX).'
+                PdfPreviewPanel.notifyWarning?.(
+                    'LocalLeaf: SyncTeX inverse search failed. Make sure synctex is installed (comes with TeX Live / MiKTeX).',
                 );
             }
         });
 
         proc.on('error', (err) => {
             console.log('[LocalLeaf] synctex spawn error:', err.message);
-            vscode.window.showWarningMessage(
-                'LocalLeaf: Could not run synctex command. Make sure a TeX distribution (TeX Live / MiKTeX) is installed.'
+            PdfPreviewPanel.notifyWarning?.(
+                'LocalLeaf: Could not run synctex command. Make sure a TeX distribution (TeX Live / MiKTeX) is installed.',
             );
         });
     }
