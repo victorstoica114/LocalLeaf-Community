@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import { BaseAPI, ProjectEntity, FileEntity, FolderEntity } from '../api/base';
 import { SocketIOAPI, DocumentUpdate } from '../api/socketio';
 import { SettingsManager } from '../utils/settingsManager';
-import { IgnoreParser } from './ignoreParser';
+import { IgnoreParser, createIgnoreWatcher } from './ignoreParser';
 import { ChangeTracker, SyncMode } from './changeTracker';
 import { BaselineReplacement, SyncBaselineStore } from './syncBaseline';
 import {
@@ -159,6 +159,7 @@ export class SyncEngine {
     private docPushTimers: Map<string, NodeJS.Timeout> = new Map();
     private pendingRemoteApplyTimers: Map<string, NodeJS.Timeout> = new Map();
     private ignoreParser: IgnoreParser;
+    private ignoreWatcher?: vscode.FileSystemWatcher;
     private _status: SyncStatus = 'disconnected';
     private _onStatusChange = new vscode.EventEmitter<SyncStatusEvent>();
     private disposables: vscode.Disposable[] = [];
@@ -431,6 +432,7 @@ export class SyncEngine {
         // Load ignore patterns
         await this.ignoreParser.load();
         await this.loadPersistedBaseline();
+        this.setupIgnoreWatcher();
 
         // Create socket connection
         const identity = this.api.getIdentity();
@@ -694,6 +696,44 @@ export class SyncEngine {
             return false;
         }
         return !this.ignoreParser.shouldIgnore(relativePath);
+    }
+
+    private setupIgnoreWatcher(): void {
+        this.ignoreWatcher?.dispose();
+        const workspaceFolder = this.settings.getWorkspaceFolder();
+        this.ignoreWatcher = createIgnoreWatcher(
+            workspaceFolder,
+            () => void this.reloadIgnorePatternsAndPruneChanges(),
+        );
+        this.disposables.push(this.ignoreWatcher);
+    }
+
+    private async reloadIgnorePatternsAndPruneChanges(): Promise<void> {
+        await this.ignoreParser.load();
+        const removedCount = this.pruneIgnoredTrackedChanges();
+        if (removedCount > 0) {
+            this.log(`Ignore patterns updated; removed ${removedCount} pending ignored change${removedCount === 1 ? '' : 's'}`);
+        }
+    }
+
+    private pruneIgnoredTrackedChanges(): number {
+        let removedCount = 0;
+
+        for (const change of this._changeTracker.getLocalChanges()) {
+            if (!this.shouldSync(change.path)) {
+                this._changeTracker.clearLocal(change.path);
+                removedCount++;
+            }
+        }
+
+        for (const change of this._changeTracker.getRemoteChanges()) {
+            if (!this.shouldSync(change.path)) {
+                this._changeTracker.clearRemote(change.path);
+                removedCount++;
+            }
+        }
+
+        return removedCount;
     }
 
     /**
@@ -3712,6 +3752,8 @@ export class SyncEngine {
         this.pendingRemoteDocContent.clear();
         this.disposables.forEach(d => d.dispose());
         this.disposables = [];
+        this.localWatcher = undefined;
+        this.ignoreWatcher = undefined;
         this.setStatus('disconnected');
     }
 

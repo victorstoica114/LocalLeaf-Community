@@ -64,6 +64,18 @@ test('manual startup restores local change rows from disk after skipping auto-pu
   assert.match(extension, /shouldAutoPull && !\(syncMode === 'manual' && restoredLocalCount > 0\)/);
 });
 
+test('ignore file changes reload patterns and prune pending changes before sidebar state', () => {
+  const syncEngine = fs.readFileSync(path.join(root, 'src/sync/syncEngine.ts'), 'utf8');
+
+  assert.match(syncEngine, /import \{ IgnoreParser, createIgnoreWatcher \} from '\.\/ignoreParser'/);
+  assert.match(syncEngine, /private ignoreWatcher\?: vscode\.FileSystemWatcher/);
+  assert.match(syncEngine, /private setupIgnoreWatcher\(\): void/);
+  assert.match(syncEngine, /createIgnoreWatcher\([\s\S]*\(\) => void this\.reloadIgnorePatternsAndPruneChanges\(\)/);
+  assert.match(syncEngine, /private async reloadIgnorePatternsAndPruneChanges\(\): Promise<void> \{[\s\S]*await this\.ignoreParser\.load\(\)[\s\S]*this\.pruneIgnoredTrackedChanges\(\)/);
+  assert.match(syncEngine, /private pruneIgnoredTrackedChanges\(\): number \{[\s\S]*this\._changeTracker\.getLocalChanges\(\)[\s\S]*!this\.shouldSync\(change\.path\)[\s\S]*this\._changeTracker\.clearLocal\(change\.path\)/);
+  assert.match(syncEngine, /this\._changeTracker\.getRemoteChanges\(\)[\s\S]*!this\.shouldSync\(change\.path\)[\s\S]*this\._changeTracker\.clearRemote\(change\.path\)/);
+});
+
 test('clicking a change row opens a diff instead of the plain local file', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
 
