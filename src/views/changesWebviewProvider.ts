@@ -349,7 +349,7 @@ body{
     height: 100vh;
     display: flex;
     flex-direction: column;
-    overflow-y: auto;
+    overflow: hidden;
     overflow-x: hidden;
 }
 .top-status-region{
@@ -507,37 +507,59 @@ body{
     display: none;
 }
 
-/* ── Change groups ─────────────────────────────────── */
-.panel-section{
-    margin: 8px 8px 8px 0;
-    border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
-    border-radius: 0 6px 6px 0;
-    overflow: hidden;
-    flex-shrink: 0;
-}
-.changes-section{
-    flex: 1 1 auto;
-    min-height: 0;
-}
-.bottom-sections{
-    margin-top: auto;
-    flex-shrink: 0;
-}
-.panel-section-header{
+/* ── Tabs ──────────────────────────────────────────── */
+.tab-bar{
     display: flex;
     align-items: center;
-    min-height: 28px;
-    padding: 6px 12px;
-    border-radius: 0 6px 6px 0;
-    background: #007acc;
-    color: #fff;
-    font-size: 0.82em;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    gap: 2px;
+    flex-shrink: 0;
+    min-height: 35px;
+    padding: 6px 8px 0;
+    border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background));
 }
-.panel-section-body{
-    padding: 0;
+.tab-button{
+    flex: 1 1 0;
+    min-width: 0;
+    height: 29px;
+    padding: 0 8px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 6px 6px 0 0;
+    color: var(--vscode-descriptionForeground);
+    background: transparent;
+    font: inherit;
+    font-size: 0.82em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.tab-button:hover{
+    color: var(--vscode-foreground);
+    background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31));
+}
+.tab-button.active{
+    color: var(--vscode-foreground);
+    background: var(--vscode-tab-activeBackground, rgba(127,127,127,.08));
+    border-bottom-color: var(--vscode-focusBorder, #007acc);
+}
+.tab-button:focus-visible{
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -2px;
+}
+.tab-content{
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 6px 0 8px;
+}
+.tab-panel{
+    min-height: 100%;
 }
 .tool-list,
 .detail-list{
@@ -769,6 +791,7 @@ body{
         const root = document.getElementById('root');
         let state = null;
         let collapsedGroups = {};
+        let activeTab = null;
         let contextMenu = null;
 
         window.addEventListener('message', e => {
@@ -980,19 +1003,7 @@ body{
             return h('div', {className:'group'}, header, body);
         }
 
-        function renderSection(label, ...children) {
-            const cls = 'panel-section ' + label.toLowerCase() + '-section';
-            return h('section', {className:cls},
-                h('div', {className:'panel-section-header'}, label),
-                h('div', {className:'panel-section-body'}, ...children),
-            );
-        }
-
-        function renderChangesSection() {
-            if (state.syncMode === 'realtime') {
-                return null;
-            }
-
+        function renderChangesContent() {
             const conflictsEl = renderGroup('conflicts', 'Conflicts', '\u26A0', state.conflicts, 'conflict');
             const remoteEl = renderGroup('remote', 'Remote Changes', '\u2193', state.remoteChanges, 'remote');
             const localEl = renderGroup('local', 'Local Changes', '\u2191', state.localChanges, 'local');
@@ -1002,10 +1013,10 @@ body{
                 children.push(h('div', {className:'empty'}, 'No file changes yet.\\nChanges will appear here as files are synced.'));
             }
 
-            return renderSection('Changes', ...children);
+            return h('div', {className:'tab-panel changes-panel'}, ...children);
         }
 
-        function renderToolsSection() {
+        function renderToolsContent() {
             const tools = [
                 ['Remove LaTeX Comments', '%', 'removeComments'],
                 ['Edit Ignore Patterns', '≡', 'editIgnorePatterns'],
@@ -1020,10 +1031,12 @@ body{
                     h('span', {className:'tool-label'}, label),
                 ),
             );
-            return renderSection('Tools', h('div', {className:'tool-list'}, ...items));
+            return h('div', {className:'tab-panel tools-panel'},
+                h('div', {className:'tool-list'}, ...items),
+            );
         }
 
-        function renderDetailsSection() {
+        function renderDetailsContent() {
             const items = (state.details || []).map(item =>
                 h('div', {className:'detail-item', title:item.description + ': ' + item.label},
                     h('span', {className:'detail-icon'}, item.icon),
@@ -1034,7 +1047,11 @@ body{
                 ),
             );
 
-            return renderSection('Details', h('div', {className:'detail-list'}, ...items));
+            const usersEl = renderOnlineUsers();
+            return h('div', {className:'tab-panel details-panel'},
+                usersEl,
+                h('div', {className:'detail-list'}, ...items),
+            );
         }
 
         function renderTopStatusRegion() {
@@ -1043,21 +1060,54 @@ body{
             );
         }
 
+        function getAvailableTabs() {
+            const tabs = [];
+            if (state.syncMode !== 'realtime') {
+                tabs.push({id:'changes', label:'Changes'});
+            }
+            tabs.push({id:'tools', label:'Tools'});
+            tabs.push({id:'details', label:'Details'});
+            return tabs;
+        }
+
+        function ensureActiveTab(tabs) {
+            if (!tabs.some(tab => tab.id === activeTab)) {
+                activeTab = tabs[0].id;
+            }
+        }
+
+        function renderTabBar(tabs) {
+            return h('div', {className:'tab-bar', role:'tablist'},
+                ...tabs.map(tab => h('button', {
+                    className:'tab-button' + (tab.id === activeTab ? ' active' : ''),
+                    role:'tab',
+                    'aria-selected': tab.id === activeTab ? 'true' : 'false',
+                    'data-tab':tab.id,
+                    title:tab.label,
+                    onClick: () => {
+                        activeTab = tab.id;
+                        render();
+                    },
+                }, tab.label)),
+            );
+        }
+
+        function renderTabContent() {
+            if (activeTab === 'changes') return renderChangesContent();
+            if (activeTab === 'details') return renderDetailsContent();
+            return renderToolsContent();
+        }
+
         function render() {
             if (!state) { root.innerHTML = ''; return; }
             root.innerHTML = '';
 
             root.appendChild(renderTopStatusRegion());
 
-            const usersEl = renderOnlineUsers();
-            if (usersEl) root.appendChild(usersEl);
-
-            const changesEl = renderChangesSection();
-            if (changesEl) root.appendChild(changesEl);
-            root.appendChild(h('div', {className:'bottom-sections'},
-                renderToolsSection(),
-                renderDetailsSection(),
-            ));
+            const tabs = getAvailableTabs();
+            ensureActiveTab(tabs);
+            root.appendChild(renderTabBar(tabs));
+            root.appendChild(h('div', {className:'tab-content'}, renderTabContent()));
 
             const choiceEl = renderChoiceModal();
             if (choiceEl) root.appendChild(choiceEl);

@@ -106,32 +106,48 @@ test('local changes expose discard from the row context menu instead of inline a
   assert.doesNotMatch(changesProvider, /title:'Discard', 'data-command':'discardChange'/);
 });
 
-test('main webview owns changes tools and details sections', () => {
+test('main webview owns changes tools and details tab content', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
 
-  assert.match(changesProvider, /renderSection\('Changes'/);
-  assert.match(changesProvider, /renderSection\('Tools'/);
-  assert.match(changesProvider, /renderSection\('Details'/);
+  assert.match(changesProvider, /function renderChangesContent\(\)/);
+  assert.match(changesProvider, /function renderToolsContent\(\)/);
+  assert.match(changesProvider, /function renderDetailsContent\(\)/);
   assert.match(changesProvider, /removeComments/);
   assert.match(changesProvider, /state\.details/);
 });
 
-test('realtime mode hides the changes section while keeping tools and details', () => {
+test('main webview presents changes tools and details as top tabs', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
 
-  assert.match(changesProvider, /function renderChangesSection\(\) \{[\s\S]*state\.syncMode === 'realtime'[\s\S]*return null/);
-  assert.match(changesProvider, /const changesEl = renderChangesSection\(\);[\s\S]*if \(changesEl\) root\.appendChild\(changesEl\)/);
-  assert.match(changesProvider, /root\.appendChild\(h\('div', \{className:'bottom-sections'\}/);
+  assert.match(changesProvider, /let activeTab = null/);
+  assert.match(changesProvider, /function getAvailableTabs\(\)/);
+  assert.match(changesProvider, /function renderTabBar\(tabs\)/);
+  assert.match(changesProvider, /className:'tab-bar'/);
+  assert.match(changesProvider, /role:'tablist'/);
+  assert.match(changesProvider, /'data-tab':tab\.id/);
+  assert.match(changesProvider, /function renderTabContent\(\)/);
+  assert.doesNotMatch(changesProvider, /bottom-sections/);
 });
 
-test('main webview section headers are rounded flush-left with tools and details anchored below', () => {
+test('realtime mode removes the changes tab while keeping tools and details tabs', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
 
-  assert.match(changesProvider, /#root\{[\s\S]*display:\s*flex/);
-  assert.match(changesProvider, /\.panel-section\{[\s\S]*margin:\s*8px 8px 8px 0/);
-  assert.match(changesProvider, /\.panel-section-header\{[\s\S]*border-radius:\s*0 6px 6px 0/);
-  assert.match(changesProvider, /\.bottom-sections\{[\s\S]*margin-top:\s*auto/);
-  assert.match(changesProvider, /h\('div', \{className:'bottom-sections'\},/);
+  assert.match(changesProvider, /if \(state\.syncMode !== 'realtime'\) \{[\s\S]*id:'changes'/);
+  assert.match(changesProvider, /id:'tools'/);
+  assert.match(changesProvider, /id:'details'/);
+  assert.match(changesProvider, /if \(!tabs\.some\(tab => tab\.id === activeTab\)\) \{[\s\S]*activeTab = tabs\[0\]\.id/);
+  assert.doesNotMatch(changesProvider, /const changesEl = renderChangesSection\(\)/);
+});
+
+test('main webview tabs use restrained native styling instead of blue section headers', () => {
+  const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+
+  assert.match(changesProvider, /#root\{[\s\S]*overflow:\s*hidden/);
+  assert.match(changesProvider, /\.tab-bar\{[\s\S]*display:\s*flex/);
+  assert.match(changesProvider, /\.tab-button\.active\{[\s\S]*border-bottom-color/);
+  assert.match(changesProvider, /\.tab-content\{[\s\S]*overflow-y:\s*auto/);
+  assert.doesNotMatch(changesProvider, /background:\s*#007acc/);
+  assert.doesNotMatch(changesProvider, /panel-section-header/);
 });
 
 test('main webview puts the realtime switch at the top left instead of a localleaf title', () => {
