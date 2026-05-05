@@ -5,6 +5,7 @@ const {
   getManualPushPlan,
   shouldAutoPullOnProjectLoad,
   shouldTrackLocalDelete,
+  shouldTrackLocalModification,
   shouldPushAfterManualPull,
   getManualSyncCompletionState,
 } = require('../out/sync/syncPolicy');
@@ -109,4 +110,18 @@ test('local delete is not tracked for unknown never-synced files', () => {
     hasRemoteEntry: false,
     hasBaseContent: false,
   }), false);
+});
+
+test('manual local modification is not tracked after content is reverted to baseline', () => {
+  assert.equal(shouldTrackLocalModification({
+    currentContent: Buffer.from('same'),
+    baseContent: Buffer.from('same'),
+  }), false);
+});
+
+test('manual local modification is tracked when current content differs from baseline', () => {
+  assert.equal(shouldTrackLocalModification({
+    currentContent: Buffer.from('changed'),
+    baseContent: Buffer.from('same'),
+  }), true);
 });

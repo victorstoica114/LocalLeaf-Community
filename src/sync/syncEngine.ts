@@ -10,7 +10,7 @@ import { SettingsManager } from '../utils/settingsManager';
 import { IgnoreParser } from './ignoreParser';
 import { ChangeTracker, SyncMode } from './changeTracker';
 import { BaselineReplacement, SyncBaselineStore } from './syncBaseline';
-import { getManualSyncCompletionState, shouldTrackLocalDelete } from './syncPolicy';
+import { getManualSyncCompletionState, shouldTrackLocalDelete, shouldTrackLocalModification } from './syncPolicy';
 import { DEBOUNCE_DELAY } from '../consts';
 
 /**
@@ -336,6 +336,14 @@ export class SyncEngine {
      */
     hasBaseContent(): boolean {
         return this.baseContent.size > 0;
+    }
+
+    /**
+     * Get the last synced baseline content for a file.
+     */
+    getBaseContent(relativePath: string): Uint8Array | undefined {
+        const content = this.baseContent.get(relativePath);
+        return content ? new Uint8Array(content) : undefined;
     }
 
     /**
@@ -1237,6 +1245,24 @@ export class SyncEngine {
 
         // Manual mode: record change instead of pushing immediately
         if (this._syncMode === 'manual') {
+            let content: Uint8Array;
+            try {
+                content = await vscode.workspace.fs.readFile(uri);
+            } catch (readError) {
+                if (isFileNotFoundError(readError)) {
+                    debugLog(`File no longer exists (race condition): ${relativePath}`);
+                    return;
+                }
+                throw readError;
+            }
+
+            const base = this.baseContent.get(relativePath);
+            if (!shouldTrackLocalModification({ currentContent: content, baseContent: base })) {
+                this._changeTracker.clearLocal(relativePath);
+                this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
+                return;
+            }
+
             const entry = this.fileTreeByPath.get(relativePath);
             this._changeTracker.addLocalChange({
                 path: relativePath,

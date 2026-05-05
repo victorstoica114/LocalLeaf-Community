@@ -35,6 +35,11 @@ export interface LocalDeleteTrackingState {
     lastSynced?: string;
 }
 
+export interface LocalModificationTrackingState {
+    currentContent: Uint8Array;
+    baseContent?: Uint8Array;
+}
+
 export function shouldAutoPullOnProjectLoad(state: StartupSyncState): boolean {
     if (state.syncMode === 'realtime') {
         return true;
@@ -77,4 +82,19 @@ export function getManualPushPlan(input: ManualPushPlanInput): ManualPushPlan {
 
 export function shouldTrackLocalDelete(state: LocalDeleteTrackingState): boolean {
     return state.hasRemoteEntry && (state.hasBaseContent || !!state.lastSynced);
+}
+
+export function shouldTrackLocalModification(state: LocalModificationTrackingState): boolean {
+    if (!state.baseContent) {
+        return true;
+    }
+    if (state.currentContent.length !== state.baseContent.length) {
+        return true;
+    }
+    for (let i = 0; i < state.currentContent.length; i++) {
+        if (state.currentContent[i] !== state.baseContent[i]) {
+            return true;
+        }
+    }
+    return false;
 }

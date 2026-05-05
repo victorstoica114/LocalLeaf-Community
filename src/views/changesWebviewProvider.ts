@@ -57,7 +57,6 @@ type WebviewMessage =
     | { command: 'resolveConflictRemote'; path: string }
     | { command: 'resolveConflictLocal'; path: string }
     | { command: 'confirmationResponse'; id: string; value: string }
-    | { command: 'dismissNotice'; id: string }
     | { command: 'jumpToUser'; clientId: string }
     | { command: 'toggleSyncMode' };
 
@@ -92,6 +91,7 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.options = {
             enableScripts: true,
+            enableCommandUris: true,
             localResourceRoots: [this.extensionUri],
         };
 
@@ -149,15 +149,8 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
     /**
      * Show a coalesced notice in the sidebar.
      */
-    showNotice(message: string, type: 'info' | 'warning' | 'error', autoDismissMs?: number): void {
-        const id = this.notifications.showNotice(message, type);
-        const revision = this.notifications.getState().notice?.revision;
-
-        if (autoDismissMs && autoDismissMs > 0) {
-            setTimeout(() => {
-                this.notifications.dismissNotice(id, revision);
-            }, autoDismissMs);
-        }
+    showNotice(message: string, type: 'info' | 'warning' | 'error', _autoDismissMs?: number): void {
+        this.notifications.showNotice(message, type);
     }
 
     /**
@@ -170,34 +163,37 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
 
     // ── Private ────────────────────────────────────────────────────
 
+    private runCommand(command: string, ...args: unknown[]): void {
+        void vscode.commands.executeCommand(command, ...args).then(undefined, error => {
+            this.notifications.showNotice(`Command failed: ${error}`, 'error');
+        });
+    }
+
     private handleMessage(msg: WebviewMessage): void {
         switch (msg.command) {
             case 'openFile':
-                vscode.commands.executeCommand('vscode.open', this.fileUri(msg.path));
+                this.runCommand('vscode.open', this.fileUri(msg.path));
                 break;
             case 'viewDiff':
-                vscode.commands.executeCommand('localleaf.viewDiff', msg.path);
+                this.runCommand('localleaf.viewDiff', msg.path);
                 break;
             case 'discardChange':
-                vscode.commands.executeCommand('localleaf.discardChange', msg.path);
+                this.runCommand('localleaf.discardChange', msg.path);
                 break;
             case 'resolveConflictRemote':
-                vscode.commands.executeCommand('localleaf.resolveConflictRemote', msg.path);
+                this.runCommand('localleaf.resolveConflictRemote', msg.path);
                 break;
             case 'resolveConflictLocal':
-                vscode.commands.executeCommand('localleaf.resolveConflictLocal', msg.path);
+                this.runCommand('localleaf.resolveConflictLocal', msg.path);
                 break;
             case 'confirmationResponse':
                 this.notifications.respondToModal(msg.id, msg.value);
                 break;
-            case 'dismissNotice':
-                this.notifications.dismissNotice(msg.id);
-                break;
             case 'jumpToUser':
-                vscode.commands.executeCommand('localleaf.jumpToCollaborator', msg.clientId);
+                this.runCommand('localleaf.jumpToCollaborator', msg.clientId);
                 break;
             case 'toggleSyncMode':
-                vscode.commands.executeCommand('localleaf.toggleSyncMode');
+                this.runCommand('localleaf.toggleSyncMode');
                 break;
         }
     }
@@ -259,13 +255,26 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
 <style>
 /* ── Reset ─────────────────────────────────────────── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
 body{
     font-family: var(--vscode-font-family);
     font-size: var(--vscode-font-size);
     color: var(--vscode-foreground);
     background: transparent;
     line-height: 1.4;
+    overflow: hidden;
+}
+#root{
+    height: 100vh;
+    overflow-y: auto;
     overflow-x: hidden;
+}
+.top-status-region{
+    position: sticky;
+    top: 0;
+    z-index: 15;
+    background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    box-shadow: 0 1px 0 var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
 }
 
 /* ── Status strip ──────────────────────────────────── */
@@ -274,11 +283,15 @@ body{
     font-size: 0.85em;
     color: var(--vscode-descriptionForeground);
     border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
+    border-left: 3px solid transparent;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 4px;
 }
+.status-strip.info{ border-left-color: var(--vscode-editorInfo-foreground, #3794ff); }
+.status-strip.warning{ border-left-color: var(--vscode-editorWarning-foreground, #cca700); }
+.status-strip.error{ border-left-color: var(--vscode-editorError-foreground, #f14c4c); }
 .status-left{
     flex: 1;
     min-width: 0;
@@ -475,7 +488,7 @@ body{
     flex-shrink: 0;
 }
 .change-item .actions{
-    display: none;
+    display: flex;
     gap: 2px;
     margin-left: 6px;
     flex-shrink: 0;
@@ -495,6 +508,9 @@ body{
     border-radius: 3px;
     font-size: 0.85em;
     opacity: 0.7;
+}
+.diff-btn{
+    opacity: 0.95;
 }
 .action-btn:hover{
     opacity: 1;
@@ -603,6 +619,28 @@ body{
             return el;
         }
 
+        root.addEventListener('click', event => {
+            const target = event.target.closest('[data-command]');
+            if (!target || !root.contains(target)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            vscode.postMessage({
+                command: target.dataset.command,
+                path: target.dataset.path,
+            });
+        });
+
+        root.addEventListener('keydown', event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            const target = event.target.closest('.change-item[data-command]');
+            if (!target || !root.contains(target)) return;
+            event.preventDefault();
+            vscode.postMessage({
+                command: target.dataset.command,
+                path: target.dataset.path,
+            });
+        });
+
         function changeIcon(type) {
             const map = {modified:'M', created:'+', deleted:'-', renamed:'R', moved:'V'};
             return map[type] || '?';
@@ -645,13 +683,21 @@ body{
             );
         }
 
-        function renderStatusStrip() {
+        function renderPrimaryStatusBar() {
             const isRealtime = state.syncMode === 'realtime';
             const toggleLabel = isRealtime ? 'ON' : 'OFF';
             const toggleCls = 'sync-toggle ' + (isRealtime ? 'on' : 'off');
+            const notice = state.notifications && state.notifications.notice;
+            const message = notice ? notice.message : state.statusText;
+            const count = notice && notice.count > 1 ? 'x' + notice.count : '';
+            const title = notice && notice.history && notice.history.length > 1
+                ? notice.history.join('\\n')
+                : message;
+            const statusClass = 'status-strip ' + (notice ? notice.type : 'default');
 
-            return h('div', {className:'status-strip'},
-                h('span', {className:'status-left'}, state.statusText),
+            return h('div', {className:statusClass, title},
+                h('span', {className:'status-left'}, message),
+                count ? h('span', {className:'notice-count'}, count) : null,
                 h('span', {className:'status-right'},
                     h('span', {className:'sync-mode-label'}, 'Real-time sync'),
                     h('button', {
@@ -684,21 +730,21 @@ body{
         }
 
         function renderChangeItem(item, groupType) {
-            const actions = [];
+            const actions = [
+                h('button', {className:'action-btn diff-btn', title:'View Diff', 'data-command':'viewDiff', 'data-path':item.path}, 'Diff'),
+            ];
             if (groupType === 'conflict') {
                 actions.push(
-                    h('button', {className:'action-btn', title:'View Diff', onClick:e=>{e.stopPropagation();vscode.postMessage({command:'viewDiff',path:item.path})}}, 'Diff'),
-                    h('button', {className:'action-btn', title:'Use Remote', onClick:e=>{e.stopPropagation();vscode.postMessage({command:'resolveConflictRemote',path:item.path})}}, 'Remote'),
-                    h('button', {className:'action-btn', title:'Use Local', onClick:e=>{e.stopPropagation();vscode.postMessage({command:'resolveConflictLocal',path:item.path})}}, 'Local'),
+                    h('button', {className:'action-btn', title:'Use Remote', 'data-command':'resolveConflictRemote', 'data-path':item.path}, 'Remote'),
+                    h('button', {className:'action-btn', title:'Use Local', 'data-command':'resolveConflictLocal', 'data-path':item.path}, 'Local'),
                 );
             } else {
                 actions.push(
-                    h('button', {className:'action-btn', title:'Discard', onClick:e=>{e.stopPropagation();vscode.postMessage({command:'discardChange',path:item.path})}}, 'Discard'),
+                    h('button', {className:'action-btn', title:'Discard', 'data-command':'discardChange', 'data-path':item.path}, 'Discard'),
                 );
             }
 
-            const openCmd = groupType === 'conflict' ? 'viewDiff' : 'openFile';
-            return h('div', {className:'change-item', title: item.path, onClick:()=>vscode.postMessage({command:openCmd, path:item.path})},
+            return h('div', {className:'change-item', title: item.path, role:'button', tabindex:'0', 'data-command':'viewDiff', 'data-path':item.path},
                 h('span', {className:'icon', style:'color:'+changeIconColor(item.type)}, changeIcon(item.type)),
                 h('span', {className:'name'}, fileName(item.path)),
                 h('span', {className:'desc'}, item.type),
@@ -722,19 +768,9 @@ body{
             return h('div', {className:'group'}, header, body);
         }
 
-        function renderPanelNotice() {
-            const n = state.notifications && state.notifications.notice;
-            if (!n) return null;
-            const count = n.count > 1 ? 'x' + n.count : '';
-            const title = n.history && n.history.length > 1 ? n.history.join('\\n') : n.message;
-            return h('div', {className:'notice-status-bar ' + n.type, title},
-                h('span', {className:'notice-msg'}, n.message),
-                count ? h('span', {className:'notice-count'}, count) : null,
-                h('button', {
-                    className:'notice-dismiss',
-                    title:'Dismiss',
-                    onClick:()=>vscode.postMessage({command:'dismissNotice',id:n.id}),
-                }, '\u00d7'),
+        function renderTopStatusRegion() {
+            return h('div', {className:'top-status-region'},
+                renderPrimaryStatusBar(),
             );
         }
 
@@ -742,10 +778,7 @@ body{
             if (!state) { root.innerHTML = ''; return; }
             root.innerHTML = '';
 
-            const noticeEl = renderPanelNotice();
-            if (noticeEl) root.appendChild(noticeEl);
-
-            root.appendChild(renderStatusStrip());
+            root.appendChild(renderTopStatusRegion());
 
             const usersEl = renderOnlineUsers();
             if (usersEl) root.appendChild(usersEl);

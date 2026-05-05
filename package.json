@@ -2,7 +2,7 @@
   "name": "localleaf",
   "displayName": "LocalLeaf",
   "description": "Local LaTeX Editing yet Synced to Overleaf",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "asixa",
   "repository": {
     "type": "git",
@@ -25,7 +25,8 @@
   "activationEvents": [
     "workspaceContains:.localleaf",
     "workspaceContains:**/.localleaf/settings.json",
-    "onView:localleaf.projectsView"
+    "onView:localleaf.projectsView",
+    "onView:localleaf.changesView"
   ],
   "extensionDependencies": [
     "vscode.git"

@@ -354,6 +354,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     <style>
         /* Reset */
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
 
         body {
             font-family: var(--vscode-font-family);
@@ -361,7 +362,19 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             color: var(--vscode-foreground);
             background: transparent;
             padding: 0;
+            overflow: hidden;
+        }
+        #root {
+            height: 100vh;
+            overflow-y: auto;
             overflow-x: hidden;
+        }
+        .top-status-region{
+            position: sticky;
+            top: 0;
+            z-index: 15;
+            background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+            box-shadow: 0 1px 0 var(--vscode-panel-border, var(--vscode-sideBar-border, transparent));
         }
 
         .notice-status-bar{
@@ -602,11 +615,17 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     </style>
 </head>
 <body>
-    <div id="notification-root"></div>
-    ${body}
+    <div id="root">
+        <div id="top-status-region" class="top-status-region">
+            <div id="notification-root"></div>
+        </div>
+        ${body}
+    </div>
     <script>
         const vscode = acquireVsCodeApi();
         function postMessage(msg) { vscode.postMessage(msg); }
+        const root = document.getElementById('root');
+        function renderTopStatusRegion() { return document.getElementById('top-status-region'); }
         const notificationRoot = document.getElementById('notification-root');
         let notificationState = ${initialNotificationState};
 

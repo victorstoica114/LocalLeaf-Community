@@ -15,6 +15,7 @@ import { CursorTracker, TrackedUser, getInitials } from './collaboration/cursorT
 import { setOutputChannel } from './api/socketio';
 import { DetailsProvider, ToolsProvider } from './views/sidebarProvider';
 import { ChangesWebviewProvider } from './views/changesWebviewProvider';
+import { cleanChangePath, createChangeDiffPlan, DiffSide } from './views/changeDiffPlan';
 import { ProjectsWebviewProvider, ProjectSortField } from './views/projectsWebviewProvider';
 import { PanelNotificationCenter, PanelNoticeType, PanelModalRequest } from './views/panelNotificationCenter';
 import { LatexCompiler, CompilerType, CompilationResult } from './compilation/latexCompiler';
@@ -267,7 +268,7 @@ async function showPanelModal(request: PanelModalRequest): Promise<string> {
 function showPanelNotice(
     message: string,
     type: PanelNoticeType = 'info',
-    autoDismissMs?: number,
+    _autoDismissMs?: number,
     options?: { reveal?: boolean },
 ): NoticeToken | undefined {
     if (!panelNotifications) {
@@ -279,13 +280,7 @@ function showPanelNotice(
 
     const id = panelNotifications.showNotice(message, type);
     const revision = panelNotifications.getState().notice?.revision;
-    const token = { id, revision };
-
-    if (autoDismissMs && autoDismissMs > 0) {
-        setTimeout(() => dismissPanelNotice(token), autoDismissMs);
-    }
-
-    return token;
+    return { id, revision };
 }
 
 function dismissPanelNotice(token: NoticeToken | undefined): void {
@@ -2144,40 +2139,94 @@ function cmdCancelCompilation() {
 // === Changes View Context Actions ===
 
 async function cmdViewDiff(filePath: string) {
-    if (!syncEngine || !filePath) return;
-
-    const settingsManager = SettingsManager.getCurrentInstance();
-    if (!settingsManager) return;
-
-    // Fetch remote content first
-    const remoteContent = await syncEngine.getRemoteContent(filePath);
-    if (remoteContent === undefined) {
-        changesWebviewProvider.showNotice(`Cannot fetch remote content for ${filePath}`, 'error');
+    if (!filePath) {
+        showPanelNotice('Cannot open diff: missing file path', 'error');
+        return;
+    }
+    if (!syncEngine) {
+        showPanelNotice('Cannot open diff: sync engine is not ready', 'warning');
         return;
     }
 
-    const remoteText = new TextDecoder().decode(remoteContent);
+    const settingsManager = SettingsManager.getCurrentInstance();
+    if (!settingsManager) {
+        showPanelNotice('Cannot open diff: no linked LocalLeaf project is active', 'warning');
+        return;
+    }
 
-    // Register a temporary content provider for the remote file
-    const provider = new (class implements vscode.TextDocumentContentProvider {
-        provideTextDocumentContent(): string {
-            return remoteText;
+    const localPath = cleanChangePath(filePath);
+    const tracker = syncEngine.changeTracker;
+    const localChange = tracker.getLocalChange(filePath)
+        ?? (localPath !== filePath ? tracker.getLocalChange(localPath) : undefined);
+    const remoteChange = tracker.getRemoteChange(filePath)
+        ?? (localPath !== filePath ? tracker.getRemoteChange(localPath) : undefined);
+    let remoteContent = remoteChange?.remoteContent;
+    const plan = createChangeDiffPlan({
+        localChangeType: localChange?.type,
+        remoteChangeType: remoteChange?.type,
+        hasRemoteContent: !!remoteContent,
+    });
+
+    if (plan.requiresRemoteContent) {
+        try {
+            remoteContent = await syncEngine.getRemoteContent(filePath)
+                ?? (localPath !== filePath ? await syncEngine.getRemoteContent(localPath) : undefined);
+        } catch (error) {
+            changesWebviewProvider.showNotice(`Cannot fetch remote content for ${filePath}: ${error}`, 'error');
+            return;
         }
-    })();
-    const disposable = vscode.workspace.registerTextDocumentContentProvider('localleaf-remote', provider);
+        if (remoteContent === undefined) {
+            changesWebviewProvider.showNotice(`Cannot fetch remote content for ${filePath}`, 'error');
+            return;
+        }
+    }
 
-    const localUri = settingsManager.getFilePath(filePath);
-    const remoteUri = vscode.Uri.parse(`localleaf-remote:${filePath}`);
+    const baseContent = syncEngine.getBaseContent(filePath) ?? syncEngine.getBaseContent(localPath);
+    const localUri = settingsManager.getFilePath(localPath);
+    const disposables: vscode.Disposable[] = [];
+
+    const virtualUri = (label: string, content: Uint8Array | undefined): vscode.Uri => {
+        const scheme = `localleaf-diff-${Date.now()}-${disposables.length}`;
+        const text = new TextDecoder().decode(content ?? new Uint8Array(0));
+        const provider = new (class implements vscode.TextDocumentContentProvider {
+            provideTextDocumentContent(): string {
+                return text;
+            }
+        })();
+        disposables.push(vscode.workspace.registerTextDocumentContentProvider(scheme, provider));
+        return vscode.Uri.parse(`${scheme}:/${encodeURIComponent(label)}`);
+    };
+
+    const sideUri = (side: DiffSide): vscode.Uri => {
+        switch (side) {
+            case 'base':
+                return virtualUri(`${filePath} (base)`, baseContent);
+            case 'local':
+                return localUri;
+            case 'remote':
+                return virtualUri(`${filePath} (remote)`, remoteContent);
+            case 'empty':
+                return virtualUri(`${filePath} (empty)`, undefined);
+        }
+    };
+
+    const title = `${localPath || filePath} (${plan.titleKind})`;
 
     try {
         await vscode.commands.executeCommand('vscode.diff',
-            localUri,
-            remoteUri,
-            `${filePath} (Local ↔ Remote)`
+            sideUri(plan.left),
+            sideUri(plan.right),
+            title
         );
+    } catch (error) {
+        changesWebviewProvider.showNotice(`Cannot open diff for ${localPath || filePath}: ${error}`, 'error');
     } finally {
-        // Keep provider alive while diff is open
-        setTimeout(() => disposable.dispose(), 60000);
+        // Keep providers alive while diff editors resolve their content.
+        setTimeout(() => {
+            for (const disposable of disposables) {
+                disposable.dispose();
+            }
+        }, 60000);
     }
 }
 
