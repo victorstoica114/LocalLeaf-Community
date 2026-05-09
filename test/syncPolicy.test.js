@@ -8,6 +8,7 @@ const {
   shouldTrackLocalModification,
   shouldPushAfterManualPull,
   getManualSyncCompletionState,
+  getLocalCreateChangeType,
   getRestoredLocalChangeType,
 } = require('../out/sync/syncPolicy');
 
@@ -125,6 +126,28 @@ test('manual local modification is tracked when current content differs from bas
     currentContent: Buffer.from('changed'),
     baseContent: Buffer.from('same'),
   }), true);
+});
+
+test('manual create events for known remote files are restored as modifications', () => {
+  assert.equal(getLocalCreateChangeType({
+    hasRemoteEntry: true,
+    hasBaseContent: false,
+    currentContent: Buffer.from('remote plus local edit'),
+    remoteContent: Buffer.from('remote'),
+  }), 'modified');
+
+  assert.equal(getLocalCreateChangeType({
+    hasRemoteEntry: true,
+    hasBaseContent: false,
+    currentContent: Buffer.from('remote'),
+    remoteContent: Buffer.from('remote'),
+  }), undefined);
+
+  assert.equal(getLocalCreateChangeType({
+    hasRemoteEntry: false,
+    hasBaseContent: false,
+    currentContent: Buffer.from('new local file'),
+  }), 'created');
 });
 
 test('manual startup restores local changes from persisted baseline state', () => {

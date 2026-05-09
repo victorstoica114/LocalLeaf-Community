@@ -64,6 +64,13 @@ test('manual startup restores local change rows from disk after skipping auto-pu
   assert.match(extension, /shouldAutoPull && !\(syncMode === 'manual' && restoredLocalCount > 0\)/);
 });
 
+test('startup auto-pull runs in the background instead of blocking activation', () => {
+  const extension = fs.readFileSync(path.join(root, 'src/extension.ts'), 'utf8');
+
+  assert.match(extension, /void syncEngine\.pullAll\(\)[\s\S]*log\('Auto-pull complete'\)/);
+  assert.doesNotMatch(extension, /await syncEngine\.pullAll\(\);\n\s*log\('Auto-pull complete'\)/);
+});
+
 test('ignore file changes reload patterns and prune pending changes before sidebar state', () => {
   const syncEngine = fs.readFileSync(path.join(root, 'src/sync/syncEngine.ts'), 'utf8');
 
@@ -74,6 +81,31 @@ test('ignore file changes reload patterns and prune pending changes before sideb
   assert.match(syncEngine, /private async reloadIgnorePatternsAndPruneChanges\(\): Promise<void> \{[\s\S]*await this\.ignoreParser\.load\(\)[\s\S]*this\.pruneIgnoredTrackedChanges\(\)/);
   assert.match(syncEngine, /private pruneIgnoredTrackedChanges\(\): number \{[\s\S]*this\._changeTracker\.getLocalChanges\(\)[\s\S]*!this\.shouldSync\(change\.path\)[\s\S]*this\._changeTracker\.clearLocal\(change\.path\)/);
   assert.match(syncEngine, /this\._changeTracker\.getRemoteChanges\(\)[\s\S]*!this\.shouldSync\(change\.path\)[\s\S]*this\._changeTracker\.clearRemote\(change\.path\)/);
+});
+
+test('manual push asks for force when Overleaf reports file already exists', () => {
+  const syncEngine = fs.readFileSync(path.join(root, 'src/sync/syncEngine.ts'), 'utf8');
+
+  assert.match(syncEngine, /function isFileAlreadyExistsError\(error: unknown\): boolean/);
+  assert.match(syncEngine, /isFileAlreadyExistsError\(error\)[\s\S]*Force Push/);
+  assert.match(syncEngine, /await this\.refreshProjectFileTree\(\)/);
+  assert.match(syncEngine, /await this\.pushChanges\(\{ \.\.\.options, force: true, fileExistsRetry: true \}\)/);
+  assert.match(syncEngine, /private async forcePushCreatedChange\(/);
+  assert.match(syncEngine, /if \(options\?\.force && existingRemoteEntry\) \{[\s\S]*await this\.forcePushCreatedChange/);
+});
+
+test('manual pull confirms cloud overwrite and applies remote as authoritative', () => {
+  const extension = fs.readFileSync(path.join(root, 'src/extension.ts'), 'utf8');
+  const syncEngine = fs.readFileSync(path.join(root, 'src/sync/syncEngine.ts'), 'utf8');
+
+  assert.match(extension, /Pull from Overleaf will overwrite local unpushed changes/);
+  assert.match(extension, /await syncEngine!\.pullAll\(\{ remoteWins \}\)/);
+
+  assert.match(syncEngine, /interface PullAllOptions \{[\s\S]*remoteWins\?: boolean/);
+  assert.match(syncEngine, /async pullAll\(options: PullAllOptions = \{\}\): Promise<void>/);
+  assert.match(syncEngine, /if \(options\.remoteWins\) \{[\s\S]*this\._changeTracker\.clearLocal\(entry\.path\)/);
+  assert.match(syncEngine, /if \(hasConflict && !options\.remoteWins\) \{[\s\S]*this\.tryAutoMergeTextConflict/);
+  assert.match(syncEngine, /if \(options\.remoteWins\) \{[\s\S]*vscode\.workspace\.fs\.delete\(localUri, \{ recursive: true/);
 });
 
 test('clicking a change row opens a diff instead of the plain local file', () => {
@@ -109,13 +141,27 @@ test('change rows do not render trailing change type labels', () => {
   assert.doesNotMatch(changesProvider, /h\('span', \{className:'desc'\}, item\.type\)/);
 });
 
-test('local changes expose discard from the row context menu instead of inline actions', () => {
+test('local changes expose revert actions from row context menu and group header', () => {
   const changesProvider = fs.readFileSync(path.join(root, 'src/views/changesWebviewProvider.ts'), 'utf8');
+  const extension = fs.readFileSync(path.join(root, 'src/extension.ts'), 'utf8');
+  const syncEngine = fs.readFileSync(path.join(root, 'src/sync/syncEngine.ts'), 'utf8');
 
   assert.match(changesProvider, /root\.addEventListener\('contextmenu'/);
   assert.match(changesProvider, /\.change-item\[data-group="local"\]/);
   assert.match(changesProvider, /showChangeContextMenu\(event\.clientX,\s*event\.clientY,\s*item\.dataset\.path\)/);
+  assert.match(changesProvider, /Revert Change/);
+  assert.match(changesProvider, /Revert All/);
+  assert.match(changesProvider, /command:'discardAllLocalChanges'[\s\S]*paths:items\.map\(item => item\.path\)/);
   assert.doesNotMatch(changesProvider, /title:'Discard', 'data-command':'discardChange'/);
+
+  assert.match(extension, /COMMANDS\.DISCARD_ALL_LOCAL_CHANGES/);
+  assert.match(extension, /await syncEngine\.revertLocalChange\(filePath\)/);
+  assert.match(extension, /await syncEngine\.revertLocalChanges\(targetPaths\)/);
+
+  assert.match(syncEngine, /async revertLocalChange\(relativePath: string\): Promise<boolean>/);
+  assert.match(syncEngine, /case 'created':[\s\S]*vscode\.workspace\.fs\.delete\(localUri, \{ recursive: true/);
+  assert.match(syncEngine, /case 'modified':[\s\S]*case 'deleted':[\s\S]*vscode\.workspace\.fs\.writeFile\(localUri, baseContent\)/);
+  assert.match(syncEngine, /async revertLocalChanges\(paths: string\[\]\): Promise<number>/);
 });
 
 test('main webview owns changes tools and details tab content', () => {
@@ -220,4 +266,17 @@ test('pdf viewer uses continuous anchored wheel zoom for mac trackpad gestures',
   assert.match(pdfViewer, /function captureZoomAnchor\(clientX, clientY\)/);
   assert.match(pdfViewer, /restoreZoomAnchor\(anchor, oldZoom, newZoom\)/);
   assert.match(pdfViewer, /viewerContainer\.scrollLeft/);
+});
+
+test('pdf viewer preserves viewport anchor when compiled PDF updates', () => {
+  const pdfViewer = fs.readFileSync(path.join(root, 'media/pdfViewer.js'), 'utf8');
+
+  assert.match(pdfViewer, /function capturePdfViewAnchor\(\)/);
+  assert.match(pdfViewer, /function restorePdfViewAnchor\(anchor\)/);
+  assert.match(pdfViewer, /let pendingRenderAnchor = null/);
+  assert.match(pdfViewer, /async function openPdfData\(data, restoreAnchor\)/);
+  assert.match(pdfViewer, /await renderAllPages\(restoreAnchor\)/);
+  assert.match(pdfViewer, /var anchor = capturePdfViewAnchor\(\);[\s\S]*await openPdfData\(bytes\.buffer, anchor\)/);
+  assert.match(pdfViewer, /restorePdfViewAnchor\(restoreAnchor\)/);
+  assert.doesNotMatch(pdfViewer, /viewerContainer\.scrollTop = scrollPosition/);
 });

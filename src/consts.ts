@@ -91,4 +91,5 @@ export const COMMANDS = {
     RESOLVE_CONFLICT_LOCAL: 'localleaf.resolveConflictLocal',
     VIEW_DIFF: 'localleaf.viewDiff',
     DISCARD_CHANGE: 'localleaf.discardChange',
+    DISCARD_ALL_LOCAL_CHANGES: 'localleaf.discardAllLocalChanges',
 } as const;

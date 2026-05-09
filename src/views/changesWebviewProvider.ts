@@ -63,6 +63,7 @@ type WebviewMessage =
     | { command: 'openFile'; path: string }
     | { command: 'viewDiff'; path: string }
     | { command: 'discardChange'; path: string }
+    | { command: 'discardAllLocalChanges'; paths: string[] }
     | { command: 'resolveConflictRemote'; path: string }
     | { command: 'resolveConflictLocal'; path: string }
     | { command: 'confirmationResponse'; id: string; value: string }
@@ -195,6 +196,9 @@ export class ChangesWebviewProvider implements vscode.WebviewViewProvider {
                 break;
             case 'discardChange':
                 this.runCommand('localleaf.discardChange', msg.path);
+                break;
+            case 'discardAllLocalChanges':
+                this.runCommand(COMMANDS.DISCARD_ALL_LOCAL_CHANGES, msg.paths);
                 break;
             case 'resolveConflictRemote':
                 this.runCommand('localleaf.resolveConflictRemote', msg.path);
@@ -632,6 +636,29 @@ body{
     font-size: 0.9em;
     transition: transform 0.15s;
 }
+.group-label{
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.group-action{
+    border: 0;
+    border-radius: 3px;
+    padding: 2px 5px;
+    color: var(--vscode-foreground);
+    background: transparent;
+    font: inherit;
+    font-size: 0.9em;
+    text-transform: none;
+    letter-spacing: 0;
+    cursor: pointer;
+    opacity: 0.75;
+}
+.group-action:hover{
+    opacity: 1;
+    background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,.31));
+}
 .group-header.collapsed .chevron{
     transform: rotate(-90deg);
 }
@@ -868,12 +895,12 @@ body{
             hideChangeContextMenu();
             contextMenu = h('div', {className:'context-menu'},
                 h('button', {
-                    title:'Discard local change',
+                    title:'Revert local change',
                     onClick: () => {
                         hideChangeContextMenu();
                         vscode.postMessage({command:'discardChange', path:itemPath});
                     },
-                }, 'Discard'),
+                }, 'Revert Change'),
             );
             document.body.appendChild(contextMenu);
             const rect = contextMenu.getBoundingClientRect();
@@ -990,12 +1017,24 @@ body{
         function renderGroup(id, label, icon, items, groupType) {
             if (items.length === 0) return null;
             const isCollapsed = !!collapsedGroups[id];
+            const localGroupAction = groupType === 'local'
+                ? h('button', {
+                    className:'group-action',
+                    title:'Revert all local changes in this group',
+                    onClick: event => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        vscode.postMessage({command:'discardAllLocalChanges', paths:items.map(item => item.path)});
+                    },
+                }, 'Revert All')
+                : null;
             const header = h('div', {
                 className: 'group-header' + (isCollapsed ? ' collapsed' : ''),
                 onClick: () => { collapsedGroups[id] = !collapsedGroups[id]; render(); },
             },
                 h('span', {className:'chevron'}, isCollapsed ? '\u25B8' : '\u25BE'),
-                icon + ' ' + label + ' (' + items.length + ')',
+                h('span', {className:'group-label'}, icon + ' ' + label + ' (' + items.length + ')'),
+                localGroupAction,
             );
             const body = h('div', {className: 'group-body' + (isCollapsed ? ' hidden' : '')},
                 ...items.map(it => renderChangeItem(it, groupType)),

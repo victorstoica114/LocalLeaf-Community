@@ -8,9 +8,10 @@ import { BaseAPI, ProjectEntity, FileEntity, FolderEntity } from '../api/base';
 import { SocketIOAPI, DocumentUpdate } from '../api/socketio';
 import { SettingsManager } from '../utils/settingsManager';
 import { IgnoreParser, createIgnoreWatcher } from './ignoreParser';
-import { ChangeTracker, SyncMode } from './changeTracker';
+import { ChangeTracker, SyncMode, PendingChange } from './changeTracker';
 import { BaselineReplacement, SyncBaselineStore } from './syncBaseline';
 import {
+    getLocalCreateChangeType,
     getManualSyncCompletionState,
     getRestoredLocalChangeType,
     shouldTrackLocalDelete,
@@ -89,6 +90,12 @@ function isFileNotFoundError(error: unknown): boolean {
     return false;
 }
 
+function isFileAlreadyExistsError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
+    return normalized.includes('400') && normalized.includes('file already exists');
+}
+
 /**
  * Compare two Uint8Arrays for equality
  */
@@ -139,6 +146,16 @@ interface LineEdit {
     start: number;
     end: number;
     newLines: string[];
+}
+
+interface PushChangesOptions {
+    force?: boolean;
+    paths?: string[];
+    fileExistsRetry?: boolean;
+}
+
+interface PullAllOptions {
+    remoteWins?: boolean;
 }
 
 /**
@@ -352,6 +369,10 @@ export class SyncEngine {
         return content ? new Uint8Array(content) : undefined;
     }
 
+    private getParentUri(uri: vscode.Uri): vscode.Uri {
+        return vscode.Uri.joinPath(uri, '..');
+    }
+
     /**
      * Set status and emit event
      */
@@ -554,6 +575,39 @@ export class SyncEngine {
             this.fileTree.set(id, entry);
             this.fileTreeByPath.set(entry.path, entry);
         }
+    }
+
+    private async refreshProjectFileTree(): Promise<void> {
+        const projectSettings = this.settings.getSettings();
+        if (!projectSettings) {
+            throw new Error('Project not configured');
+        }
+
+        const projectResult = await this.api.getProjectDetails(projectSettings.projectId);
+        if (projectResult.type === 'success' && projectResult.projectData) {
+            const projectData = projectResult.projectData;
+            if (projectData.rootFolder && projectData.rootFolder.length > 0) {
+                this.project = {
+                    _id: projectData.projectId,
+                    name: projectData.projectName || projectSettings.projectName || 'Unknown',
+                    rootDoc_id: projectData.rootDocId,
+                    rootFolder: projectData.rootFolder,
+                    compiler: projectData.compiler,
+                    owner: { _id: projectData.userId || '', email: projectData.userEmail || '', first_name: 'Unknown' },
+                    members: [],
+                };
+                this.buildFileTree(this.project);
+                return;
+            }
+        }
+
+        if (this.socket) {
+            this.project = await this.socket.joinProject();
+            this.buildFileTree(this.project);
+            return;
+        }
+
+        throw new Error(projectResult.message || 'Failed to refresh Overleaf file tree');
     }
 
     /**
@@ -1505,16 +1559,64 @@ export class SyncEngine {
         const relativePath = this.getRelativePath(uri);
         if (!this.shouldSync(relativePath)) return;
 
+        // Suppress echo from remote-initiated saves that surface as creates.
+        if (this._remoteUpdatingPaths.has(relativePath)) return;
+
         // Suppress echo from pull operations writing files to disk
         if (this._isPulling) return;
 
         // Manual mode: record change instead of pushing immediately
         if (this._syncMode === 'manual') {
+            let stat: vscode.FileStat;
+            try {
+                stat = await vscode.workspace.fs.stat(uri);
+            } catch (statError) {
+                if (isFileNotFoundError(statError)) {
+                    debugLog(`File no longer exists (race condition): ${relativePath}`);
+                    return;
+                }
+                throw statError;
+            }
+
+            const remotePath = stat.type === vscode.FileType.Directory
+                ? (relativePath.endsWith('/') ? relativePath : relativePath + '/')
+                : relativePath;
+            const entry = this.fileTreeByPath.get(remotePath);
+            const base = this.baseContent.get(remotePath);
+            let currentContent: Uint8Array | undefined;
+            let remoteContent: Uint8Array | undefined;
+
+            if (stat.type !== vscode.FileType.Directory) {
+                currentContent = await vscode.workspace.fs.readFile(uri);
+                if (!base && entry) {
+                    remoteContent = await this.getRemoteContent(remotePath);
+                }
+            } else {
+                currentContent = new Uint8Array(0);
+            }
+
+            const type = getLocalCreateChangeType({
+                hasRemoteEntry: !!entry,
+                hasBaseContent: !!base,
+                currentContent,
+                baseContent: base,
+                remoteContent,
+            });
+            if (!type) {
+                this._changeTracker.clearLocal(remotePath);
+                if (currentContent) {
+                    this.fileCache.set(remotePath, { hash: hashContent(currentContent), timestamp: Date.now() });
+                }
+                return;
+            }
+
             this._changeTracker.addLocalChange({
-                path: relativePath,
-                type: 'created',
+                path: type === 'modified' ? remotePath : relativePath,
+                type,
                 source: 'local',
                 timestamp: Date.now(),
+                entityId: entry?.id,
+                entityType: entry?.type,
             });
             return;
         }
@@ -2852,20 +2954,94 @@ export class SyncEngine {
 
         this.setStatus('pushing', `Uploading ${relativePath}`, relativePath);
 
+        await this.createRemoteFileFromLocalContent(projectSettings.projectId, parentId, relativePath, name, content, isTextFile);
+    }
+
+    private assertApiSuccess(result: { type: 'success' | 'error'; message?: string }, fallbackMessage: string): void {
+        if (result.type !== 'success') {
+            throw new Error(result.message || fallbackMessage);
+        }
+    }
+
+    private async createRemoteFileFromLocalContent(
+        projectId: string,
+        parentId: string,
+        relativePath: string,
+        name: string,
+        content: Uint8Array,
+        isTextFile: boolean = this.isTextFile(name),
+    ): Promise<void> {
         if (isTextFile && this.socket) {
-            await this.createTextDocWithContent(projectSettings.projectId, parentId, relativePath, name, content);
+            await this.createTextDocWithContent(projectId, parentId, relativePath, name, content);
         } else {
-            await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
+            const result = await this.api.uploadFile(projectId, parentId, name, content);
+            this.assertApiSuccess(result, `Failed to upload ${relativePath}`);
         }
 
         this.setBaseContent(relativePath, content);
         this.fileCache.set(relativePath, { hash: hashContent(content), timestamp: Date.now() });
     }
 
+    private async forcePushCreatedChange(
+        change: PendingChange,
+        existingRemoteEntry: FileTreeEntry,
+        localUri: vscode.Uri,
+        stat: vscode.FileStat,
+        projectId: string,
+    ): Promise<void> {
+        const name = change.path.split('/').pop()!;
+
+        if (stat.type === vscode.FileType.Directory) {
+            const folderPath = change.path.endsWith('/') ? change.path : change.path + '/';
+            if (existingRemoteEntry.type !== 'folder') {
+                const deleteResult = await this.api.deleteEntity(projectId, existingRemoteEntry.type, existingRemoteEntry.id);
+                this.assertApiSuccess(deleteResult, `Failed to replace existing remote ${change.path}`);
+                this.removePathTracking(existingRemoteEntry.path, false);
+
+                const parentId = await this.ensureParentFoldersExist(change.path);
+                const createResult = await this.api.addFolder(projectId, parentId, name);
+                this.assertApiSuccess(createResult, `Failed to create folder ${folderPath}`);
+                if (!createResult.folder) {
+                    throw new Error(`Created folder but could not resolve folder id for ${folderPath}`);
+                }
+
+                const folderEntry: FileTreeEntry = {
+                    id: createResult.folder._id,
+                    type: 'folder',
+                    name,
+                    path: folderPath,
+                    parentId,
+                };
+                this.fileTree.set(createResult.folder._id, folderEntry);
+                this.fileTreeByPath.set(folderPath, folderEntry);
+            }
+
+            this.setBaseContent(folderPath, new Uint8Array(0));
+            return;
+        }
+
+        const content = await vscode.workspace.fs.readFile(localUri);
+        const isTextFile = this.isTextFile(name);
+
+        if (existingRemoteEntry.type === 'doc' && isTextFile) {
+            await this.pushDocumentChanges(existingRemoteEntry.id, change.path, content);
+            this.setBaseContent(change.path, content);
+            this.fileCache.set(change.path, { hash: hashContent(content), timestamp: Date.now() });
+            return;
+        }
+
+        const deleteResult = await this.api.deleteEntity(projectId, existingRemoteEntry.type, existingRemoteEntry.id);
+        this.assertApiSuccess(deleteResult, `Failed to replace existing remote ${change.path}`);
+        this.removePathTracking(existingRemoteEntry.path, existingRemoteEntry.type === 'folder');
+
+        const parentId = await this.ensureParentFoldersExist(change.path);
+        await this.createRemoteFileFromLocalContent(projectId, parentId, change.path, name, content, isTextFile);
+    }
+
     /**
      * Perform full sync (pull all files)
      */
-    async pullAll(): Promise<void> {
+    async pullAll(options: PullAllOptions = {}): Promise<void> {
         if (!this.project) {
             throw new Error('Not connected');
         }
@@ -2897,6 +3073,10 @@ export class SyncEngine {
                     await vscode.workspace.fs.createDirectory(localUri);
                     // Track folders in baseContent with empty content
                     this.setBaseContent(entry.path, new Uint8Array(0));
+                    if (options.remoteWins) {
+                        this._changeTracker.clearLocal(entry.path);
+                        this._changeTracker.clearRemote(entry.path);
+                    }
                     return;
                 }
 
@@ -2933,7 +3113,7 @@ export class SyncEngine {
                 // Check for conflicts or new remote files
                 if (exists) {
                     const hasConflict = await this.hasConflict(localUri, remoteContent);
-                    if (hasConflict) {
+                    if (hasConflict && !options.remoteWins) {
                         // Try non-overlapping auto-merge for text docs in manual mode.
                         if (this._syncMode === 'manual' && entry.type === 'doc') {
                             let localContent: Uint8Array | undefined;
@@ -3029,6 +3209,10 @@ export class SyncEngine {
                     // Content is the same, just update cache
                     this.setBaseContent(entry.path, remoteContent);
                     this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                    if (options.remoteWins) {
+                        this._changeTracker.clearLocal(entry.path);
+                        this._changeTracker.clearRemote(entry.path);
+                    }
                     return;
                 }
 
@@ -3036,6 +3220,10 @@ export class SyncEngine {
                 await vscode.workspace.fs.writeFile(localUri, remoteContent);
                 this.setBaseContent(entry.path, remoteContent);
                 this.fileCache.set(entry.path, { hash: hashContent(remoteContent), timestamp: Date.now() });
+                if (options.remoteWins) {
+                    this._changeTracker.clearLocal(entry.path);
+                    this._changeTracker.clearRemote(entry.path);
+                }
                 downloadedCount++;
             };
 
@@ -3061,7 +3249,24 @@ export class SyncEngine {
                 }
             }
             if (orphanedPaths.length > 0) {
-                await this.handleOrphanedLocalFiles(orphanedPaths);
+                if (options.remoteWins) {
+                    for (const syncedPath of orphanedPaths) {
+                        const localUri = this.settings.getFilePath(syncedPath);
+                        try {
+                            await vscode.workspace.fs.delete(localUri, { recursive: true, useTrash: false });
+                        } catch (error) {
+                            if (!isFileNotFoundError(error)) {
+                                throw error;
+                            }
+                        }
+                        this.deleteBaseContent(syncedPath);
+                        this.fileCache.delete(syncedPath);
+                        this._changeTracker.clearLocal(syncedPath);
+                        this._changeTracker.clearRemote(syncedPath);
+                    }
+                } else {
+                    await this.handleOrphanedLocalFiles(orphanedPaths);
+                }
             }
 
             // Detect local-only files (exist locally but not on Overleaf or in baseContent)
@@ -3413,7 +3618,7 @@ export class SyncEngine {
     /**
      * Push buffered local changes in manual mode.
      */
-    async pushChanges(options?: { force?: boolean; paths?: string[] }): Promise<void> {
+    async pushChanges(options?: PushChangesOptions): Promise<void> {
         if (!this.project) {
             throw new Error('Not connected');
         }
@@ -3514,11 +3719,24 @@ export class SyncEngine {
                         }
 
                         this.setStatus('pushing', `Creating ${change.path}`, change.path);
-                        const parentId = await this.ensureParentFoldersExist(change.path);
                         const name = change.path.split('/').pop()!;
+                        const remotePath = stat.type === vscode.FileType.Directory
+                            ? (change.path.endsWith('/') ? change.path : change.path + '/')
+                            : change.path;
+                        const existingRemoteEntry = this.fileTreeByPath.get(remotePath);
+
+                        if (options?.force && existingRemoteEntry) {
+                            await this.forcePushCreatedChange(change, existingRemoteEntry, localUri, stat, projectSettings.projectId);
+                            pushedCount++;
+                            clearProcessedChange = true;
+                            break;
+                        }
+
+                        const parentId = await this.ensureParentFoldersExist(change.path);
 
                         if (stat.type === vscode.FileType.Directory) {
                             const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
+                            this.assertApiSuccess(result, `Failed to create folder ${change.path}`);
                             if (result.type === 'success' && result.folder) {
                                 const folderPath = change.path + '/';
                                 const folderEntry: FileTreeEntry = {
@@ -3536,20 +3754,14 @@ export class SyncEngine {
                             const content = await vscode.workspace.fs.readFile(localUri);
                             const isTextFile = this.isTextFile(name);
 
-                            if (isTextFile && this.socket) {
-                                await this.createTextDocWithContent(
-                                    projectSettings.projectId,
-                                    parentId,
-                                    change.path,
-                                    name,
-                                    content
-                                );
-                            } else {
-                                await this.api.uploadFile(projectSettings.projectId, parentId, name, content);
-                            }
-
-                            this.setBaseContent(change.path, content);
-                            this.fileCache.set(change.path, { hash: hashContent(content), timestamp: Date.now() });
+                            await this.createRemoteFileFromLocalContent(
+                                projectSettings.projectId,
+                                parentId,
+                                change.path,
+                                name,
+                                content,
+                                isTextFile
+                            );
                         }
                         pushedCount++;
                         clearProcessedChange = true;
@@ -3595,6 +3807,28 @@ export class SyncEngine {
             this.log(message);
             this.setStatus('idle', message);
         } catch (error) {
+            if (isFileAlreadyExistsError(error) && !options?.fileExistsRetry) {
+                const choice = options?.force
+                    ? 'force'
+                    : await this.showModalChoice({
+                        message: `Overleaf reports that a file already exists while pushing. Force push will refresh the remote tree and overwrite the existing remote file with your local copy.\n\n${error}`,
+                        type: 'warning',
+                        buttons: [
+                            { label: 'Force Push', value: 'force', danger: true },
+                            { label: 'Cancel', value: 'cancel' },
+                        ],
+                    });
+
+                if (choice === 'force') {
+                    await this.refreshProjectFileTree();
+                    await this.pushChanges({ ...options, force: true, fileExistsRetry: true });
+                    return;
+                }
+
+                this.setStatus('idle', 'Push canceled');
+                return;
+            }
+
             const authErr = isAuthError(error);
             this.setStatus('error', authErr ? 'Session expired' : `Push failed: ${error}`, undefined, authErr);
             throw error;
@@ -3699,6 +3933,86 @@ export class SyncEngine {
         } finally {
             this._isPulling = false;
         }
+    }
+
+    /**
+     * Revert one pending local change back to the last synced baseline.
+     */
+    async revertLocalChange(relativePath: string): Promise<boolean> {
+        const change = this._changeTracker.getLocalChange(relativePath);
+        if (!change) {
+            return false;
+        }
+
+        const localUri = this.settings.getFilePath(change.path);
+        const isFolder = change.entityType === 'folder' || change.path.endsWith('/');
+        const wasPulling = this._isPulling;
+        this._isPulling = true;
+
+        try {
+            switch (change.type) {
+                case 'created':
+                    try {
+                        await vscode.workspace.fs.delete(localUri, { recursive: true, useTrash: false });
+                    } catch (error) {
+                        if (!isFileNotFoundError(error)) {
+                            throw error;
+                        }
+                    }
+                    this.fileCache.delete(change.path);
+                    break;
+
+                case 'modified':
+                case 'deleted': {
+                    const baseContent = this.baseContent.get(change.path);
+                    if (!baseContent) {
+                        throw new Error(`Cannot revert ${change.path}: no synced baseline is available`);
+                    }
+
+                    if (isFolder) {
+                        await vscode.workspace.fs.createDirectory(localUri);
+                    } else {
+                        await vscode.workspace.fs.createDirectory(this.getParentUri(localUri));
+                        await vscode.workspace.fs.writeFile(localUri, baseContent);
+                    }
+                    this.fileCache.set(change.path, { hash: hashContent(baseContent), timestamp: Date.now() });
+                    break;
+                }
+
+                default:
+                    throw new Error(`Cannot revert unsupported local change type "${change.type}" for ${change.path}`);
+            }
+
+            this._changeTracker.clearLocal(change.path);
+            await this.updateLastSyncedIfFullySynced();
+            return true;
+        } finally {
+            this._isPulling = wasPulling;
+        }
+    }
+
+    /**
+     * Revert multiple pending local changes.
+     */
+    async revertLocalChanges(paths: string[]): Promise<number> {
+        let revertedCount = 0;
+        const errors: string[] = [];
+
+        for (const path of paths) {
+            try {
+                if (await this.revertLocalChange(path)) {
+                    revertedCount++;
+                }
+            } catch (error) {
+                errors.push(`${path}: ${error}`);
+            }
+        }
+
+        if (errors.length > 0) {
+            throw new Error(errors.join('\n'));
+        }
+
+        return revertedCount;
     }
 
     /**

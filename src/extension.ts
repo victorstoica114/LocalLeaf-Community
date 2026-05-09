@@ -218,6 +218,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.DISCARD_CHANGE, (path: string) => cmdDiscardChange(path)),
         vscode.commands.registerCommand(COMMANDS.RESOLVE_CONFLICT_REMOTE, (path: string) => cmdResolveConflict(path, 'remote')),
         vscode.commands.registerCommand(COMMANDS.RESOLVE_CONFLICT_LOCAL, (path: string) => cmdResolveConflict(path, 'local')),
+        vscode.commands.registerCommand(COMMANDS.DISCARD_ALL_LOCAL_CHANGES, (paths?: string[]) => cmdDiscardAllLocalChanges(paths)),
     );
 }
 
@@ -373,8 +374,15 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
                 log(isFirstSync
                     ? 'First sync — downloading project files...'
                     : 'Auto-pulling files from Overleaf (realtime mode)...');
-                await syncEngine.pullAll();
-                log('Auto-pull complete');
+                void syncEngine.pullAll()
+                    .then(() => {
+                        log('Auto-pull complete');
+                        changesWebviewProvider.showNotice('Auto-pull complete', 'info', 4000);
+                    })
+                    .catch(error => {
+                        log(`Startup auto-pull failed: ${error}`);
+                        changesWebviewProvider.showNotice(`Startup auto-pull failed: ${error}`, 'error');
+                    });
             } else {
                 log(syncMode === 'manual' && restoredLocalCount > 0
                     ? 'Manual mode — restored pending local changes; skipping auto-pull'
@@ -1332,10 +1340,25 @@ async function pullFromOverleafInternal() {
     }
 
     try {
+        const remoteWins = syncEngine.syncMode === 'manual';
+        if (remoteWins) {
+            const choice = await showPanelModal({
+                message: 'Pull from Overleaf will overwrite local unpushed changes with the cloud version. Local-only new files will remain as local changes. Continue?',
+                type: 'warning',
+                buttons: [
+                    { label: 'Pull from Overleaf', value: 'pull', danger: true },
+                    { label: 'Cancel', value: 'cancel' },
+                ],
+            });
+            if (choice !== 'pull') {
+                changesWebviewProvider.showNotice('Pull canceled', 'info', 4000);
+                return;
+            }
+        }
+
         // Always use pullAll for full reconciliation.
-        // In manual mode, conflicts are auto-skipped and recorded
-        // in the change tracker (no blocking popups).
-        await syncEngine!.pullAll();
+        // Manual user-initiated pull treats Overleaf as authoritative after confirmation.
+        await syncEngine!.pullAll({ remoteWins });
         if (syncEngine.syncMode === 'manual') {
             const completion = getManualSyncCompletionState(getPendingSyncCounts(syncEngine));
             if (!completion.canComplete) {
@@ -2262,15 +2285,48 @@ async function cmdResolveConflict(filePath: string, resolution: 'remote' | 'loca
 async function cmdDiscardChange(filePath: string) {
     if (!syncEngine || !filePath) return;
 
-    const tracker = syncEngine.changeTracker;
-    const hasLocal = tracker.hasLocalChange(filePath);
-    const hasRemote = tracker.hasRemoteChange(filePath);
-
-    if (hasLocal) {
-        tracker.clearLocal(filePath);
+    try {
+        const reverted = await syncEngine.revertLocalChange(filePath);
+        if (reverted) {
+            changesWebviewProvider.showNotice(`Reverted local change "${filePath}"`, 'info', 4000);
+        }
+    } catch (error) {
+        changesWebviewProvider.showNotice(`Failed to revert "${filePath}": ${error}`, 'error');
     }
-    if (hasRemote) {
-        tracker.clearRemote(filePath);
+}
+
+async function cmdDiscardAllLocalChanges(paths?: string[]) {
+    if (!syncEngine) return;
+
+    const tracker = syncEngine.changeTracker;
+    const targetPaths = paths && paths.length > 0
+        ? paths
+        : tracker.getLocalChanges()
+            .filter(change => !tracker.hasRemoteChange(change.path))
+            .map(change => change.path);
+
+    if (targetPaths.length === 0) {
+        return;
+    }
+
+    const choice = await showPanelModal({
+        message: `Revert ${targetPaths.length} local change${targetPaths.length === 1 ? '' : 's'}? This will modify files on disk back to the last synced version.`,
+        type: 'warning',
+        buttons: [
+            { label: 'Revert All', value: 'revert', danger: true },
+            { label: 'Cancel', value: 'cancel' },
+        ],
+    });
+
+    if (choice !== 'revert') {
+        return;
+    }
+
+    try {
+        const revertedCount = await syncEngine.revertLocalChanges(targetPaths);
+        changesWebviewProvider.showNotice(`Reverted ${revertedCount} local change${revertedCount === 1 ? '' : 's'}`, 'info', 4000);
+    } catch (error) {
+        changesWebviewProvider.showNotice(`Failed to revert all local changes: ${error}`, 'error');
     }
 }
 

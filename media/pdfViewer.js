@@ -12,7 +12,8 @@ let totalPages = 0;
 let zoomLevel = 1.0;
 let rendering = false;
 let pendingRender = false;
-let scrollPosition = 0;
+let pendingRenderAnchor = null;
+let renderGeneration = 0;
 let zoomDebounceTimer = null;
 let renderedZoom = 1.0;
 
@@ -32,14 +33,14 @@ function initViewer(url) {
 
 async function loadPdf(url) {
     try {
-        scrollPosition = viewerContainer.scrollTop;
+        var anchor = capturePdfViewAnchor();
 
         // Fetch raw bytes with cache: 'no-store' to bypass browser / webview
         // resource-server caching, then hand the ArrayBuffer to pdf.js.
         var resp = await fetch(url, { cache: 'no-store' });
         var data = await resp.arrayBuffer();
 
-        await openPdfData(data);
+        await openPdfData(data, anchor);
     } catch (error) {
         viewer.innerHTML = '<div class="error-message">Failed to load PDF: ' + error.message + '</div>';
     }
@@ -47,7 +48,7 @@ async function loadPdf(url) {
 
 async function loadPdfFromBase64(base64) {
     try {
-        scrollPosition = viewerContainer.scrollTop;
+        var anchor = capturePdfViewAnchor();
 
         var raw = atob(base64);
         var bytes = new Uint8Array(raw.length);
@@ -55,13 +56,15 @@ async function loadPdfFromBase64(base64) {
             bytes[i] = raw.charCodeAt(i);
         }
 
-        await openPdfData(bytes.buffer);
+        await openPdfData(bytes.buffer, anchor);
     } catch (error) {
         viewer.innerHTML = '<div class="error-message">Failed to load PDF: ' + error.message + '</div>';
     }
 }
 
-async function openPdfData(data) {
+async function openPdfData(data, restoreAnchor) {
+    renderGeneration++;
+
     // Destroy previous document to free memory
     if (pdfDoc) {
         try { pdfDoc.destroy(); } catch (_) {}
@@ -71,77 +74,97 @@ async function openPdfData(data) {
     totalPages = pdfDoc.numPages;
     pageCount.textContent = totalPages;
 
-    await renderAllPages();
-    viewerContainer.scrollTop = scrollPosition;
+    await renderAllPages(restoreAnchor);
 }
 
 // ─── Rendering (canvas + text layer) ─────────────────────────────
 
-async function renderAllPages() {
-    if (rendering) { pendingRender = true; return; }
-    rendering = true;
-    viewer.innerHTML = '';
-
-    for (var i = 1; i <= totalPages; i++) {
-        var page = await pdfDoc.getPage(i);
-        var baseViewport = page.getViewport({ scale: 1.0 });
-        var viewport = page.getViewport({ scale: zoomLevel });
-
-        // Wrapper (relative position so text layer overlaps canvas)
-        var pageDiv = document.createElement('div');
-        pageDiv.className = 'pdf-page';
-        pageDiv.dataset.pageNum = i;
-        pageDiv.dataset.baseWidth = baseViewport.width;
-        pageDiv.dataset.baseHeight = baseViewport.height;
-        pageDiv.style.width = viewport.width + 'px';
-        pageDiv.style.height = viewport.height + 'px';
-
-        // Canvas
-        var canvas = document.createElement('canvas');
-        var ctx = canvas.getContext('2d');
-        var dpr = window.devicePixelRatio || 1;
-        canvas.width = viewport.width * dpr;
-        canvas.height = viewport.height * dpr;
-        canvas.style.width = viewport.width + 'px';
-        canvas.style.height = viewport.height + 'px';
-        ctx.scale(dpr, dpr);
-        pageDiv.appendChild(canvas);
-
-        // Text layer (transparent text for selection)
-        var textLayerDiv = document.createElement('div');
-        textLayerDiv.className = 'textLayer';
-        pageDiv.appendChild(textLayerDiv);
-
-        viewer.appendChild(pageDiv);
-
-        // Render canvas
-        await page.render({ canvasContext: ctx, viewport: viewport }).promise;
-
-        // Render text layer
-        try {
-            var textContent = await page.getTextContent();
-            pdfjsLib.renderTextLayer({
-                textContent: textContent,
-                container: textLayerDiv,
-                viewport: viewport,
-                textDivs: [],
-            });
-        } catch (_) {
-            // text layer not critical — ignore if unavailable
-        }
-
-        // Annotation layer (clickable links, citations, cross-references)
-        try {
-            await renderAnnotationLayer(page, pageDiv, viewport);
-        } catch (_) {
-            // annotation layer not critical — ignore
-        }
+async function renderAllPages(restoreAnchor) {
+    if (rendering) {
+        pendingRender = true;
+        pendingRenderAnchor = restoreAnchor || pendingRenderAnchor;
+        return;
     }
 
-    renderedZoom = zoomLevel;
-    updatePageIndicator();
-    rendering = false;
-    if (pendingRender) { pendingRender = false; renderAllPages(); }
+    rendering = true;
+    var generation = renderGeneration;
+    var doc = pdfDoc;
+    viewer.innerHTML = '';
+
+    try {
+        for (var i = 1; i <= totalPages; i++) {
+            if (generation !== renderGeneration || doc !== pdfDoc) return;
+            var page = await doc.getPage(i);
+            if (generation !== renderGeneration || doc !== pdfDoc) return;
+            var baseViewport = page.getViewport({ scale: 1.0 });
+            var viewport = page.getViewport({ scale: zoomLevel });
+
+            // Wrapper (relative position so text layer overlaps canvas)
+            var pageDiv = document.createElement('div');
+            pageDiv.className = 'pdf-page';
+            pageDiv.dataset.pageNum = i;
+            pageDiv.dataset.baseWidth = baseViewport.width;
+            pageDiv.dataset.baseHeight = baseViewport.height;
+            pageDiv.style.width = viewport.width + 'px';
+            pageDiv.style.height = viewport.height + 'px';
+
+            // Canvas
+            var canvas = document.createElement('canvas');
+            var ctx = canvas.getContext('2d');
+            var dpr = window.devicePixelRatio || 1;
+            canvas.width = viewport.width * dpr;
+            canvas.height = viewport.height * dpr;
+            canvas.style.width = viewport.width + 'px';
+            canvas.style.height = viewport.height + 'px';
+            ctx.scale(dpr, dpr);
+            pageDiv.appendChild(canvas);
+
+            // Text layer (transparent text for selection)
+            var textLayerDiv = document.createElement('div');
+            textLayerDiv.className = 'textLayer';
+            pageDiv.appendChild(textLayerDiv);
+
+            viewer.appendChild(pageDiv);
+
+            // Render canvas
+            await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+            if (generation !== renderGeneration || doc !== pdfDoc) return;
+
+            // Render text layer
+            try {
+                var textContent = await page.getTextContent();
+                pdfjsLib.renderTextLayer({
+                    textContent: textContent,
+                    container: textLayerDiv,
+                    viewport: viewport,
+                    textDivs: [],
+                });
+            } catch (_) {
+                // text layer not critical — ignore if unavailable
+            }
+
+            // Annotation layer (clickable links, citations, cross-references)
+            try {
+                await renderAnnotationLayer(page, pageDiv, viewport);
+            } catch (_) {
+                // annotation layer not critical — ignore
+            }
+        }
+
+        if (generation === renderGeneration && doc === pdfDoc) {
+            renderedZoom = zoomLevel;
+            if (restoreAnchor) restorePdfViewAnchor(restoreAnchor);
+            updatePageIndicator();
+        }
+    } finally {
+        rendering = false;
+        if (pendingRender) {
+            var anchor = pendingRenderAnchor || restoreAnchor;
+            pendingRender = false;
+            pendingRenderAnchor = null;
+            await renderAllPages(anchor);
+        }
+    }
 }
 
 // ─── Annotation layer (links / citations / references) ───────────
@@ -268,6 +291,60 @@ function updatePageIndicator() {
 }
 
 viewerContainer.addEventListener('scroll', updatePageIndicator);
+
+function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+
+function capturePdfViewAnchor() {
+    var pages = viewer.querySelectorAll('.pdf-page');
+    var centerY = viewerContainer.scrollTop + viewerContainer.clientHeight / 2;
+    var maxScrollLeft = Math.max(1, viewerContainer.scrollWidth - viewerContainer.clientWidth);
+
+    for (var i = 0; i < pages.length; i++) {
+        var p = pages[i];
+        var pageTop = p.offsetTop;
+        var pageBottom = pageTop + p.offsetHeight;
+        if (centerY >= pageTop && centerY <= pageBottom) {
+            return {
+                pageNumber: parseInt(p.dataset.pageNum, 10),
+                pageOffsetRatio: p.offsetHeight > 0 ? (centerY - pageTop) / p.offsetHeight : 0,
+                viewportOffsetY: viewerContainer.clientHeight / 2,
+                scrollLeftRatio: viewerContainer.scrollLeft / maxScrollLeft,
+                fallbackTop: viewerContainer.scrollTop,
+            };
+        }
+    }
+
+    return {
+        pageNumber: currentPage,
+        pageOffsetRatio: 0,
+        viewportOffsetY: viewerContainer.clientHeight / 2,
+        scrollLeftRatio: viewerContainer.scrollLeft / maxScrollLeft,
+        fallbackTop: viewerContainer.scrollTop,
+    };
+}
+
+function restorePdfViewAnchor(anchor) {
+    if (!anchor) return;
+
+    var pages = viewer.querySelectorAll('.pdf-page');
+    if (pages.length === 0) {
+        viewerContainer.scrollTop = anchor.fallbackTop || 0;
+        return;
+    }
+
+    var targetPageNumber = clamp(anchor.pageNumber || 1, 1, pages.length);
+    var targetPage = pages[targetPageNumber - 1];
+    var pageOffsetRatio = clamp(anchor.pageOffsetRatio || 0, 0, 1);
+    var desiredTop = targetPage.offsetTop + targetPage.offsetHeight * pageOffsetRatio - anchor.viewportOffsetY;
+    var maxScrollTop = Math.max(0, viewerContainer.scrollHeight - viewerContainer.clientHeight);
+    var maxScrollLeft = Math.max(0, viewerContainer.scrollWidth - viewerContainer.clientWidth);
+
+    viewerContainer.scrollTop = clamp(desiredTop, 0, maxScrollTop);
+    viewerContainer.scrollLeft = clamp((anchor.scrollLeftRatio || 0) * maxScrollLeft, 0, maxScrollLeft);
+    updatePageIndicator();
+}
 
 // ─── Zoom helpers ────────────────────────────────────────────────
 

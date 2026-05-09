@@ -40,6 +40,14 @@ export interface LocalModificationTrackingState {
     baseContent?: Uint8Array;
 }
 
+export interface LocalCreateTrackingState {
+    hasRemoteEntry: boolean;
+    hasBaseContent: boolean;
+    currentContent?: Uint8Array;
+    baseContent?: Uint8Array;
+    remoteContent?: Uint8Array;
+}
+
 export interface LocalChangeRestorationState {
     currentExists: boolean;
     hasRemoteEntry: boolean;
@@ -107,6 +115,22 @@ export function shouldTrackLocalModification(state: LocalModificationTrackingSta
         }
     }
     return false;
+}
+
+export function getLocalCreateChangeType(state: LocalCreateTrackingState): ChangeType | undefined {
+    if (!state.hasRemoteEntry && !state.hasBaseContent) {
+        return 'created';
+    }
+
+    const comparisonContent = state.baseContent ?? state.remoteContent;
+    if (!state.currentContent || !comparisonContent) {
+        return 'modified';
+    }
+
+    return shouldTrackLocalModification({
+        currentContent: state.currentContent,
+        baseContent: comparisonContent,
+    }) ? 'modified' : undefined;
 }
 
 export function getRestoredLocalChangeType(state: LocalChangeRestorationState): ChangeType | undefined {
