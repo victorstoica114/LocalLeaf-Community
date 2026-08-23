@@ -1,0 +1,14 @@
+LocalLeaf Community
+
+This project continues LocalLeaf, originally created by Teddy van Jerry
+(Wuqiong Zhao):
+
+https://github.com/Teddy-van-Jerry/LocalLeaf
+
+It also incorporates and adapts work proposed by Xingyu Chen (Asixa) in
+LocalLeaf pull request #3. The project is currently maintained by Victor
+Stoica with help from community contributors.
+
+The software is distributed under the MIT License. The original copyright
+and permission notice are preserved in the LICENSE file. More detail about
+the project's history is available in ATTRIBUTION.md.
