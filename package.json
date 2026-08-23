@@ -2,7 +2,7 @@
   "name": "localleaf-community",
   "displayName": "LocalLeaf Community",
   "description": "Edit Overleaf projects locally in VS Code with two-way synchronization.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "victorstoica114",
   "repository": {
     "type": "git",
@@ -14,6 +14,10 @@
   },
   "license": "MIT",
   "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#145A52",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -24,7 +28,10 @@
     "latex",
     "overleaf",
     "sync",
-    "tex"
+    "tex",
+    "collaboration",
+    "self-hosted",
+    "vscode-extension"
   ],
   "activationEvents": [
     "workspaceContains:.localleaf",
@@ -37,7 +44,7 @@
       "description": "LocalLeaf synchronizes workspace files with an Overleaf server and requires a trusted workspace."
     }
   },
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -147,9 +154,12 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run package",
+    "compile": "tsc -p ./ && node esbuild.js",
+    "check-types": "tsc --noEmit -p ./",
+    "bundle": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "npm run check-types && node esbuild.js --production",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
@@ -166,6 +176,7 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
+    "esbuild": "^0.28.2",
     "eslint": "^8.55.0",
     "patch-package": "^8.0.0",
     "typescript": "^5.3.0"
