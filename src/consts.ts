@@ -2,8 +2,8 @@
  * LocalLeaf Constants
  */
 
-export const EXTENSION_ID = 'teddy-van-jerry.localleaf';
-export const EXTENSION_NAME = 'LocalLeaf';
+export const EXTENSION_ID = 'victorstoica114.localleaf-community';
+export const EXTENSION_NAME = 'LocalLeaf Community';
 
 // Configuration paths
 export const CONFIG_DIR = '.localleaf';

@@ -1290,7 +1290,7 @@ async function run(): Promise<void> {
         };
         capabilities?: { untrustedWorkspaces?: { supported?: boolean } };
     };
-    assert.equal(manifest.publisher, 'teddy-van-jerry');
+    assert.equal(manifest.publisher, 'victorstoica114');
     assert.equal(manifest.contributes?.viewsContainers?.activitybar?.[0]?.id, 'localleaf');
     assert.deepStrictEqual(
         manifest.contributes?.views?.localleaf?.map(view => [view.id, view.type]),

@@ -1,83 +1,87 @@
 <p align="center">
-  <img src="./images/icon.png" alt="LocalLeaf Logo" width="128" height="128">
+  <img src="./images/icon.png" alt="LocalLeaf logo" width="128" height="128">
 </p>
 
-# LocalLeaf: Local LaTeX Editing yet Synced to Overleaf
+# LocalLeaf Community
 
-[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/teddy-van-jerry.localleaf?label=VS%20Code%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=teddy-van-jerry.localleaf)
-[![Website](https://img.shields.io/badge/Website-localleaf.wqzhao.org-green)](https://localleaf.wqzhao.org)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A VS Code extension for a workaround solution to collaborate on LaTeX documents using [Overleaf](https://www.overleaf.com/) while editing them locally.
+LocalLeaf Community lets you work on Overleaf projects from VS Code while keeping a real local copy of every file. It is the continuation of [LocalLeaf](https://github.com/Teddy-van-Jerry/LocalLeaf), the extension created by Teddy van Jerry, and is now maintained here with contributions from the wider community.
 
-## Features
+The idea is deliberately simple: write with the local tools you already like, and let LocalLeaf keep the project in step with Overleaf.
 
-- **Two-way sync** with Overleaf projects
-- **Real-time collaboration** - see collaborators' cursors
-- **Conflict resolution** with visual diff view
-- **Auto-sync** on file changes
-- **Ignore patterns** support (like `.gitignore`)
+## What it can do
 
-> **Status bar items** showing Overleaf account, sync status, real-time collaboration status.
-> Also shown on the right in this example includes VS Code's error/warning indicators and LaTeX Workshop's build status.
-> ![status bar screenshot](./images/status-bar.png)
+- Synchronize files in both directions with Overleaf and self-hosted Overleaf instances
+- Show and link remote projects from the VS Code sidebar
+- Keep documents updated in real time
+- Show collaborators and jump to their cursor positions
+- Help resolve local and remote conflicts with a visual diff
+- Ignore build output and other generated files through `.leafignore`
+- Remove old ignored artifacts from the remote project after confirmation
+- Work alongside LaTeX Workshop for local compilation and PDF preview
 
-## Getting Started
+## Project status
 
-1. Install the extension from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=teddy-van-jerry.localleaf)
-2. Run `LocalLeaf: Login` command and enter your Overleaf cookies (see [how to get cookies](https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies))
-3. Open a folder and run `LocalLeaf: Link Folder to Overleaf Project`
-4. Start editing - changes sync automatically!
+The community edition is being prepared for its first public release. Until that package is available, the safest way to try it is from source:
+
+```powershell
+npm install
+npm test
+npx @vscode/vsce package
+```
+
+Install the generated `.vsix` with **Extensions: Install from VSIX...** in VS Code. If the original Marketplace extension is installed, disable or uninstall it first; both versions currently keep the same commands and workspace format so existing LocalLeaf projects continue to work.
+
+## Getting started
+
+1. Open the folder that should contain your local project.
+2. Run `LocalLeaf: Login` and authenticate with your Overleaf server.
+3. Choose a project from the LocalLeaf sidebar and link it to the folder.
+4. Review the first synchronization prompts before choosing which copy to keep.
 
 > [!WARNING]
-> - Only paste cookies when the server URL is the real Overleaf host (`https://www.overleaf.com`). The extension sends the cookie to whatever URL you enter; avoid lookalike URLs such as `https://www.overleaf.com.attacker.test` or ones that hide another host (e.g., `https://www.overleaf.com@evil.com`).
-> - Cookies are stored in VS Code Secret Storage, not in your workspace, but they still grant full account access. Treat them like a password and clear credentials with `LocalLeaf: Logout` if you suspect exposure.
+> Your Overleaf cookies grant access to your account. Only send them to the real server you intend to use, check the URL carefully, and treat them like a password. LocalLeaf stores them in VS Code Secret Storage rather than inside the workspace. Use `LocalLeaf: Logout` if you suspect they were exposed.
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `LocalLeaf: Login` | Authenticate with Overleaf |
-| `LocalLeaf: Logout` | Clear stored credentials |
-| `LocalLeaf: Verify Credentials` | Check if your session is still valid |
-| `LocalLeaf: Refresh Cookie` | Re-authenticate without full re-login |
-| `LocalLeaf: Link Folder to Overleaf Project` | Connect a local folder to an Overleaf project |
-| `LocalLeaf: Unlink Folder` | Disconnect folder from Overleaf project |
-| `LocalLeaf: Sync Now` | Manually trigger two-way sync |
-| `LocalLeaf: Pull from Overleaf` | Download changes from Overleaf |
-| `LocalLeaf: Push to Overleaf` | Upload local changes to Overleaf |
-| `LocalLeaf: Show Sync Status` | Display sync status and options to resync/reconnect |
-| `LocalLeaf: Edit Ignore Patterns` | Configure files to exclude from sync |
-| `LocalLeaf: Clean Ignored Files from Overleaf` | Delete stale remote files matched by `.leafignore`, after confirmation |
-| `LocalLeaf: Set Main Document` | Set the main `.tex` file for compilation |
-| `LocalLeaf: Configure Settings` | Open extension settings |
-| `LocalLeaf: Jump to Collaborator` | Navigate to a collaborator's cursor position |
+| Command | What it does |
+|---------|--------------|
+| `LocalLeaf: Login` | Connects an Overleaf account |
+| `LocalLeaf: Logout` | Removes the stored credentials |
+| `LocalLeaf: Verify Credentials` | Checks whether the current session is still valid |
+| `LocalLeaf: Refresh Cookie` | Replaces an expired session cookie |
+| `LocalLeaf: Link Folder to Overleaf Project` | Links the current folder to a project |
+| `LocalLeaf: Unlink Folder` | Removes the local project link |
+| `LocalLeaf: Sync Now` | Starts a two-way synchronization |
+| `LocalLeaf: Pull from Overleaf` | Downloads the latest remote state |
+| `LocalLeaf: Push to Overleaf` | Explains the automatic push behavior |
+| `LocalLeaf: Edit Ignore Patterns` | Opens `.leafignore` |
+| `LocalLeaf: Clean Ignored Files from Overleaf` | Removes ignored remote artifacts after confirmation |
+| `LocalLeaf: Show Sync Status` | Shows the connection and synchronization state |
+| `LocalLeaf: Set Main Document` | Selects the primary `.tex` document |
+| `LocalLeaf: Configure Settings` | Opens the extension settings |
+| `LocalLeaf: Jump to Collaborator` | Opens a collaborator's current document and position |
 
 ## Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `localleaf.defaultServer` | `https://www.overleaf.com` | Overleaf server URL (for self-hosted instances) |
-| `localleaf.autoSync` | `true` | Automatically sync when files change |
+| `localleaf.defaultServer` | `https://www.overleaf.com` | Overleaf or self-hosted server URL |
+| `localleaf.autoSync` | `true` | Synchronize automatically when local files change |
 
-## Philosophy
+## The people behind the project
 
-LocalLeaf focuses solely on **local file synchronization** with Overleaf. Unlike browser-based solutions, LocalLeaf:
+LocalLeaf was started by **Teddy van Jerry (Wuqiong Zhao)**, who designed and built the original extension and maintained its first releases. **Xingyu Chen (Asixa)** later proposed a much broader interface and workflow in PR #3. **Victor Stoica** integrated and hardened parts of that work, fixed synchronization and security issues, and now maintains this continuation.
 
-- **Creates a local replica** of your Overleaf project that you can edit with any tool
-- **Does not provide online PDF compilation** - use Overleaf's web interface or local tools for that
-- **Works seamlessly with [LaTeX Workshop](https://marketplace.visualstudio.com/items?itemName=James-Yu.latex-workshop)** for local editing, compilation, and preview
+The full story, including links and a more precise account of the work, is in [ATTRIBUTION.md](ATTRIBUTION.md). The original commit history is preserved, and Asixa's original PR history is kept in the `archive/asixa-pr-3` branch.
 
-This approach gives you the best of both worlds: Overleaf's collaboration features and your preferred local editing environment.
+## Related projects
 
-## Related Projects
+LocalLeaf was inspired by [Overleaf-Workshop](https://github.com/iamhyc/Overleaf-Workshop), which offers a more deeply integrated Overleaf experience inside VS Code. LocalLeaf takes a different route: it keeps a normal local project that remains usable with Git, LaTeX Workshop, scripts, and any other local tool.
 
-This project was inspired by and references [Overleaf-Workshop](https://github.com/iamhyc/Overleaf-Workshop), which takes a different approach by providing a more integrated Overleaf experience within VS Code, including online PDF preview and compilation. LocalLeaf instead focuses on maintaining a synchronized local copy of your files, leaving PDF compilation to dedicated tools like LaTeX Workshop or Overleaf's web interface.
-
-## Attribution
-
-The LocalLeaf logo is an original Minecraft-style pixelated design depicting a leaf growing from local ground, inspired by the [Overleaf logo](https://commons.wikimedia.org/wiki/File:Overleaf_Logo.svg). LocalLeaf is not affiliated with or endorsed by Overleaf.
+LocalLeaf and LocalLeaf Community are not affiliated with or endorsed by Overleaf.
 
 ## License
 
-[MIT](LICENSE)
+The project is distributed under the [MIT License](LICENSE). The original copyright notice is kept intact. See [NOTICE](NOTICE) and [ATTRIBUTION.md](ATTRIBUTION.md) for project history and credits.

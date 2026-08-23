@@ -2,6 +2,15 @@
 
 All notable changes to LocalLeaf will be documented in this file.
 
+## Unreleased - Community continuation
+
+### Changed
+
+- Continued development in the LocalLeaf Community repository while preserving the original MIT license and project history
+- Added a redesigned project sidebar based on ideas and code from Asixa's PR #3, followed by accessibility, security, and reliability work
+- Hardened synchronization, API handling, credential flows, and webview behavior
+- Added Windows path compatibility and support for cleaning ignored files on self-hosted Overleaf instances
+
 ## [0.1.3] - 2026-01-04
 
 ### Added
