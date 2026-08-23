@@ -2,6 +2,21 @@
 
 All notable changes to LocalLeaf Community will be documented in this file.
 
+## [0.2.1] - 2026-08-23
+
+### Added
+
+- Added contributor guidance for development, testing, and pull requests
+- Added a regression check that loads the production entry-point bundle
+
+### Changed
+
+- Bundled the extension and its runtime dependencies into one minified JavaScript file with esbuild
+- Reduced the VSIX by excluding intermediate TypeScript output, development dependencies, and unused images
+- Updated the development launch configuration to run the bundled entry point
+
+[0.2.1]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.0...v0.2.1
+
 ## [0.2.0] - 2026-08-23
 
 This is the first release maintained from the LocalLeaf Community repository.

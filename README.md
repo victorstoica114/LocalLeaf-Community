@@ -5,6 +5,7 @@
 # LocalLeaf Community
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Contributions welcome](https://img.shields.io/badge/contributions-welcome-35A66F.svg)](CONTRIBUTING.md)
 
 LocalLeaf Community lets you work on Overleaf projects from VS Code while keeping a real local copy of every file. It is the continuation of [LocalLeaf](https://github.com/Teddy-van-Jerry/LocalLeaf), the extension created by Teddy van Jerry, and is now maintained here with contributions from the wider community.
 
@@ -36,6 +37,10 @@ npx @vscode/vsce package
 ```
 
 If the original Marketplace extension is installed, disable or uninstall it first. Both versions currently keep the same commands and workspace format, so existing LocalLeaf projects continue to work.
+
+## Contributing
+
+Contributions are welcome, whether they are code, documentation, bug reports, or testing against different Overleaf installations. The most useful starting points and the local development commands are collected in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Getting started
 

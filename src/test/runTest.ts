@@ -1267,10 +1267,14 @@ async function run(): Promise<void> {
         'the local integration checklist must never be packaged');
     assert.match(vscodeIgnore, /^local-pr3-artifacts\/\*\*$/m,
         'local PR artifacts must never be packaged');
-    assert.match(vscodeIgnore, /^out\/test\/\*\*$/m,
-        'compiled test code must not be packaged');
-    assert.match(vscodeIgnore, /^out\/test\/runTest\.js$/m,
-        'the compiled regression runner must be explicitly excluded from the VSIX');
+    assert.match(vscodeIgnore, /^out\/\*\*$/m,
+        'intermediate TypeScript output must not be packaged');
+    assert.match(vscodeIgnore, /^node_modules\/\*\*$/m,
+        'dependencies already included in the bundle must not be packaged separately');
+    assert.match(vscodeIgnore, /^dist\/\*\*$/m,
+        'the dist folder must default to excluded');
+    assert.match(vscodeIgnore, /^!dist\/extension\.js$/m,
+        'the production extension bundle must be explicitly included');
     ignoreParser.settings = { mainTex: 'thesis[1].tex', mainPdf: 'thesis[1].pdf' };
     ignoreParser.resolveVariables();
     assert.deepStrictEqual(
@@ -1284,6 +1288,7 @@ async function run(): Promise<void> {
         'utf8',
     )) as {
         publisher: string;
+        main: string;
         contributes?: {
             viewsContainers?: { activitybar?: Array<{ id?: string }> };
             views?: { localleaf?: Array<{ id?: string; type?: string }> };
@@ -1291,6 +1296,7 @@ async function run(): Promise<void> {
         capabilities?: { untrustedWorkspaces?: { supported?: boolean } };
     };
     assert.equal(manifest.publisher, 'victorstoica114');
+    assert.equal(manifest.main, './dist/extension.js');
     assert.equal(manifest.contributes?.viewsContainers?.activitybar?.[0]?.id, 'localleaf');
     assert.deepStrictEqual(
         manifest.contributes?.views?.localleaf?.map(view => [view.id, view.type]),
@@ -1304,6 +1310,12 @@ async function run(): Promise<void> {
         false,
         'LocalLeaf must stay disabled in untrusted workspaces because it writes remote content locally',
     );
+
+    const bundlePath = path.join(__dirname, '..', '..', 'dist', 'extension.js');
+    assert.ok(fs.statSync(bundlePath).size > 0, 'the extension bundle must be generated');
+    const bundle = require(bundlePath) as { activate?: unknown; deactivate?: unknown };
+    assert.equal(typeof bundle.activate, 'function', 'the bundle must export activate');
+    assert.equal(typeof bundle.deactivate, 'function', 'the bundle must export deactivate');
 
     assert.equal(readInstalledPackageVersion('form-data'), '4.0.6');
     assert.equal(readInstalledPackageVersion('minimatch'), '9.0.9');
