@@ -20,7 +20,7 @@ const PARTICLES = [
 
 function Hero() {
   return (
-    <section className="min-h-screen flex flex-col items-center justify-center px-4 py-16 relative overflow-hidden">
+    <section className="hero min-h-screen flex flex-col items-center justify-center px-4 py-16 relative overflow-hidden">
       <div className="absolute inset-0 pointer-events-none">
         {PARTICLES.map((particle, index) => (
           <div
@@ -36,34 +36,34 @@ function Hero() {
         ))}
       </div>
 
-      <div className="animate-float animate-glow" style={{ marginBottom: '3rem' }}>
+      <div className="brand-lockup animate-float animate-glow">
         <img
-          src="./images/icon.svg"
-          alt="LocalLeaf Community logo"
-          className="w-32 h-32 md:w-48 md:h-48"
+          src="./images/wordmark.png"
+          alt="LocalLeaf"
+          className="brand-logo"
         />
       </div>
 
       <h1
-        className="font-minecraft text-2xl md:text-4xl text-white text-center mb-4 animate-pixel-fade"
+        className="w-full font-minecraft text-2xl md:text-4xl text-white text-center mb-4 animate-pixel-fade"
         style={{ textShadow: '4px 4px 0px #2E7D32' }}
       >
         LocalLeaf Community
       </h1>
 
       <p
-        className="text-xl md:text-3xl text-white text-center mb-8 animate-pixel-fade animate-delay-1"
+        className="w-full text-xl md:text-3xl text-white text-center mb-8 animate-pixel-fade animate-delay-1"
         style={{ textShadow: '2px 2px 0px rgba(0,0,0,0.5)' }}
       >
         Local LaTeX editing, synced with Overleaf
       </p>
 
-      <p className="text-lg md:text-2xl text-white/90 text-center max-w-2xl mb-12 animate-pixel-fade animate-delay-2">
+      <p className="w-full text-lg md:text-2xl text-white/90 text-center max-w-2xl mb-12 animate-pixel-fade animate-delay-2">
         Continue working with Overleaf while using the local editor and tools you already know.
         Built on the original LocalLeaf project and maintained by the community.
       </p>
 
-      <p className="text-base md:text-lg text-white/80 text-center max-w-2xl mb-8 animate-pixel-fade animate-delay-2">
+      <p className="w-full text-base md:text-lg text-white/80 text-center max-w-2xl mb-8 animate-pixel-fade animate-delay-2">
         An independent community continuation, not sponsored or maintained by the original author or by Overleaf.
       </p>
 

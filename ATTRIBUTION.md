@@ -18,6 +18,10 @@ Parts of that proposal became the starting point for the interface used here. Th
 
 Victor contributed fixes for file creation and binary synchronization, integrated and refined the new interface, addressed review and security findings, improved Windows path handling, and added compatibility fixes for self-hosted Overleaf servers. He maintains the community repository and the releases produced from it.
 
+## Community branding
+
+The current two-document-and-leaf identity was created for LocalLeaf Community in August 2026. It replaces the original pixel-art logo and should not be read as branding supplied or approved by the original project or by Overleaf.
+
 ## Everyone else
 
 Bug reports, testing, review comments, and small fixes matter too. Git remains the detailed record of individual changes, and future contributors will be credited through that history.

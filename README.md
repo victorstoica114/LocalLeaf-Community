@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./images/icon.png" alt="LocalLeaf logo" width="128" height="128">
+  <img src="./docs/branding/localleaf-community-wordmark.png" alt="LocalLeaf Community" width="560">
 </p>
 
 # LocalLeaf Community
@@ -23,9 +23,11 @@ The idea is deliberately simple: write with the local tools you already like, an
 - Remove old ignored artifacts from the remote project after confirmation
 - Work alongside LaTeX Workshop for local compilation and PDF preview
 
-## Project status
+## Releases
 
-The community edition is being prepared for its first public release. Until that package is available, the safest way to try it is from source:
+Download the latest `.vsix` from [GitHub Releases](https://github.com/victorstoica114/LocalLeaf-Community/releases/latest), then install it with **Extensions: Install from VSIX...** in VS Code.
+
+To build the extension yourself:
 
 ```powershell
 npm install
@@ -33,7 +35,7 @@ npm test
 npx @vscode/vsce package
 ```
 
-Install the generated `.vsix` with **Extensions: Install from VSIX...** in VS Code. If the original Marketplace extension is installed, disable or uninstall it first; both versions currently keep the same commands and workspace format so existing LocalLeaf projects continue to work.
+If the original Marketplace extension is installed, disable or uninstall it first. Both versions currently keep the same commands and workspace format, so existing LocalLeaf projects continue to work.
 
 ## Getting started
 
