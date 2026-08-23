@@ -1,15 +1,33 @@
 # Changelog
 
-All notable changes to LocalLeaf will be documented in this file.
+All notable changes to LocalLeaf Community will be documented in this file.
 
-## Unreleased - Community continuation
+## [0.2.0] - 2026-08-23
+
+This is the first release maintained from the LocalLeaf Community repository.
+
+### Added
+
+- Added a redesigned project browser and workspace sidebar based on ideas and code from Asixa's PR #3
+- Added clearer account, connection, synchronization, conflict, collaborator, and ignored-file controls
+- Added a confirmed cleanup command for removing files that are newly covered by `.leafignore` from the remote project
+- Added independent LocalLeaf Community branding, project attribution, and third-party notices
 
 ### Changed
 
-- Continued development in the LocalLeaf Community repository while preserving the original MIT license and project history
-- Added a redesigned project sidebar based on ideas and code from Asixa's PR #3, followed by accessibility, security, and reliability work
-- Hardened synchronization, API handling, credential flows, and webview behavior
-- Added Windows path compatibility and support for cleaning ignored files on self-hosted Overleaf instances
+- Continued development in an independent community repository while preserving the original MIT license and project history
+- Improved accessibility, keyboard behavior, zoom handling, loading states, and feedback throughout the sidebar
+- Hardened synchronization, API handling, credential flows, path validation, and webview message handling
+- Updated dependencies and package overrides to address known security advisories
+
+### Fixed
+
+- Fixed synchronization races around file creation, binary files, remote updates, and filesystem watcher echoes
+- Fixed Windows path handling that could incorrectly reject valid files as being outside the workspace
+- Fixed project activation and linked-workspace detection after startup
+- Fixed cleanup of ignored files on self-hosted Overleaf instances and nested project folders
+
+[0.2.0]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.1.3...v0.2.0
 
 ## [0.1.3] - 2026-01-04
 
