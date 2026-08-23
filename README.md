@@ -8,6 +8,8 @@
 
 LocalLeaf Community lets you work on Overleaf projects from VS Code while keeping a real local copy of every file. It is the continuation of [LocalLeaf](https://github.com/Teddy-van-Jerry/LocalLeaf), the extension created by Teddy van Jerry, and is now maintained here with contributions from the wider community.
 
+LocalLeaf Community is an independent, community-maintained continuation. It is not sponsored, endorsed, or maintained by Teddy van Jerry or by Overleaf.
+
 The idea is deliberately simple: write with the local tools you already like, and let LocalLeaf keep the project in step with Overleaf.
 
 ## What it can do
@@ -84,4 +86,4 @@ LocalLeaf and LocalLeaf Community are not affiliated with or endorsed by Overlea
 
 ## License
 
-The project is distributed under the [MIT License](LICENSE). The original copyright notice is kept intact. See [NOTICE](NOTICE) and [ATTRIBUTION.md](ATTRIBUTION.md) for project history and credits.
+The project is distributed under the [MIT License](LICENSE). Teddy's original copyright notice is kept intact, with a separate notice for the community's later work. See [NOTICE](NOTICE), [ATTRIBUTION.md](ATTRIBUTION.md), and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for project history, credits, and dependency licenses.

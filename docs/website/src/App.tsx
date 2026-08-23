@@ -4,6 +4,7 @@ const RELEASES_URL = 'https://github.com/victorstoica114/LocalLeaf-Community/rel
 const GITHUB_URL = 'https://github.com/victorstoica114/LocalLeaf-Community'
 const DOCS_URL = 'https://github.com/victorstoica114/LocalLeaf-Community#readme'
 const ATTRIBUTION_URL = 'https://github.com/victorstoica114/LocalLeaf-Community/blob/main/ATTRIBUTION.md'
+const THIRD_PARTY_NOTICES_URL = './THIRD_PARTY_NOTICES.txt'
 const PARTICLES = [
   { left: 8, top: 14, duration: 3.4, delay: 0.2 },
   { left: 18, top: 62, duration: 4.2, delay: 1.1 },
@@ -60,6 +61,10 @@ function Hero() {
       <p className="text-lg md:text-2xl text-white/90 text-center max-w-2xl mb-12 animate-pixel-fade animate-delay-2">
         Continue working with Overleaf while using the local editor and tools you already know.
         Built on the original LocalLeaf project and maintained by the community.
+      </p>
+
+      <p className="text-base md:text-lg text-white/80 text-center max-w-2xl mb-8 animate-pixel-fade animate-delay-2">
+        An independent community continuation, not sponsored or maintained by the original author or by Overleaf.
       </p>
 
       <div className="flex flex-col sm:flex-row gap-4 animate-pixel-fade animate-delay-3">
@@ -257,6 +262,15 @@ function Footer() {
             className="text-gray-400 hover:text-white"
           >
             Original project by Teddy van Jerry, with community contributions
+          </a>
+        </p>
+
+        <p className="text-base text-gray-500 text-center mt-3">
+          <a
+            href={THIRD_PARTY_NOTICES_URL}
+            className="text-gray-400 hover:text-white"
+          >
+            Third-party notices
           </a>
         </p>
       </div>
