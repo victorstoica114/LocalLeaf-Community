@@ -8,11 +8,13 @@ Teddy created LocalLeaf and its original design. He built the first working VS C
 
 The original project lives at [Teddy-van-Jerry/LocalLeaf](https://github.com/Teddy-van-Jerry/LocalLeaf). Its MIT copyright notice remains in [LICENSE](LICENSE), exactly as it appeared in the original repository.
 
-## Xingyu Chen (Asixa)
+## Xingyu Chen (Asixa / RFDT)
 
 Asixa opened [PR #3](https://github.com/Teddy-van-Jerry/LocalLeaf/pull/3) with a large set of ideas and implementations. That work explored a richer sidebar, Source Control integration, local LaTeX compilation and PDF preview, collaborator tools, and a number of synchronization improvements.
 
-Parts of that proposal became the starting point for the interface used here. The integration was selective and received additional security and reliability work, but the original direction and code deserve clear credit. The original commit series is preserved in the `archive/asixa-pr-3` branch so the authorship can be inspected directly.
+The preserved proposal contains 34 commits: 24 authored as **RFDT** and 10 authored as **Xingyu Chen**. Both author names belong to the Asixa contribution series and are retained exactly as recorded by Git.
+
+Parts of that proposal became the starting point for the interface used here. The integration was selective and received additional security and reliability work, but the original direction and code deserve clear credit. The original commit series is preserved in the `archive/asixa-pr-3` branch, and its ancestry is connected to the default branch so the original authorship remains visible to Git and GitHub.
 
 ## Victor Stoica
 

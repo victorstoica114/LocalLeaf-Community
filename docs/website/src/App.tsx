@@ -261,7 +261,7 @@ function Footer() {
             rel="noopener noreferrer"
             className="text-gray-400 hover:text-white"
           >
-            Original project by Teddy van Jerry, with community contributions
+            Created by Teddy van Jerry; major contributions by Xingyu Chen (Asixa / RFDT); maintained by Victor Stoica
           </a>
         </p>
 

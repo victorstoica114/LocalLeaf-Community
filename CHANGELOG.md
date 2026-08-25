@@ -2,6 +2,18 @@
 
 All notable changes to LocalLeaf Community will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Connected Asixa's preserved PR #3 history to the default branch, documented both original author names, Xingyu Chen and RFDT, and added a mailmap entry that groups them under Xingyu Chen
+- Excluded this development checkout's LocalLeaf link metadata from Git and VSIX packages
+
+### Fixed
+
+- Added automatic negotiation between legacy and query-based Overleaf Socket.IO project joins, restoring real-time synchronization with current self-hosted Community Edition servers
+- Preserved synchronization event handlers when switching Socket.IO protocols and surfaced the real-time connection cause when HTTP fallback is also unavailable
+
 ## [0.2.1] - 2026-08-23
 
 ### Added
