@@ -91,20 +91,37 @@ export interface SocketEventHandlers {
     onCompilerUpdated?: (compiler: string) => void;
 }
 
+type ConnectionMode = 'legacy' | 'query';
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function projectFromResponse(value: unknown): ProjectEntity {
+    if (value === null || typeof value !== 'object') {
+        throw new Error('Overleaf returned an invalid project response.');
+    }
+    return value as ProjectEntity;
+}
+
 /**
  * Socket.io API for real-time communication with Overleaf
  * Reference: Overleaf-Workshop/src/api/socketio.ts
  */
 export class SocketIOAPI {
-    private socket!: SocketIOClient.Socket;
+    private socket?: SocketIOClient.Socket;
+    private connectionMode: ConnectionMode = 'legacy';
     private projectRecord?: ProjectEntity;
     private projectRecordPromise?: Promise<ProjectEntity>;
+    private projectRecordResolve?: (project: ProjectEntity) => void;
     private handlers: SocketEventHandlers[] = [];
     private _publicId?: string;
     private _connected: boolean = false;
     private _handshakeComplete: boolean = false;
     private _handshakePromise!: Promise<void>;
     private _handshakeResolve!: () => void;
+    private _connectionFailurePromise!: Promise<Error>;
+    private _connectionFailureResolve!: (error: Error) => void;
 
     constructor(
         private readonly api: BaseAPI,
@@ -118,19 +135,56 @@ export class SocketIOAPI {
      * Initialize socket connection
      * Reference: Overleaf-Workshop socketio.ts init()
      */
-    private init() {
+    private init(mode: ConnectionMode = 'legacy') {
+        this.teardownSocket();
+        this.connectionMode = mode;
+
         // Create handshake promise
         this._handshakeComplete = false;
         this._handshakePromise = new Promise((resolve) => {
             this._handshakeResolve = resolve;
         });
+        this._connectionFailurePromise = new Promise((resolve) => {
+            this._connectionFailureResolve = resolve;
+        });
 
-        // Connect with projectId and timestamp in query
+        // Older Community Edition servers expect an explicit joinProject event.
+        // Newer servers expect the project ID as part of the Socket.IO handshake.
         this.projectRecordPromise = undefined;
-        const query = `?projectId=${encodeURIComponent(this.projectId)}&t=${Date.now()}`;
+        this.projectRecordResolve = undefined;
+        this.projectRecord = undefined;
+        this._connected = false;
+        const query = mode === 'query'
+            ? `?projectId=${encodeURIComponent(this.projectId)}&t=${Date.now()}`
+            : undefined;
         this.socket = this.api.initSocket(this.identity, query);
 
-        this.setupInternalHandlers();
+        this.setupInternalHandlers(this.socket, mode);
+        for (const handlers of this.handlers) {
+            this.attachHandlers(this.socket, handlers);
+        }
+    }
+
+    private teardownSocket(): void {
+        const socket = this.socket;
+        this.socket = undefined;
+        if (!socket) return;
+        socket.removeAllListeners?.();
+        socket.disconnect();
+    }
+
+    private failConnection(socket: SocketIOClient.Socket, error: Error): void {
+        if (this.socket !== socket || this._connected) return;
+        this._connectionFailureResolve(error);
+    }
+
+    private async raceConnectionFailure<T>(operation: Promise<T>): Promise<T> {
+        return Promise.race([
+            operation,
+            this._connectionFailurePromise.then(error => {
+                throw error;
+            }),
+        ]);
     }
 
     private withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -150,8 +204,12 @@ export class SocketIOAPI {
     }
 
     private emit(event: string, ...args: unknown[]): Promise<unknown[]> {
+        const socket = this.socket;
+        if (!socket) {
+            return Promise.reject(new Error('Socket is not initialized'));
+        }
         const response = new Promise<unknown[]>((resolve, reject) => {
-            this.socket.emit(event, ...args, (error: unknown, ...data: unknown[]) => {
+            socket.emit(event, ...args, (error: unknown, ...data: unknown[]) => {
                 if (error) {
                     reject(error instanceof Error ? error : new Error(String(error)));
                 } else {
@@ -166,37 +224,49 @@ export class SocketIOAPI {
      * Setup internal event handlers
      * Reference: Overleaf-Workshop socketio.ts initInternalHandlers()
      */
-    private setupInternalHandlers() {
-        this.socket.on('connect', () => {
-            this._connected = true;
+    private setupInternalHandlers(socket: SocketIOClient.Socket, mode: ConnectionMode) {
+        socket.on('connect', () => {
+            if (this.socket !== socket) return;
             this._handshakeComplete = true;
             this._handshakeResolve();
         });
 
-        this.socket.on('connect_failed', () => {
-            log('Connection failed');
-            this._connected = false;
+        socket.on('connect_failed', () => {
+            if (this.socket !== socket) return;
+            const error = new Error('Socket connection failed');
+            log(error.message);
+            this.failConnection(socket, error);
         });
 
-        this.socket.on('forceDisconnect', (message: string) => {
+        socket.on('forceDisconnect', (message: string) => {
+            if (this.socket !== socket) return;
             log(`Force disconnected: ${message}`);
             this._connected = false;
+            this.failConnection(socket, new Error(message || 'Overleaf forced the socket to disconnect'));
             // Check if force disconnect is auth-related
             const isAuthError = this.isAuthRelatedMessage(message);
             this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
         });
 
-        this.socket.on('error', (err: unknown) => {
+        socket.on('error', (err: unknown) => {
+            if (this.socket !== socket) return;
             log(`Socket error: ${err}`);
         });
 
-        this.socket.on('disconnect', () => {
+        socket.on('disconnect', () => {
+            if (this.socket !== socket) return;
             log('Disconnected from Overleaf');
+            const wasConnected = this._connected;
             this._connected = false;
-            this.handlers.forEach(h => h.onDisconnected?.(false));
+            if (wasConnected) {
+                this.handlers.forEach(h => h.onDisconnected?.(false));
+            } else {
+                this.failConnection(socket, new Error('Socket disconnected before the project was joined'));
+            }
         });
 
-        this.socket.on('connectionRejected', (err: unknown) => {
+        socket.on('connectionRejected', (err: unknown) => {
+            if (this.socket !== socket) return;
             const message = err instanceof Error
                 ? err.message
                 : typeof err === 'object' && err !== null && 'message' in err
@@ -204,38 +274,36 @@ export class SocketIOAPI {
                     : String(err);
             log(`Connection rejected: ${message}`);
             this._connected = false;
-            // Check if rejection is auth-related
-            const isAuthError = this.isAuthRelatedMessage(message);
-            this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
+            this.failConnection(socket, new Error(message || 'Socket connection rejected'));
         });
 
-        this.socket.on('connectionAccepted', (_session: unknown, publicId: string) => {
+        socket.on('connectionAccepted', (_session: unknown, publicId: string) => {
+            if (this.socket !== socket) return;
             this._publicId = publicId;
-            this._connected = true;
-            this.handlers.forEach(h => h.onConnected?.(publicId));
         });
 
-        // joinProjectResponse handler
-        this.projectRecordPromise = new Promise((resolve, reject) => {
-            this.socket.on('joinProjectResponse', (res: unknown) => {
+        if (mode === 'query') {
+            this.projectRecordPromise = new Promise(resolve => {
+                this.projectRecordResolve = resolve;
+            });
+            socket.on('joinProjectResponse', (res: unknown) => {
+                if (this.socket !== socket) return;
                 if (res === null || typeof res !== 'object') {
-                    reject(new Error('Overleaf returned an invalid project response.'));
+                    this.failConnection(socket, new Error('Overleaf returned an invalid project response.'));
                     return;
                 }
                 const response = res as Record<string, unknown>;
                 const publicId = response.publicId;
                 const project = response.project;
                 if (typeof publicId !== 'string' || project === null || typeof project !== 'object') {
-                    reject(new Error('Overleaf returned incomplete project metadata.'));
+                    this.failConnection(socket, new Error('Overleaf returned incomplete project metadata.'));
                     return;
                 }
                 this._publicId = publicId;
-                this._connected = true;
                 this.projectRecord = project as ProjectEntity;
-                this.handlers.forEach(h => h.onConnected?.(publicId));
-                resolve(this.projectRecord);
+                this.projectRecordResolve?.(this.projectRecord);
             });
-        });
+        }
     }
 
     /**
@@ -243,66 +311,71 @@ export class SocketIOAPI {
      */
     registerHandlers(handlers: SocketEventHandlers) {
         this.handlers.push(handlers);
+        if (this.socket) {
+            this.attachHandlers(this.socket, handlers);
+        }
+    }
 
+    private attachHandlers(socket: SocketIOClient.Socket, handlers: SocketEventHandlers): void {
         // File events
         if (handlers.onFileCreated) {
-            this.socket.on('reciveNewDoc', (parentFolderId: string, doc: FileEntity) => {
+            socket.on('reciveNewDoc', (parentFolderId: string, doc: FileEntity) => {
                 handlers.onFileCreated!(parentFolderId, 'doc', doc);
             });
-            this.socket.on('reciveNewFile', (parentFolderId: string, file: FileEntity) => {
+            socket.on('reciveNewFile', (parentFolderId: string, file: FileEntity) => {
                 handlers.onFileCreated!(parentFolderId, 'file', file);
             });
-            this.socket.on('reciveNewFolder', (parentFolderId: string, folder: FileEntity) => {
+            socket.on('reciveNewFolder', (parentFolderId: string, folder: FileEntity) => {
                 handlers.onFileCreated!(parentFolderId, 'folder', folder);
             });
         }
 
         if (handlers.onFileRenamed) {
-            this.socket.on('reciveEntityRename', (entityId: string, newName: string) => {
+            socket.on('reciveEntityRename', (entityId: string, newName: string) => {
                 handlers.onFileRenamed!(entityId, newName);
             });
         }
 
         if (handlers.onFileRemoved) {
-            this.socket.on('removeEntity', (entityId: string) => {
+            socket.on('removeEntity', (entityId: string) => {
                 handlers.onFileRemoved!(entityId);
             });
         }
 
         if (handlers.onFileMoved) {
-            this.socket.on('reciveEntityMove', (entityId: string, folderId: string) => {
+            socket.on('reciveEntityMove', (entityId: string, folderId: string) => {
                 handlers.onFileMoved!(entityId, folderId);
             });
         }
 
         if (handlers.onFileChanged) {
-            this.socket.on('otUpdateApplied', (update: DocumentUpdate) => {
+            socket.on('otUpdateApplied', (update: DocumentUpdate) => {
                 handlers.onFileChanged!(update);
             });
         }
 
         // Collaboration events
         if (handlers.onUserCursorUpdated) {
-            this.socket.on('clientTracking.clientUpdated', (user: UserCursorUpdate) => {
+            socket.on('clientTracking.clientUpdated', (user: UserCursorUpdate) => {
                 handlers.onUserCursorUpdated!(user);
             });
         }
 
         if (handlers.onUserDisconnected) {
-            this.socket.on('clientTracking.clientDisconnected', (clientId: string) => {
+            socket.on('clientTracking.clientDisconnected', (clientId: string) => {
                 handlers.onUserDisconnected!(clientId);
             });
         }
 
         // Project settings events
         if (handlers.onRootDocUpdated) {
-            this.socket.on('rootDocUpdated', (rootDocId: string) => {
+            socket.on('rootDocUpdated', (rootDocId: string) => {
                 handlers.onRootDocUpdated!(rootDocId);
             });
         }
 
         if (handlers.onCompilerUpdated) {
-            this.socket.on('compilerUpdated', (compiler: string) => {
+            socket.on('compilerUpdated', (compiler: string) => {
                 handlers.onCompilerUpdated!(compiler);
             });
         }
@@ -316,7 +389,11 @@ export class SocketIOAPI {
             return;
         }
 
-        await this.withTimeout(this._handshakePromise, timeoutMs, 'Socket handshake timeout');
+        await this.withTimeout(
+            this.raceConnectionFailure(this._handshakePromise),
+            timeoutMs,
+            'Socket handshake timeout',
+        );
     }
 
     /**
@@ -324,16 +401,61 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts joinProject()
      */
     async joinProject(): Promise<ProjectEntity> {
-        // Wait for handshake before emitting
-        await this.waitForHandshake();
-
-        // v2 uses joinProjectResponse event instead of callback
-        if (this.projectRecordPromise) {
-            const project = await this.withTimeout(this.projectRecordPromise, 5000, 'Join project timeout');
-            log(`Connected to project (real-time)`);
+        let legacyError: unknown;
+        try {
+            const project = await this.joinProjectLegacy();
+            this.markProjectJoined(project);
+            log('Connected to project (real-time, legacy protocol)');
             return project;
+        } catch (error) {
+            legacyError = error;
+            log(`Legacy Socket.IO project join failed: ${errorMessage(error)}`);
         }
-        throw new Error('Socket not properly initialized');
+
+        this.init('query');
+        try {
+            const project = await this.joinProjectFromHandshake();
+            this.markProjectJoined(project);
+            log('Connected to project (real-time, query protocol)');
+            return project;
+        } catch (queryError) {
+            this.teardownSocket();
+            throw new Error(
+                `Unable to join the Overleaf project using either Socket.IO protocol. `
+                + `Legacy: ${errorMessage(legacyError)}. Query: ${errorMessage(queryError)}.`
+            );
+        }
+    }
+
+    private async joinProjectLegacy(): Promise<ProjectEntity> {
+        if (this.connectionMode !== 'legacy') {
+            throw new Error('Legacy Socket.IO connection is not active');
+        }
+        await this.waitForHandshake();
+        const response = await this.withTimeout(
+            this.raceConnectionFailure(this.emit('joinProject', { project_id: this.projectId })),
+            5000,
+            'Legacy project join timed out',
+        );
+        return projectFromResponse(response[0]);
+    }
+
+    private async joinProjectFromHandshake(): Promise<ProjectEntity> {
+        if (this.connectionMode !== 'query' || !this.projectRecordPromise) {
+            throw new Error('Query Socket.IO connection is not initialized');
+        }
+        await this.waitForHandshake();
+        return this.withTimeout(
+            this.raceConnectionFailure(this.projectRecordPromise),
+            5000,
+            'Query project join timed out',
+        );
+    }
+
+    private markProjectJoined(project: ProjectEntity): void {
+        this.projectRecord = project;
+        this._connected = true;
+        this.handlers.forEach(handler => handler.onConnected?.(this._publicId || ''));
     }
 
     /**
@@ -420,8 +542,7 @@ export class SocketIOAPI {
      * Disconnect from socket
      */
     disconnect() {
-        this.socket.disconnect();
-        this.socket.removeAllListeners?.();
+        this.teardownSocket();
         this.handlers = [];
         this._connected = false;
     }

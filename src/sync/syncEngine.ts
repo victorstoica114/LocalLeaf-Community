@@ -85,6 +85,10 @@ function isAuthError(error: unknown): boolean {
            errorStr.includes('unauthorized');
 }
 
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 function ensureApiSuccess(result: { type: 'success' | 'error'; message?: string }, action: string): void {
     if (!result || result.type !== 'success') {
         throw new Error(`${action}: ${result?.message || 'unknown Overleaf API error'}`);
@@ -217,6 +221,7 @@ export class SyncEngine {
 
         // Try socket.io first, fall back to HTTP-only mode
         let useHttpFallback = false;
+        let socketError: unknown;
         try {
             this.socket = new SocketIOAPI(this.api, identity, projectSettings.projectId);
 
@@ -256,6 +261,8 @@ export class SyncEngine {
             this.setStatus('idle', 'Connected (real-time)');
         } catch (error) {
             debugLog('Socket.io failed, using HTTP fallback:', error);
+            socketError = error;
+            this.log(`Real-time connection unavailable: ${errorMessage(error)}`);
             this.socket?.disconnect();
             useHttpFallback = true;
         }
@@ -295,9 +302,20 @@ export class SyncEngine {
 
                 this.setStatus('idle', 'Connected (HTTP mode)');
             } catch (httpError) {
-                const authErr = isAuthError(httpError);
-                this.setStatus('error', authErr ? 'Session expired' : `Failed to connect: ${httpError}`, undefined, authErr);
-                throw httpError;
+                const authErr = isAuthError(socketError) || isAuthError(httpError);
+                const connectionError = new Error(
+                    socketError
+                        ? `Real-time synchronization failed: ${errorMessage(socketError)} `
+                            + `HTTP fallback failed: ${errorMessage(httpError)}`
+                        : `HTTP synchronization failed: ${errorMessage(httpError)}`
+                );
+                this.setStatus(
+                    'error',
+                    authErr ? 'Session expired' : `Failed to connect: ${connectionError.message}`,
+                    undefined,
+                    authErr,
+                );
+                throw connectionError;
             }
         }
 

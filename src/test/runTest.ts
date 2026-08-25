@@ -91,6 +91,42 @@ let fetchResponse: {
 let fetchImplementation = async (_url?: unknown, _options?: unknown): Promise<typeof fetchResponse> => fetchResponse;
 
 let executeCommandImpl: (...args: unknown[]) => Promise<unknown> = async () => undefined;
+let useSocketIoMock = true;
+
+class FakeSocket {
+    private readonly listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+    constructor(
+        private readonly onEmit?: (event: string, args: unknown[]) => void,
+    ) {}
+
+    on(event: string, listener: (...args: unknown[]) => void): this {
+        const listeners = this.listeners.get(event) ?? [];
+        listeners.push(listener);
+        this.listeners.set(event, listeners);
+        return this;
+    }
+
+    emit(event: string, ...args: unknown[]): this {
+        this.onEmit?.(event, args);
+        return this;
+    }
+
+    trigger(event: string, ...args: unknown[]): void {
+        for (const listener of this.listeners.get(event) ?? []) {
+            listener(...args);
+        }
+    }
+
+    disconnect(): this {
+        return this;
+    }
+
+    removeAllListeners(): this {
+        this.listeners.clear();
+        return this;
+    }
+}
 
 interface MockUri {
     scheme: string;
@@ -202,7 +238,7 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             },
         };
     }
-    if (request === '../api/socketio') {
+    if (request === '../api/socketio' && useSocketIoMock) {
         return { SocketIOAPI: class {} };
     }
     if (request === './ignoreParser') {
@@ -226,6 +262,19 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
 };
 
 async function run(): Promise<void> {
+    useSocketIoMock = false;
+    const { SocketIOAPI } = require(path.join('..', 'api', 'socketio')) as {
+        SocketIOAPI: new (api: unknown, identity: unknown, projectId: string) => {
+            registerHandlers(handlers: {
+                onConnected?: (publicId: string) => void;
+                onFileRenamed?: (entityId: string, newName: string) => void;
+            }): void;
+            joinProject(): Promise<unknown>;
+            disconnect(): void;
+        };
+    };
+    useSocketIoMock = true;
+
     const { BaseAPI } = require(path.join('..', 'api', 'base')) as {
         BaseAPI: new (url: string) => {
             setIdentity(identity: unknown): void;
@@ -243,6 +292,92 @@ async function run(): Promise<void> {
     const { SyncEngine } = require(path.join('..', 'sync', 'syncEngine')) as {
         SyncEngine: new (...args: unknown[]) => object;
     };
+
+    const legacyProject = {
+        _id: 'legacy-project',
+        name: 'Legacy project',
+        rootFolder: [{
+            _id: 'legacy-root',
+            name: 'rootFolder',
+            docs: [],
+            fileRefs: [],
+            folders: [],
+        }],
+        owner: { _id: 'owner', email: 'owner@example.com', first_name: 'Owner' },
+        members: [],
+    };
+    const legacyQueries: Array<string | undefined> = [];
+    let legacyConnectedId: string | undefined;
+    const legacySocket = new FakeSocket((event, args) => {
+        if (event === 'joinProject') {
+            const callback = args.at(-1) as (...callbackArgs: unknown[]) => void;
+            callback(null, legacyProject, 'owner', 0);
+        }
+    });
+    const legacyApi = {
+        initSocket: (_identity: unknown, query?: string) => {
+            legacyQueries.push(query);
+            queueMicrotask(() => {
+                legacySocket.trigger('connect');
+                legacySocket.trigger('connectionAccepted', undefined, 'legacy-public-id');
+            });
+            return legacySocket;
+        },
+    };
+    const legacyClient = new SocketIOAPI(legacyApi, { cookies: 'cookie', csrfToken: 'csrf' }, 'legacy-project');
+    legacyClient.registerHandlers({ onConnected: publicId => { legacyConnectedId = publicId; } });
+    assert.deepStrictEqual(await legacyClient.joinProject(), legacyProject);
+    assert.deepStrictEqual(legacyQueries, [undefined], 'legacy servers must be joined without a handshake query');
+    assert.equal(legacyConnectedId, 'legacy-public-id');
+    legacyClient.disconnect();
+
+    const queryProject = {
+        ...legacyProject,
+        _id: 'query-project',
+        name: 'Query project',
+    };
+    const negotiatedQueries: Array<string | undefined> = [];
+    const negotiatedSockets: FakeSocket[] = [];
+    let renamedEvent: [string, string] | undefined;
+    const negotiationApi = {
+        initSocket: (_identity: unknown, query?: string) => {
+            negotiatedQueries.push(query);
+            const socket = new FakeSocket((event) => {
+                if (event === 'joinProject' && query === undefined) {
+                    socket.trigger('connectionRejected', {
+                        message: 'missing/bad ?projectId=... query flag on handshake',
+                    });
+                }
+            });
+            negotiatedSockets.push(socket);
+            queueMicrotask(() => {
+                socket.trigger('connect');
+                if (query !== undefined) {
+                    socket.trigger('joinProjectResponse', {
+                        publicId: 'query-public-id',
+                        project: queryProject,
+                    });
+                }
+            });
+            return socket;
+        },
+    };
+    const negotiatedClient = new SocketIOAPI(
+        negotiationApi,
+        { cookies: 'cookie', csrfToken: 'csrf' },
+        'query project/with spaces',
+    );
+    negotiatedClient.registerHandlers({
+        onFileRenamed: (entityId, newName) => { renamedEvent = [entityId, newName]; },
+    });
+    assert.deepStrictEqual(await negotiatedClient.joinProject(), queryProject);
+    assert.equal(negotiatedQueries.length, 2);
+    assert.equal(negotiatedQueries[0], undefined);
+    assert.match(negotiatedQueries[1] || '', /^\?projectId=query%20project%2Fwith%20spaces&t=\d+$/);
+    negotiatedSockets[1].trigger('reciveEntityRename', 'doc-id', 'renamed.tex');
+    assert.deepStrictEqual(renamedEvent, ['doc-id', 'renamed.tex'],
+        'event handlers must survive Socket.IO protocol negotiation');
+    negotiatedClient.disconnect();
 
     const api = new BaseAPI('https://overleaf.example/');
     api.setIdentity({ cookies: 'cookie', csrfToken: 'csrf' });
@@ -1267,6 +1402,12 @@ async function run(): Promise<void> {
         'the local integration checklist must never be packaged');
     assert.match(vscodeIgnore, /^local-pr3-artifacts\/\*\*$/m,
         'local PR artifacts must never be packaged');
+    assert.match(vscodeIgnore, /^\.localleaf\/\*\*$/m,
+        'workspace link metadata must never be packaged');
+    assert.match(vscodeIgnore, /^\.leafignore$/m,
+        'this checkout\'s local ignore rules must never be packaged');
+    assert.match(vscodeIgnore, /^\.mailmap$/m,
+        'repository-only author mappings must never be packaged');
     assert.match(vscodeIgnore, /^out\/\*\*$/m,
         'intermediate TypeScript output must not be packaged');
     assert.match(vscodeIgnore, /^node_modules\/\*\*$/m,

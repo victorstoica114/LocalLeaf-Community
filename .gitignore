@@ -34,3 +34,7 @@ local-pr3-artifacts/
 
 # Test workspace
 test-workspace/
+
+# LocalLeaf link metadata for this development checkout
+.localleaf/
+.leafignore
