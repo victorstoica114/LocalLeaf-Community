@@ -28,6 +28,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Rejected remote rename and move events that collide with another entity or move a folder into its own subtree
 - Bounded `.localleaf/settings.json` and `.leafignore` input sizes as well as ignore-pattern count and length
 - Bounded local filesystem reads and upload payloads, including text-document limits before OT generation
+- Replaced retained binary synchronization payloads with zero-byte markers while keeping content hashes for echo detection
 
 ## [0.2.1] - 2026-08-23
 

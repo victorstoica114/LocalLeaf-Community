@@ -29,6 +29,7 @@ const MAX_PENDING_REMOTE_EVENT_CHARACTERS = 20 * 1024 * 1024;
 const DEFAULT_REMOTE_EVENT_COST = 4096;
 const MAX_LOCAL_SCAN_ENTITIES = 100_000;
 const MAX_LOCAL_SCAN_DEPTH = 256;
+const SYNCHRONIZED_BINARY_MARKER = new Uint8Array(0);
 
 /**
  * Sync status
@@ -628,6 +629,14 @@ export class SyncEngine {
         return true;
     }
 
+    private recordSynchronizedContent(entry: FileTreeEntry, content: Uint8Array): void {
+        this.baseContent.set(
+            entry.path,
+            entry.type === 'doc' ? content : SYNCHRONIZED_BINARY_MARKER,
+        );
+        this.fileCache.set(entry.path, hashContent(content));
+    }
+
     private getOpenTextDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
         const target = uri.toString();
         return vscode.workspace.textDocuments.find(document => document.uri.toString() === target);
@@ -997,8 +1006,7 @@ export class SyncEngine {
         if (resolution === 'skip') return 'skipped';
 
         await vscode.workspace.fs.writeFile(localUri, content);
-        this.baseContent.set(entry.path, content);
-        this.fileCache.set(entry.path, hashContent(content));
+        this.recordSynchronizedContent(entry, content);
         if (entry.type === 'doc' && this.socket && !this.joinedDocs.has(entry.id)) {
             try {
                 await this.socket.joinDoc(entry.id);
@@ -1074,7 +1082,7 @@ export class SyncEngine {
                 this.log(`Replaced on Overleaf: ${relativePath}`);
             }
 
-            this.baseContent.set(relativePath, content);
+            this.recordSynchronizedContent(entry, content);
             this.setStatus('idle');
         } catch (error) {
             // Don't show error for file-not-found during rapid operations
@@ -1290,8 +1298,7 @@ export class SyncEngine {
             }
 
             await this.pushDocumentChanges(entry.id, relativePath, content);
-            this.baseContent.set(relativePath, content);
-            this.fileCache.set(relativePath, hashContent(content));
+            this.recordSynchronizedContent(entry, content);
         });
     }
 
@@ -1352,7 +1359,7 @@ export class SyncEngine {
         let renamedOriginal = false;
         let uploadedReplacement = false;
 
-        this.baseContent.set(entry.path, content);
+        this.baseContent.set(entry.path, SYNCHRONIZED_BINARY_MARKER);
         try {
             // Overleaf rejects duplicate names. Move the original aside first,
             // then keep it as a rollback copy until the replacement is tracked.
@@ -1528,7 +1535,7 @@ export class SyncEngine {
                         if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
                             await this.refreshProjectFileTree();
                         }
-                        this.baseContent.set(relativePath, content);
+                        this.baseContent.set(relativePath, SYNCHRONIZED_BINARY_MARKER);
                         this.fileCache.set(relativePath, hashContent(content));
                     });
                 }
@@ -2500,7 +2507,7 @@ export class SyncEngine {
                 if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
                     await this.refreshProjectFileTree();
                 }
-                this.baseContent.set(relativePath, content);
+                this.baseContent.set(relativePath, SYNCHRONIZED_BINARY_MARKER);
                 this.fileCache.set(relativePath, hashContent(content));
             });
         }
@@ -2728,8 +2735,7 @@ export class SyncEngine {
                                 await this.replaceRemoteFile(entry, latestLocalContent);
                             }
 
-                            this.baseContent.set(entry.path, latestLocalContent);
-                            this.fileCache.set(entry.path, hashContent(latestLocalContent));
+                            this.recordSynchronizedContent(entry, latestLocalContent);
                             return;
                         }
                         // resolution === 'useRemote' - continue to download
@@ -2751,8 +2757,7 @@ export class SyncEngine {
                 // Skip write if content is identical
                 if (contentEquals(localContent, remoteContent)) {
                     // Content is the same, just update cache
-                    this.baseContent.set(entry.path, remoteContent);
-                    this.fileCache.set(entry.path, hashContent(remoteContent));
+                    this.recordSynchronizedContent(entry, remoteContent);
                     return;
                 }
 
@@ -2814,8 +2819,7 @@ export class SyncEngine {
                     }
                     await vscode.workspace.fs.writeFile(localUri, remoteContent);
                 }
-                this.baseContent.set(entry.path, remoteContent);
-                this.fileCache.set(entry.path, hashContent(remoteContent));
+                this.recordSynchronizedContent(entry, remoteContent);
                 downloadedCount++;
             };
 

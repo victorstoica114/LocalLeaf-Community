@@ -927,6 +927,7 @@ async function run(): Promise<void> {
 
     const propagation = Object.create(SyncEngine.prototype) as any;
     propagation.fileCache = new Map();
+    propagation.baseContent = new Map();
     assert.equal(
         propagation.shouldPropagate('/chapter.tex', Uint8Array.from([1])),
         true
@@ -950,6 +951,20 @@ async function run(): Promise<void> {
         true,
         'different invalid UTF-8 byte sequences must not collide in the synchronization cache',
     );
+    const binaryBaseline = Uint8Array.from([1, 2, 3, 4]);
+    propagation.recordSynchronizedContent(
+        { type: 'file', path: '/binary.dat' },
+        binaryBaseline,
+    );
+    assert.equal(propagation.baseContent.get('/binary.dat').byteLength, 0,
+        'binary synchronization baselines must not retain complete payloads in memory');
+    const documentBaseline = new TextEncoder().encode('document baseline');
+    propagation.recordSynchronizedContent(
+        { type: 'doc', path: '/chapter.tex' },
+        documentBaseline,
+    );
+    assert.strictEqual(propagation.baseContent.get('/chapter.tex'), documentBaseline,
+        'OT documents must retain their exact server baseline');
 
     assert.deepEqual(
         propagation.calculateOps('hello world', 'hello brave world'),
