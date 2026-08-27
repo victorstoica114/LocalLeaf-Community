@@ -996,14 +996,23 @@ async function run(): Promise<void> {
         true
     );
     assert.equal(
-        propagation.shouldPropagate('/chapter.tex', Uint8Array.from([2])),
+        propagation.shouldPropagate('/chapter.tex', Uint8Array.from([1])),
         true,
-        'different content inside the debounce window must not be discarded'
+        'unconfirmed content must remain eligible for retry after a failed upload'
+    );
+    propagation.recordSynchronizedContent(
+        { type: 'doc', path: '/chapter.tex' },
+        Uint8Array.from([1]),
+    );
+    assert.equal(
+        propagation.shouldPropagate('/chapter.tex', Uint8Array.from([1])),
+        false,
+        'confirmed identical content should still be treated as an echo'
     );
     assert.equal(
         propagation.shouldPropagate('/chapter.tex', Uint8Array.from([2])),
-        false,
-        'identical content should still be treated as an echo'
+        true,
+        'different content inside the debounce window must not be discarded'
     );
     assert.equal(
         propagation.shouldPropagate('/binary.dat', Uint8Array.from([0xff])),

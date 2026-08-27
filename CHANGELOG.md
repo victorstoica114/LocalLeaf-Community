@@ -35,6 +35,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Bounded project-list responses and validated HTTP route, mutation, and project metadata IDs at the transport boundary
 - Preserved ignored and local-only files when a synchronized remote folder is deleted or moved out of scope
 - Prevented full pulls from creating protected or ignored remote directories locally
+- Kept failed local changes eligible for retry instead of caching them as successful synchronization echoes
 
 ## [0.2.1] - 2026-08-23
 

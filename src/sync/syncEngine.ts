@@ -625,15 +625,10 @@ export class SyncEngine {
     private shouldPropagate(path: string, content?: Uint8Array): boolean {
         const cache = this.fileCache.get(path);
         const newHash = hashContent(content);
-
-        // Only identical content is an echo. Editors often emit an empty
-        // create/change event followed immediately by the actual contents.
-        if (cache === newHash) {
-            return false;
-        }
-
-        this.fileCache.set(path, newHash);
-        return true;
+        // Only content confirmed as synchronized is an echo. Advancing this
+        // cache before the remote operation succeeds would suppress retries
+        // after a failed upload of otherwise unchanged local content.
+        return cache !== newHash;
     }
 
     private recordSynchronizedContent(entry: FileTreeEntry, content: Uint8Array): void {
