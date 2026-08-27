@@ -33,6 +33,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Capped retained conflict-diff content at 20 MiB per synchronization session
 - Bounded login inputs and authentication metadata, rejected unsafe header characters, and copied identities defensively
 - Bounded project-list responses and validated HTTP route, mutation, and project metadata IDs at the transport boundary
+- Preserved ignored and local-only files when a synchronized remote folder is deleted or moved out of scope
 
 ## [0.2.1] - 2026-08-23
 

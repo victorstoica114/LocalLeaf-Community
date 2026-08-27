@@ -778,6 +778,75 @@ export class SyncEngine {
         void vscode.window.showWarningMessage(`LocalLeaf: ${message}`);
     }
 
+    private reportPreservedRemoteFolder(projectPath: string): void {
+        const message = `Removed synchronized content under ${projectPath}, but kept local-only, `
+            + 'ignored, or unsaved files in that folder.';
+        this.log(message);
+        void vscode.window.showWarningMessage(`LocalLeaf: ${message}`);
+    }
+
+    private getTrackedSubtreeEntries(projectPath: string): FileTreeEntry[] {
+        return [...this.fileTree.values()].filter(candidate =>
+            candidate.path === projectPath
+            || (projectPath.endsWith('/') && candidate.path.startsWith(projectPath))
+        );
+    }
+
+    /**
+     * Delete only paths represented by the remote tree. A recursive directory
+     * delete could also erase ignored or local-only files that Overleaf has
+     * never seen, so tracked files are removed first and directories only when
+     * they are empty afterwards.
+     */
+    private async deleteTrackedLocalEntry(entry: FileTreeEntry): Promise<'deleted' | 'preserved'> {
+        if (entry.type !== 'folder') {
+            const localUri = this.settings.getFilePath(entry.path);
+            await this.assertNoSymbolicLinks(localUri);
+            return this.deleteLocalPath(entry.path, localUri, false);
+        }
+
+        const trackedEntries = this.getTrackedSubtreeEntries(entry.path)
+            .filter(candidate => this.shouldSync(candidate.path));
+        let preserved = false;
+
+        const files = trackedEntries
+            .filter(candidate => candidate.type !== 'folder')
+            .sort((left, right) => right.path.length - left.path.length);
+        for (const candidate of files) {
+            this.throwIfDisposed();
+            const localUri = this.settings.getFilePath(candidate.path);
+            await this.assertNoSymbolicLinks(localUri);
+            try {
+                const outcome = await this.deleteLocalPath(candidate.path, localUri, false);
+                preserved ||= outcome === 'preserved';
+            } catch (error) {
+                if (!isFileNotFoundError(error)) throw error;
+            }
+        }
+
+        const folders = trackedEntries
+            .filter(candidate => candidate.type === 'folder')
+            .sort((left, right) => right.path.length - left.path.length);
+        for (const candidate of folders) {
+            this.throwIfDisposed();
+            const localUri = this.settings.getFilePath(candidate.path);
+            await this.assertNoSymbolicLinks(localUri);
+            try {
+                const remaining = await vscode.workspace.fs.readDirectory(localUri);
+                if (remaining.length > 0) {
+                    preserved = true;
+                    continue;
+                }
+                const outcome = await this.deleteLocalPath(candidate.path, localUri, false);
+                preserved ||= outcome === 'preserved';
+            } catch (error) {
+                if (!isFileNotFoundError(error)) throw error;
+            }
+        }
+
+        return preserved ? 'preserved' : 'deleted';
+    }
+
     private getOpenDocumentContent(document: vscode.TextDocument): Uint8Array {
         const text = document.getText();
         if (text.length > MAX_REMOTE_DOCUMENT_CHARACTERS) {
@@ -1798,8 +1867,11 @@ export class SyncEngine {
                     if (syncedAfter) {
                         await this.renameLocalPath(oldPath, oldUri, newUri);
                     } else {
-                        const outcome = await this.deleteLocalPath(oldPath, oldUri, true);
-                        if (outcome === 'preserved') this.reportPreservedRemoteDeletion(oldPath);
+                        const outcome = await this.deleteTrackedLocalEntry(entry);
+                        if (outcome === 'preserved') {
+                            if (entry.type === 'folder') this.reportPreservedRemoteFolder(oldPath);
+                            else this.reportPreservedRemoteDeletion(oldPath);
+                        }
                         this.removeTrackedContent(oldPath);
                     }
                 } catch (error) {
@@ -1861,19 +1933,17 @@ export class SyncEngine {
         try {
             this.setStatus('pulling', `Deleting ${entry.path}`, entry.path);
 
-            const removedEntries = [...this.fileTree.values()].filter(candidate =>
-                candidate.path === entry.path
-                || (entry.path.endsWith('/') && candidate.path.startsWith(entry.path))
-            );
+            const removedEntries = this.getTrackedSubtreeEntries(entry.path);
 
             // Delete local content first. If this fails, keep the remote tree
             // and joined-document state intact so a later pull can retry.
-            const localUri = this.settings.getFilePath(entry.path);
-            await this.assertNoSymbolicLinks(localUri);
             this.throwIfDisposed();
             try {
-                const outcome = await this.deleteLocalPath(entry.path, localUri, true);
-                if (outcome === 'preserved') this.reportPreservedRemoteDeletion(entry.path);
+                const outcome = await this.deleteTrackedLocalEntry(entry);
+                if (outcome === 'preserved') {
+                    if (entry.type === 'folder') this.reportPreservedRemoteFolder(entry.path);
+                    else this.reportPreservedRemoteDeletion(entry.path);
+                }
             } catch (error) {
                 if (!isFileNotFoundError(error)) throw error;
             }
@@ -1937,8 +2007,11 @@ export class SyncEngine {
                     if (syncedAfter) {
                         await this.renameLocalPath(oldPath, oldUri, newUri);
                     } else {
-                        const outcome = await this.deleteLocalPath(oldPath, oldUri, true);
-                        if (outcome === 'preserved') this.reportPreservedRemoteDeletion(oldPath);
+                        const outcome = await this.deleteTrackedLocalEntry(entry);
+                        if (outcome === 'preserved') {
+                            if (entry.type === 'folder') this.reportPreservedRemoteFolder(oldPath);
+                            else this.reportPreservedRemoteDeletion(oldPath);
+                        }
                         this.removeTrackedContent(oldPath);
                     }
                 } catch (error) {

@@ -1375,6 +1375,46 @@ async function run(): Promise<void> {
     assert.equal(subtreeRemoval.fileCache.size, 0);
     assert.equal(subtreeRemoval.joinedDocs.size, 0);
 
+    const safeFolderWorkspace = mockFileUri('D:\\safe-folder-delete');
+    resetMockWorkspace([safeFolderWorkspace], [
+        ['D:\\safe-folder-delete', { type: 2 }],
+        ['D:\\safe-folder-delete\\folder', { type: 2 }],
+        ['D:\\safe-folder-delete\\folder\\tracked.tex', { type: 1, content: 'tracked' }],
+        ['D:\\safe-folder-delete\\folder\\local-notes.txt', { type: 1, content: 'local' }],
+        ['D:\\safe-folder-delete\\folder\\nested', { type: 2 }],
+        ['D:\\safe-folder-delete\\folder\\nested\\tracked.tex', { type: 1, content: 'nested' }],
+    ]);
+    const safeFolderDelete = Object.create(SyncEngine.prototype) as any;
+    safeFolderDelete.disposed = false;
+    safeFolderDelete.fileTree = new Map([
+        ['folder', { id: 'folder', type: 'folder', path: '/folder/' }],
+        ['tracked', { id: 'tracked', type: 'doc', path: '/folder/tracked.tex' }],
+        ['nested', { id: 'nested', type: 'folder', path: '/folder/nested/' }],
+        ['nested-tracked', { id: 'nested-tracked', type: 'doc', path: '/folder/nested/tracked.tex' }],
+    ]);
+    safeFolderDelete.settings = {
+        getFilePath: (projectPath: string) => mockFileUri(
+            `D:\\safe-folder-delete${projectPath.replace(/\/$/, '').replace(/\//g, '\\')}`
+        ),
+    };
+    safeFolderDelete.shouldSync = () => true;
+    safeFolderDelete.assertNoSymbolicLinks = async () => undefined;
+    const safeFolderOutcome = await safeFolderDelete.deleteTrackedLocalEntry(
+        safeFolderDelete.fileTree.get('folder')
+    );
+    assert.equal(safeFolderOutcome, 'preserved');
+    assert.equal(mockFileEntries.has(path.win32.normalize(
+        'D:\\safe-folder-delete\\folder\\local-notes.txt'
+    )), true, 'remote folder deletion must preserve local-only content');
+    assert.equal(mockFileEntries.has(path.win32.normalize(
+        'D:\\safe-folder-delete\\folder\\tracked.tex'
+    )), false, 'remote folder deletion must still remove synchronized files');
+    assert.equal(mockFileEntries.has(path.win32.normalize(
+        'D:\\safe-folder-delete\\folder\\nested\\tracked.tex'
+    )), false);
+    assert.ok(mockFileDeletes.every(deletion => deletion.recursive === false),
+        'remote folder deletion must never issue a recursive local delete');
+
     const acknowledgement = Object.create(SyncEngine.prototype) as any;
     acknowledgement.fileTree = new Map([
         ['root', { id: 'root', type: 'folder', path: '/' }],
