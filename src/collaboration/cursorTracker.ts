@@ -79,6 +79,9 @@ export class CursorTracker {
     private disposables: vscode.Disposable[] = [];
     private _publicId?: string;
     private docIdToPath: Map<string, string> = new Map();
+    private pendingLocalPosition?: { docId: string; row: number; column: number };
+    private publishingLocalPosition = false;
+    private disposed = false;
 
     constructor(
         private readonly socket: SocketIOAPI,
@@ -134,6 +137,7 @@ export class CursorTracker {
      * Initialize with connected users
      */
     async initialize(): Promise<void> {
+        if (this.disposed) return;
         try {
             const users = await this.socket.getConnectedUsers();
             for (const user of users) {
@@ -333,6 +337,40 @@ export class CursorTracker {
             }
             user.decoration.dispose();
             this.users.delete(clientId);
+            if (![...this.users.values()].some(candidate => candidate.userId === user.userId)) {
+                this.userIdToColor.delete(user.userId);
+            }
+        }
+    }
+
+    /**
+     * Keep at most one cursor ACK in flight and one latest queued position.
+     * Selection events can arrive much faster than a remote server responds;
+     * publishing every intermediate point would retain unbounded callbacks.
+     */
+    private async queueLocalPosition(docId: string, row: number, column: number): Promise<void> {
+        if (this.disposed) return;
+        this.pendingLocalPosition = { docId, row, column };
+        if (this.publishingLocalPosition) return;
+
+        this.publishingLocalPosition = true;
+        try {
+            while (!this.disposed && this.pendingLocalPosition) {
+                const position = this.pendingLocalPosition;
+                this.pendingLocalPosition = undefined;
+                try {
+                    await this.socket.updatePosition(
+                        position.docId,
+                        position.row,
+                        position.column,
+                    );
+                } catch (error) {
+                    this.pendingLocalPosition = undefined;
+                    throw error;
+                }
+            }
+        } finally {
+            this.publishingLocalPosition = false;
         }
     }
 
@@ -360,7 +398,11 @@ export class CursorTracker {
         if (docId) {
             const selection = event.selections[0];
             try {
-                await this.socket.updatePosition(docId, selection.active.line, selection.active.character);
+                await this.queueLocalPosition(
+                    docId,
+                    selection.active.line,
+                    selection.active.character,
+                );
             } catch {
                 // Ignore errors (e.g., if disconnected)
             }
@@ -445,10 +487,16 @@ export class CursorTracker {
      * Dispose resources
      */
     dispose(): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        this.pendingLocalPosition = undefined;
         for (const user of this.users.values()) {
             user.decoration.dispose();
         }
         this.users.clear();
+        this.userIdToColor.clear();
+        this.docIdToPath.clear();
         this.disposables.forEach(d => d.dispose());
+        this.disposables = [];
     }
 }

@@ -635,6 +635,47 @@ async function run(): Promise<void> {
     const { SyncEngine } = require(path.join('..', 'sync', 'syncEngine')) as {
         SyncEngine: new (...args: unknown[]) => object;
     };
+    const { CursorTracker } = require(path.join('..', 'collaboration', 'cursorTracker')) as {
+        CursorTracker: new (...args: unknown[]) => object;
+    };
+
+    const cursorQueue = Object.create(CursorTracker.prototype) as any;
+    const cursorCalls: Array<[string, number, number]> = [];
+    let releaseFirstCursorCall: (() => void) | undefined;
+    const firstCursorCall = new Promise<void>(resolve => { releaseFirstCursorCall = resolve; });
+    cursorQueue.socket = {
+        updatePosition: async (docId: string, row: number, column: number) => {
+            cursorCalls.push([docId, row, column]);
+            if (cursorCalls.length === 1) await firstCursorCall;
+        },
+    };
+    cursorQueue.disposed = false;
+    cursorQueue.publishingLocalPosition = false;
+    const cursorPublishing = cursorQueue.queueLocalPosition('doc', 1, 1);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    await cursorQueue.queueLocalPosition('doc', 2, 2);
+    await cursorQueue.queueLocalPosition('doc', 3, 3);
+    assert.deepStrictEqual(cursorCalls, [['doc', 1, 1]],
+        'cursor updates must not create concurrent Socket.IO ACK callbacks');
+    releaseFirstCursorCall!();
+    await cursorPublishing;
+    assert.deepStrictEqual(cursorCalls, [['doc', 1, 1], ['doc', 3, 3]],
+        'cursor publishing must retain only the latest position while an ACK is pending');
+
+    let disposedCursorDecoration = 0;
+    cursorQueue.users = new Map([['client', {
+        userId: 'user',
+        decoration: { dispose: () => { disposedCursorDecoration++; } },
+    }]]);
+    cursorQueue.userIdToColor = new Map([['user', '#fff']]);
+    cursorQueue.docIdToPath = new Map([['doc', '/main.tex']]);
+    cursorQueue.disposables = [];
+    cursorQueue.handleUserDisconnected('client');
+    assert.equal(cursorQueue.userIdToColor.size, 0,
+        'disconnected user colors must not accumulate for the lifetime of the extension');
+    cursorQueue.dispose();
+    assert.equal(disposedCursorDecoration, 1);
+    assert.equal(cursorQueue.docIdToPath.size, 0);
 
     const legacyProject = {
         _id: 'legacy-project',
@@ -2456,6 +2497,8 @@ async function run(): Promise<void> {
         'official Overleaf detection must use the parsed hostname, not a substring');
     assert.match(extensionSource, /async function cmdRefreshCookie[\s\S]*loginWithCookies\(serverUrl, cookies\)/,
         'cookie refresh must use the same URL and HTTP safety policy as login');
+    assert.doesNotMatch(extensionSource, /context\.subscriptions\.push\(tracker\)/,
+        'reconnected cursor trackers must not be retained for the full extension lifetime');
     assert.match(extensionSource, /handleWorkspaceFoldersChanged[\s\S]*disposeCurrentSyncSession\(\)[\s\S]*initializeSync/,
         'workspace-folder changes must replace the active synchronization session');
     const initializeSyncStart = extensionSource.indexOf('async function initializeSync');

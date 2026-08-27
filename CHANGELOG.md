@@ -40,6 +40,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Closed stalled Socket.IO connections on event timeouts and cleared legacy ACK callbacks and queued payloads on disconnect
 - Tracked binary replacement backups under their real temporary paths and kept them until the uploaded replacement identity is verified
 - Enforced inbound WebSocket payload and buffering limits before legacy Socket.IO messages are parsed
+- Coalesced rapid cursor updates and released cursor-tracking state across disconnects and reconnections
 
 ## [0.2.1] - 2026-08-23
 

@@ -398,7 +398,6 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
                 tracker.dispose();
                 return;
             }
-            context.subscriptions.push(tracker);
         }
 
         // Start periodic status updates for collaborators
