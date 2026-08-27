@@ -39,6 +39,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Replaced retained Socket.IO echo payloads with bounded SHA-256 fingerprints and capped stale suppression state
 - Closed stalled Socket.IO connections on event timeouts and cleared legacy ACK callbacks and queued payloads on disconnect
 - Tracked binary replacement backups under their real temporary paths and kept them until the uploaded replacement identity is verified
+- Enforced inbound WebSocket payload and buffering limits before legacy Socket.IO messages are parsed
 
 ## [0.2.1] - 2026-08-23
 

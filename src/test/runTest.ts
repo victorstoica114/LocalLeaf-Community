@@ -68,8 +68,17 @@ async function verifyWebSocketCompatibility(): Promise<void> {
             assert.ok(address && typeof address !== 'string');
             client = new WebSocket(`ws://127.0.0.1:${address.port}`, {
                 headers: { Cookie: 'localleaf-test=1' },
+                maxPayload: 1024 * 1024,
             });
-            client.onopen = () => client.send('localleaf-ws-smoke');
+            client.onopen = () => {
+                try {
+                    assert.equal(client._receiver?._maxPayload, 1024 * 1024,
+                        'the patched ws client must enforce its configured inbound payload limit');
+                    client.send('localleaf-ws-smoke');
+                } catch (error) {
+                    finish(error as Error);
+                }
+            };
             client.onmessage = (event: { data: unknown }) => {
                 try {
                     assert.equal(String(event.data), 'localleaf-ws-smoke');
@@ -2956,6 +2965,8 @@ async function run(): Promise<void> {
     );
     assert.match(socketTransportSource, /require\('ws'\)/);
     assert.match(socketTransportSource, /headers:\s*extraHeaders\s*\|\|\s*\{\}/);
+    assert.match(socketTransportSource, /maxPayload:\s*64\s*\*\s*1024\s*\*\s*1024/);
+    assert.match(socketTransportSource, /maxBufferedChunks:\s*16\s*\*\s*1024/);
     assert.match(socketTransportSource, /\.onopen\s*=/);
     assert.match(socketTransportSource, /\.onmessage\s*=/);
     const socketLifecycleSource = fs.readFileSync(
@@ -2985,6 +2996,12 @@ async function run(): Promise<void> {
         'legacy disconnects must release every pending ACK callback');
     assert.deepStrictEqual(legacySocketManager.buffer, [],
         'legacy disconnects must release queued payloads');
+    const wsClientSource = fs.readFileSync(
+        path.join(__dirname, '..', '..', 'node_modules', 'ws', 'lib', 'websocket.js'),
+        'utf8',
+    );
+    assert.match(wsClientSource, /maxPayload:\s*100\s*\*\s*1024\s*\*\s*1024/);
+    assert.match(wsClientSource, /head,\s*options\.maxPayload,/s);
     await verifyWebSocketCompatibility();
     await verifyHardenedXmlHttpRequest();
 

@@ -86,7 +86,7 @@ index 07c1c3f..862ebcd 100644
 +
      if (wasConnected || wasConnecting) {
 diff --git a/node_modules/socket.io-client/lib/transports/websocket.js b/node_modules/socket.io-client/lib/transports/websocket.js
-index 0dfa483..d878bbb 100644
+index 0dfa483..eab07d3 100644
 --- a/node_modules/socket.io-client/lib/transports/websocket.js
 +++ b/node_modules/socket.io-client/lib/transports/websocket.js
 @@ -50,7 +50,7 @@
@@ -98,13 +98,15 @@ index 0dfa483..d878bbb 100644
      var query = io.util.query(this.socket.options.query)
        , self = this
        , Socket
-@@ -63,7 +63,9 @@
+@@ -63,7 +63,11 @@
        Socket = global.MozWebSocket || global.WebSocket;
      }
  
 -    this.websocket = new Socket(this.prepareUrl() + query);
 +    this.websocket = new Socket(this.prepareUrl() + query, {
-+      headers: extraHeaders || {}
++      headers: extraHeaders || {},
++      maxPayload: 64 * 1024 * 1024,
++      maxBufferedChunks: 16 * 1024
 +    });
  
      this.websocket.onopen = function () {
