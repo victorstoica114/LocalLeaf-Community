@@ -788,6 +788,12 @@ async function run(): Promise<void> {
 
     const api = new BaseAPI('https://overleaf.example/');
     api.setIdentity({ cookies: 'cookie', csrfToken: 'csrf' });
+    fetchResponse = {
+        ok: true,
+        status: 200,
+        json: async () => ({ entity_id: 'binary-id-1', entity_type: 'folder' }),
+        text: async () => '',
+    };
     const upload = await api.uploadFile(
         'project',
         'folder',
@@ -956,6 +962,8 @@ async function run(): Promise<void> {
     textCreation.fileTree = new Map();
     textCreation.fileTreeByPath = new Map();
     textCreation.baseContent = new Map();
+    textCreation.fileCache = new Map();
+    textCreation.pendingLocalCreates = new Set();
     textCreation.socket = {};
     let pushedDocument: { id: string; path: string; content: Uint8Array } | undefined;
     textCreation.pushDocumentChanges = async (
@@ -980,6 +988,64 @@ async function run(): Promise<void> {
         path: '/new.tex',
         content: textContent,
     });
+    assert.equal(textCreation.pendingLocalCreates.size, 0);
+    assert.deepStrictEqual(textCreation.baseContent.get('/new.tex'), textContent,
+        'a new document must enter the synchronized baseline only after its content push succeeds');
+
+    const failedTextCreation = Object.create(SyncEngine.prototype) as any;
+    failedTextCreation.api = {
+        addDoc: async () => ({ type: 'error', message: 'simulated create failure' }),
+    };
+    failedTextCreation.fileTree = new Map();
+    failedTextCreation.fileTreeByPath = new Map();
+    failedTextCreation.baseContent = new Map();
+    failedTextCreation.pendingLocalCreates = new Set();
+    failedTextCreation.socket = {};
+    await assert.rejects(
+        () => failedTextCreation.createTextDocumentWithContent(
+            'project',
+            'folder',
+            '/failed.tex',
+            'failed.tex',
+            textContent,
+        ),
+        /simulated create failure/,
+    );
+    assert.equal(failedTextCreation.baseContent.has('/failed.tex'), false,
+        'failed creates must not leave a false synchronized baseline');
+    assert.equal(failedTextCreation.pendingLocalCreates.size, 0,
+        'pending-create markers must be released after failures');
+
+    const failedTextPush = Object.create(SyncEngine.prototype) as any;
+    failedTextPush.api = {
+        addDoc: async () => ({
+            type: 'success',
+            doc: { _id: 'empty-remote-doc', _type: 'doc', name: 'failed-push.tex' },
+        }),
+    };
+    failedTextPush.fileTree = new Map();
+    failedTextPush.fileTreeByPath = new Map();
+    failedTextPush.baseContent = new Map();
+    failedTextPush.pendingLocalCreates = new Set();
+    failedTextPush.socket = {};
+    failedTextPush.pushDocumentChanges = async () => {
+        throw new Error('simulated content push failure');
+    };
+    await assert.rejects(
+        () => failedTextPush.createTextDocumentWithContent(
+            'project',
+            'folder',
+            '/failed-push.tex',
+            'failed-push.tex',
+            textContent,
+        ),
+        /simulated content push failure/,
+    );
+    assert.equal(failedTextPush.fileTreeByPath.has('/failed-push.tex'), true,
+        'a remotely created empty document must remain tracked for a retry');
+    assert.equal(failedTextPush.baseContent.has('/failed-push.tex'), false,
+        'an empty remote document must not be marked as containing the failed local push');
+    assert.equal(failedTextPush.pendingLocalCreates.size, 0);
 
     const binaryReplacement = Object.create(SyncEngine.prototype) as any;
     binaryReplacement.settings = {
@@ -1082,6 +1148,20 @@ async function run(): Promise<void> {
     assert.deepStrictEqual(
         failedReplacement.baseContent.get('/figure.pdf'),
         oldBinaryContent
+    );
+
+    const invalidUploadTracker = Object.create(SyncEngine.prototype) as any;
+    invalidUploadTracker.fileTree = new Map();
+    invalidUploadTracker.fileTreeByPath = new Map();
+    assert.throws(
+        () => invalidUploadTracker.trackUploadedEntity(
+            { file: { _id: 'wrong-type', _type: 'folder', name: 'figure.pdf' } },
+            'folder',
+            'figure.pdf',
+            '/figure.pdf',
+        ),
+        /invalid uploaded entity type/,
+        'file upload tracking must reject impossible server entity types',
     );
 
     const folderRebase = Object.create(SyncEngine.prototype) as any;
@@ -1642,6 +1722,7 @@ async function run(): Promise<void> {
     cancellableLock.fileTreeByPath = new Map();
     cancellableLock.fileCache = new Map();
     cancellableLock.baseContent = new Map();
+    cancellableLock.pendingLocalCreates = new Set();
     cancellableLock.joinedDocs = new Set();
     const pendingLock = cancellableLock.acquireLockWhenAvailable('/busy.tex');
     cancellableLock.disconnect();

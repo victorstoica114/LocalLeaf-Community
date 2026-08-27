@@ -131,6 +131,7 @@ export class SyncEngine {
     private disposables: vscode.Disposable[] = [];
     private syncLock: Set<string> = new Set();
     private joinedDocs: Set<string> = new Set();
+    private pendingLocalCreates: Set<string> = new Set();
     private suppressedRemoteDeletes: Set<string> = new Set();
     private suppressedRemoteRenames: Map<string, Set<string>> = new Map();
     private suppressedRemoteDocumentUpdates: Map<string, Set<string>> = new Map();
@@ -1156,10 +1157,12 @@ export class SyncEngine {
             return undefined;
         }
         const entityId = validateOverleafId(result.file._id, 'uploaded entity ID');
-        const entityType = result.file._type || 'file';
+        if (result.file._type !== 'file') {
+            throw new Error(`Overleaf returned an invalid uploaded entity type for ${path}`);
+        }
         const existing = this.fileTree.get(entityId);
         if (existing) {
-            if (existing.path !== path || existing.type !== entityType) {
+            if (existing.path !== path || existing.type !== 'file') {
                 throw new Error(`Overleaf reused uploaded entity ID: ${entityId}`);
             }
             return existing;
@@ -1167,8 +1170,8 @@ export class SyncEngine {
 
         const entry: FileTreeEntry = {
             id: entityId,
-            type: entityType,
-            name: result.file.name || name,
+            type: 'file',
+            name,
             path,
             parentId,
         };
@@ -1178,6 +1181,18 @@ export class SyncEngine {
         return entry;
     }
 
+    private async runPendingLocalCreate<T>(
+        path: string,
+        operation: () => Promise<T>,
+    ): Promise<T> {
+        this.pendingLocalCreates.add(path);
+        try {
+            return await operation();
+        } finally {
+            this.pendingLocalCreates.delete(path);
+        }
+    }
+
     private async createTextDocumentWithContent(
         projectId: string,
         parentId: string,
@@ -1185,41 +1200,44 @@ export class SyncEngine {
         name: string,
         content: Uint8Array
     ): Promise<void> {
-        // Set this before creating the document so its socket acknowledgement
-        // is recognized as an echo of the local operation.
-        this.baseContent.set(relativePath, content);
-        const result = await this.api.addDoc(projectId, parentId, name);
-        ensureApiSuccess(result, `Create ${relativePath}`);
+        await this.runPendingLocalCreate(relativePath, async () => {
+            const result = await this.api.addDoc(projectId, parentId, name);
+            ensureApiSuccess(result, `Create ${relativePath}`);
 
-        let entry: FileTreeEntry | undefined;
-        if (result.doc?._id) {
-            const docId = validateOverleafId(result.doc._id, 'document ID');
-            const existing = this.fileTree.get(docId);
-            if (existing && (existing.path !== relativePath || existing.type !== 'doc')) {
-                throw new Error(`Overleaf reused document ID: ${docId}`);
+            let entry: FileTreeEntry | undefined;
+            if (result.doc?._id) {
+                const docId = validateOverleafId(result.doc._id, 'document ID');
+                const existing = this.fileTree.get(docId);
+                if (existing && (existing.path !== relativePath || existing.type !== 'doc')) {
+                    throw new Error(`Overleaf reused document ID: ${docId}`);
+                }
+                entry = existing || {
+                    id: docId,
+                    type: 'doc',
+                    name,
+                    path: relativePath,
+                    parentId,
+                };
+                this.fileTree.set(docId, entry);
+                this.fileTreeByPath.set(relativePath, entry);
+            } else {
+                await this.refreshProjectFileTree();
+                entry = this.fileTreeByPath.get(relativePath);
             }
-            entry = existing || {
-                id: docId,
-                type: 'doc',
-                name: result.doc.name || name,
-                path: relativePath,
-                parentId,
-            };
-            this.fileTree.set(docId, entry);
-            this.fileTreeByPath.set(relativePath, entry);
-        } else {
-            await this.refreshProjectFileTree();
-            entry = this.fileTreeByPath.get(relativePath);
-        }
 
-        if (!entry || entry.type !== 'doc') {
-            throw new Error(`Create ${relativePath}: new document was not returned by Overleaf`);
-        }
-        if (!this.socket) {
-            throw new Error(`Create ${relativePath}: real-time connection is required to write document content`);
-        }
+            if (!entry || entry.type !== 'doc') {
+                throw new Error(`Create ${relativePath}: new document was not returned by Overleaf`);
+            }
+            if (!this.socket) {
+                throw new Error(
+                    `Create ${relativePath}: real-time connection is required to write document content`
+                );
+            }
 
-        await this.pushDocumentChanges(entry.id, relativePath, content);
+            await this.pushDocumentChanges(entry.id, relativePath, content);
+            this.baseContent.set(relativePath, content);
+            this.fileCache.set(relativePath, hashContent(content));
+        });
     }
 
     private async deleteRemoteEntry(entry: FileTreeEntry, preserveLocal = false): Promise<void> {
@@ -1388,30 +1406,37 @@ export class SyncEngine {
 
             if ((stat.type & vscode.FileType.Directory) !== 0) {
                 const folderPath = relativePath + '/';
-                const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
-                ensureApiSuccess(result, `Create folder ${folderPath}`);
+                await this.runPendingLocalCreate(folderPath, async () => {
+                    const result = await this.api.addFolder(projectSettings.projectId, parentId, name);
+                    ensureApiSuccess(result, `Create folder ${folderPath}`);
 
-                // Add folder to file tree immediately (don't wait for socket event)
-                if (result.type === 'success' && result.folder) {
-                    const folderId = validateOverleafId(result.folder._id, 'folder ID');
-                    const existing = this.fileTree.get(folderId);
-                    if (existing && (existing.path !== folderPath || existing.type !== 'folder')) {
-                        throw new Error(`Overleaf reused folder ID: ${folderId}`);
+                    // Add the folder immediately when possible; otherwise
+                    // recover its canonical identity from the server tree.
+                    if (result.folder) {
+                        const folderId = validateOverleafId(result.folder._id, 'folder ID');
+                        const existing = this.fileTree.get(folderId);
+                        if (existing && (existing.path !== folderPath || existing.type !== 'folder')) {
+                            throw new Error(`Overleaf reused folder ID: ${folderId}`);
+                        }
+                        const folderEntry: FileTreeEntry = existing || {
+                            id: folderId,
+                            type: 'folder',
+                            name,
+                            path: folderPath,
+                            parentId,
+                        };
+                        this.fileTree.set(folderId, folderEntry);
+                        this.fileTreeByPath.set(folderPath, folderEntry);
+                        debugLog('Added folder to tree:', folderPath, result.folder._id);
+                    } else {
+                        await this.refreshProjectFileTree();
                     }
-                    const folderEntry: FileTreeEntry = existing || {
-                        id: folderId,
-                        type: 'folder',
-                        name: name,
-                        path: folderPath,
-                        parentId: parentId,
-                    };
-                    this.fileTree.set(folderId, folderEntry);
-                    this.fileTreeByPath.set(folderPath, folderEntry);
-                    debugLog('Added folder to tree:', folderPath, result.folder._id);
-                }
+                    if (this.fileTreeByPath.get(folderPath)?.type !== 'folder') {
+                        throw new Error(`Create folder ${folderPath}: Overleaf returned no folder identity`);
+                    }
+                    this.baseContent.set(folderPath, new Uint8Array(0));
+                });
 
-                // Track folder in baseContent so delete/rename operations work
-                this.baseContent.set(folderPath, new Uint8Array(0));
                 this.log(`Created folder on Overleaf: ${folderPath}`);
             } else {
                 // Read file content - may throw if file was deleted
@@ -1437,23 +1462,21 @@ export class SyncEngine {
                         content
                     );
                 } else {
-                    // Set this before upload so the socket acknowledgement is
-                    // recognized as an echo of the local operation.
-                    this.baseContent.set(relativePath, content);
-                    const result = await this.api.uploadFile(
-                        projectSettings.projectId,
-                        parentId,
-                        name,
-                        content
-                    );
-                    ensureApiSuccess(result, `Upload ${relativePath}`);
-                    if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
-                        await this.refreshProjectFileTree();
-                    }
+                    await this.runPendingLocalCreate(relativePath, async () => {
+                        const result = await this.api.uploadFile(
+                            projectSettings.projectId,
+                            parentId,
+                            name,
+                            content
+                        );
+                        ensureApiSuccess(result, `Upload ${relativePath}`);
+                        if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
+                            await this.refreshProjectFileTree();
+                        }
+                        this.baseContent.set(relativePath, content);
+                        this.fileCache.set(relativePath, hashContent(content));
+                    });
                 }
-
-                this.baseContent.set(relativePath, content);
-                this.fileCache.set(relativePath, hashContent(content));
             }
 
             this.setStatus('idle');
@@ -1577,7 +1600,7 @@ export class SyncEngine {
 
             // Check if this is an echo of our own creation (file already in baseContent)
             const alreadySynced = this.baseContent.has(path);
-            if (alreadySynced) {
+            if (alreadySynced || this.pendingLocalCreates.has(path)) {
                 debugLog(`Ignoring remote create echo for already-synced: ${path}`);
                 this.setStatus('idle');
                 return;
@@ -2336,29 +2359,35 @@ export class SyncEngine {
             } else {
                 // Folder doesn't exist, create it
                 debugLog('Creating missing parent folder:', folderPath);
-                const result = await this.api.addFolder(projectSettings.projectId, currentParentId, segment);
-                this.throwIfDisposed();
+                const trackedFolder = await this.runPendingLocalCreate(folderPath, async () => {
+                    const result = await this.api.addFolder(
+                        projectSettings.projectId,
+                        currentParentId,
+                        segment
+                    );
+                    this.throwIfDisposed();
 
-                if (result.type !== 'success' || !result.folder) {
-                    throw new Error(`Failed to create folder ${folderPath}: ${result.message}`);
-                }
+                    if (result.type !== 'success' || !result.folder) {
+                        throw new Error(`Failed to create folder ${folderPath}: ${result.message}`);
+                    }
 
-                // Add to file tree
-                const folderEntry: FileTreeEntry = {
-                    id: validateOverleafId(result.folder._id, 'folder ID'),
-                    type: 'folder',
-                    name: segment,
-                    path: folderPath,
-                    parentId: currentParentId,
-                };
-                const existing = this.fileTree.get(folderEntry.id);
-                if (existing && (existing.path !== folderPath || existing.type !== 'folder')) {
-                    throw new Error(`Overleaf reused folder ID: ${folderEntry.id}`);
-                }
-                const trackedFolder = existing || folderEntry;
-                this.fileTree.set(trackedFolder.id, trackedFolder);
-                this.fileTreeByPath.set(folderPath, trackedFolder);
-                this.baseContent.set(folderPath, new Uint8Array(0));
+                    const folderEntry: FileTreeEntry = {
+                        id: validateOverleafId(result.folder._id, 'folder ID'),
+                        type: 'folder',
+                        name: segment,
+                        path: folderPath,
+                        parentId: currentParentId,
+                    };
+                    const existing = this.fileTree.get(folderEntry.id);
+                    if (existing && (existing.path !== folderPath || existing.type !== 'folder')) {
+                        throw new Error(`Overleaf reused folder ID: ${folderEntry.id}`);
+                    }
+                    const canonicalFolder = existing || folderEntry;
+                    this.fileTree.set(canonicalFolder.id, canonicalFolder);
+                    this.fileTreeByPath.set(folderPath, canonicalFolder);
+                    this.baseContent.set(folderPath, new Uint8Array(0));
+                    return canonicalFolder;
+                });
 
                 this.log(`Created folder on Overleaf: ${folderPath}`);
 
@@ -2399,22 +2428,22 @@ export class SyncEngine {
                 content
             );
         } else {
-            this.baseContent.set(relativePath, content);
-            const result = await this.api.uploadFile(
-                projectSettings.projectId,
-                parentId,
-                name,
-                content
-            );
-            this.throwIfDisposed();
-            ensureApiSuccess(result, `Upload ${relativePath}`);
-            if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
-                await this.refreshProjectFileTree();
-            }
+            await this.runPendingLocalCreate(relativePath, async () => {
+                const result = await this.api.uploadFile(
+                    projectSettings.projectId,
+                    parentId,
+                    name,
+                    content
+                );
+                this.throwIfDisposed();
+                ensureApiSuccess(result, `Upload ${relativePath}`);
+                if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
+                    await this.refreshProjectFileTree();
+                }
+                this.baseContent.set(relativePath, content);
+                this.fileCache.set(relativePath, hashContent(content));
+            });
         }
-
-        this.baseContent.set(relativePath, content);
-        this.fileCache.set(relativePath, hashContent(content));
     }
 
     /**
@@ -2818,6 +2847,7 @@ export class SyncEngine {
         this.fileTreeByPath.clear();
         this.fileCache.clear();
         this.baseContent.clear();
+        this.pendingLocalCreates.clear();
         this.joinedDocs.clear();
         this._status = 'disconnected';
         this._onStatusChange.fire({ status: 'disconnected' });

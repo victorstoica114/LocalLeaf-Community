@@ -639,13 +639,12 @@ export class BaseAPI {
             const entityId = nonEmptyString(rawEntity?._id)
                 || nonEmptyString(rawEntity?.id)
                 || nonEmptyString(uploadObject?.entity_id);
-            const rawEntityType = rawEntity?._type || rawEntity?.type || uploadObject?.entity_type;
-            const entityType: FileEntity['_type'] =
-                rawEntityType === 'doc' || rawEntityType === 'folder' ? rawEntityType : 'file';
             const file: FileEntity | undefined = entityId
                 ? {
                     _id: entityId,
-                    _type: entityType,
+                    // This endpoint creates fileRefs. Do not let malformed
+                    // response metadata turn the result into a doc or folder.
+                    _type: 'file',
                     name: filename,
                 }
                 : undefined;
