@@ -883,6 +883,21 @@ async function run(): Promise<void> {
     await assert.rejects(() => firstPendingEvent, /timed out/);
     assert.equal((overloadedClient as any).pendingSocketEventCount, 0);
 
+    const forcedSocket = new FakeSocket();
+    const forcedClient = new SocketIOAPI({
+        initSocket: () => forcedSocket,
+    }, { cookies: 'cookie', csrfToken: 'csrf' }, 'project');
+    let forcedAuthNotification: boolean | undefined;
+    forcedClient.registerHandlers({
+        onDisconnected: isAuthError => { forcedAuthNotification = isAuthError; },
+    });
+    (forcedClient as any)._connected = true;
+    forcedSocket.trigger('forceDisconnect', 'session expired');
+    assert.equal(forcedAuthNotification, true);
+    assert.equal(forcedSocket.disconnectCount, 1,
+        'a server-forced disconnect must close the transport immediately');
+    assert.equal((forcedClient as any).socket, undefined);
+
     assert.throws(
         () => validateRemoteDocumentLines(new Array(MAX_REMOTE_DOCUMENT_LINES + 1).fill('')),
         /oversized document content/,

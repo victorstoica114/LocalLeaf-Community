@@ -2405,7 +2405,8 @@ export class SyncEngine {
         if (!this.socket) return;
 
         let joinedCount = 0;
-        const failures: Array<{ path: string; error: unknown }> = [];
+        let failureCount = 0;
+        const failedPaths: string[] = [];
         for (const [id, entry] of this.fileTree) {
             if (entry.type === 'doc' && !this.joinedDocs.has(id)) {
                 if (!this.shouldSync(entry.path)) continue;
@@ -2414,16 +2415,19 @@ export class SyncEngine {
                     this.joinedDocs.add(id);
                     joinedCount++;
                 } catch (error) {
-                    failures.push({ path: entry.path, error });
+                    failureCount++;
+                    if (failedPaths.length < 3) failedPaths.push(entry.path);
+                    debugLog(`Unable to watch ${entry.path}:`, error);
+                    if (this.socket.isConnected === false) break;
                 }
             }
         }
         if (joinedCount > 0) {
             this.log(`Watching ${joinedCount} documents for remote changes`);
         }
-        if (failures.length > 0) {
-            const preview = failures.slice(0, 3).map(failure => failure.path).join(', ');
-            const message = `Unable to watch ${failures.length} document(s) for live updates: ${preview}`;
+        if (failureCount > 0) {
+            const preview = failedPaths.join(', ');
+            const message = `Unable to watch ${failureCount} document(s) for live updates: ${preview}`;
             this.log(message);
             this.setStatus('error', message);
             throw new Error(message);

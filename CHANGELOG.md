@@ -43,6 +43,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Coalesced rapid cursor updates and released cursor-tracking state across disconnects and reconnections
 - Capped concurrent Socket.IO events awaiting acknowledgements and closed connections that exceed the limit
 - Required a verified remote entity identity before treating new binary uploads as synchronized
+- Closed server-forced socket sessions immediately and bounded live-watch failure diagnostics
 
 ## [0.2.1] - 2026-08-23
 

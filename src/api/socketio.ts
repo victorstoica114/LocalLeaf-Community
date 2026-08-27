@@ -485,6 +485,7 @@ export class SocketIOAPI {
             // Check if force disconnect is auth-related
             const isAuthError = this.isAuthRelatedMessage(message);
             this.handlers.forEach(h => h.onDisconnected?.(isAuthError));
+            this.teardownSocket();
         });
 
         socket.on('error', (err: unknown) => {
