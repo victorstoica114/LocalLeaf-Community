@@ -17,6 +17,7 @@ import {
 const MAX_CONNECTED_USERS = 1000;
 const MAX_CONNECTED_USER_RESPONSE_ITEMS = 10_000;
 const MAX_PROFILE_FIELD_LENGTH = 4096;
+const MAX_PENDING_SOCKET_EVENTS = 1000;
 
 // Output channel for logging (visible to user)
 let outputChannel: vscode.OutputChannel | undefined;
@@ -318,6 +319,8 @@ export class SocketIOAPI {
     private _connectionFailurePromise!: Promise<Error>;
     private _connectionFailureResolve!: (error: Error) => void;
     private socketEventTimeoutMs = 5000;
+    private pendingSocketEventCount = 0;
+    private maxPendingSocketEvents = MAX_PENDING_SOCKET_EVENTS;
 
     constructor(
         private readonly api: BaseAPI,
@@ -427,6 +430,14 @@ export class SocketIOAPI {
         if (!socket) {
             return Promise.reject(new Error('Socket is not initialized'));
         }
+        if (this.pendingSocketEventCount >= this.maxPendingSocketEvents) {
+            this.abortTimedOutSocket(socket);
+            return Promise.reject(new Error(
+                'Too many pending Socket.IO events; the stalled connection was closed.'
+            ));
+        }
+
+        this.pendingSocketEventCount++;
         const response = new Promise<unknown[]>((resolve, reject) => {
             socket.emit(event, ...args, (error: unknown, ...data: unknown[]) => {
                 if (error) {
@@ -441,7 +452,9 @@ export class SocketIOAPI {
             this.socketEventTimeoutMs,
             `Socket event "${event}" timed out`,
             () => this.abortTimedOutSocket(socket),
-        );
+        ).finally(() => {
+            this.pendingSocketEventCount = Math.max(0, this.pendingSocketEventCount - 1);
+        });
     }
 
     /**

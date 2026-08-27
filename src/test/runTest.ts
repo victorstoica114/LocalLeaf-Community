@@ -865,6 +865,24 @@ async function run(): Promise<void> {
         'a timed-out live socket must surface the connection loss exactly once');
     assert.equal((stalledClient as any).socket, undefined);
 
+    const overloadedSocket = new FakeSocket();
+    const overloadedClient = new SocketIOAPI({
+        initSocket: () => overloadedSocket,
+    }, { cookies: 'cookie', csrfToken: 'csrf' }, 'project');
+    (overloadedClient as any)._connected = true;
+    (overloadedClient as any).socketEventTimeoutMs = 5;
+    (overloadedClient as any).maxPendingSocketEvents = 1;
+    const firstPendingEvent = overloadedClient.joinDoc('first-doc');
+    await assert.rejects(
+        () => overloadedClient.joinDoc('second-doc'),
+        /Too many pending Socket\.IO events/,
+        'pending ACK callbacks must be capped before another event is emitted',
+    );
+    assert.equal(overloadedSocket.disconnectCount, 1,
+        'exceeding the pending ACK limit must close the stalled transport');
+    await assert.rejects(() => firstPendingEvent, /timed out/);
+    assert.equal((overloadedClient as any).pendingSocketEventCount, 0);
+
     assert.throws(
         () => validateRemoteDocumentLines(new Array(MAX_REMOTE_DOCUMENT_LINES + 1).fill('')),
         /oversized document content/,
