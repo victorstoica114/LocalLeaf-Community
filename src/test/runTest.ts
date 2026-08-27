@@ -1447,7 +1447,7 @@ async function run(): Promise<void> {
             uncertainReplacement.fileTree.get(oldBinary.id),
             Uint8Array.from([9, 8, 7]),
         ),
-        /replacement identity could not be verified.*backup was kept/,
+        /uploaded file identity could not be verified.*backup was kept/,
         'an untracked successful upload must keep the original rollback copy',
     );
     assert.equal(uncertainDeleteCount, 0,
@@ -1480,6 +1480,21 @@ async function run(): Promise<void> {
         ),
         /duplicate uploaded entity path/,
         'upload responses must not overwrite a concurrently tracked entity',
+    );
+
+    const untrackedUpload = Object.create(SyncEngine.prototype) as any;
+    untrackedUpload.fileTree = new Map();
+    untrackedUpload.fileTreeByPath = new Map();
+    untrackedUpload.refreshProjectFileTree = async () => undefined;
+    await assert.rejects(
+        () => untrackedUpload.resolveUploadedFile(
+            {},
+            'folder',
+            'untracked.pdf',
+            '/untracked.pdf',
+        ),
+        /uploaded file identity could not be verified/,
+        'an empty upload response and unavailable HTTP tree must not create a false baseline',
     );
 
     const folderRebase = Object.create(SyncEngine.prototype) as any;

@@ -1472,6 +1472,23 @@ export class SyncEngine {
         return entry;
     }
 
+    private async resolveUploadedFile(
+        result: { file?: FileEntity },
+        parentId: string,
+        name: string,
+        path: string,
+    ): Promise<FileTreeEntry> {
+        let entry = this.trackUploadedEntity(result, parentId, name, path);
+        if (!entry) {
+            await this.refreshProjectFileTree();
+            entry = this.fileTreeByPath.get(path);
+        }
+        if (!entry || entry.type !== 'file') {
+            throw new Error(`Upload ${path}: the uploaded file identity could not be verified`);
+        }
+        return entry;
+    }
+
     private async runPendingLocalCreate<T>(
         path: string,
         operation: () => Promise<T>,
@@ -1629,21 +1646,13 @@ export class SyncEngine {
             uploadedReplacement = true;
             this.fileCache.set(originalPath, hashContent(content));
 
-            let replacementEntry = this.trackUploadedEntity(
+            const replacementEntry = await this.resolveUploadedFile(
                 result,
                 entry.parentId,
                 originalName,
                 originalPath,
             );
-            if (!replacementEntry) {
-                await this.refreshProjectFileTree();
-                replacementEntry = this.fileTreeByPath.get(originalPath);
-            }
-            if (
-                !replacementEntry
-                || replacementEntry.type !== 'file'
-                || replacementEntry.id === entry.id
-            ) {
+            if (replacementEntry.id === entry.id) {
                 throw new Error(
                     `Upload ${originalPath}: the replacement identity could not be verified`
                 );
@@ -1808,9 +1817,7 @@ export class SyncEngine {
                             content
                         );
                         ensureApiSuccess(result, `Upload ${relativePath}`);
-                        if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
-                            await this.refreshProjectFileTree();
-                        }
+                        await this.resolveUploadedFile(result, parentId, name, relativePath);
                         this.setBaseContent(relativePath, SYNCHRONIZED_CONTENT_MARKER);
                         this.fileCache.set(relativePath, hashContent(content));
                     });
@@ -2823,9 +2830,7 @@ export class SyncEngine {
                 );
                 this.throwIfDisposed();
                 ensureApiSuccess(result, `Upload ${relativePath}`);
-                if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
-                    await this.refreshProjectFileTree();
-                }
+                await this.resolveUploadedFile(result, parentId, name, relativePath);
                 this.setBaseContent(relativePath, SYNCHRONIZED_CONTENT_MARKER);
                 this.fileCache.set(relativePath, hashContent(content));
             });
