@@ -2972,6 +2972,8 @@ async function run(): Promise<void> {
         'local PR artifacts must never be packaged');
     assert.match(vscodeIgnore, /^\.localleaf\/\*\*$/m,
         'workspace link metadata must never be packaged');
+    assert.match(vscodeIgnore, /^\.tmp-\*\/\*\*$/m,
+        'temporary build and verification tooling must never be packaged');
     assert.match(vscodeIgnore, /^\.leafignore$/m,
         'this checkout\'s local ignore rules must never be packaged');
     assert.match(vscodeIgnore, /^\.mailmap$/m,
