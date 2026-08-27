@@ -14,6 +14,8 @@ import {
 } from './pathSafety';
 import { isSupportedServerUrl, validateServerUrl } from './serverUrl';
 
+export const MAX_PROJECT_SETTINGS_BYTES = 256 * 1024;
+
 /**
  * Project settings stored in .localleaf/settings.json
  */
@@ -75,7 +77,11 @@ export function isValidProjectSettings(value: unknown): value is StoredProjectSe
         && isValidOptionalProjectFile(candidate.mainTex, '.tex')
         && isValidOptionalProjectFile(candidate.mainPdf, '.pdf')
         && (candidate.autoSync === undefined || typeof candidate.autoSync === 'boolean')
-        && (candidate.lastSynced === undefined || typeof candidate.lastSynced === 'string');
+        && (candidate.lastSynced === undefined || (
+            typeof candidate.lastSynced === 'string'
+            && candidate.lastSynced.length <= 128
+            && Number.isFinite(Date.parse(candidate.lastSynced))
+        ));
 }
 
 /**
@@ -150,9 +156,16 @@ export class SettingsManager {
         try {
             const settingsFile = vscode.Uri.joinPath(workspaceFolder, CONFIG_DIR, SETTINGS_FILE);
             await assertSafeWorkspacePath(workspaceFolder, settingsFile);
+            const stat = await vscode.workspace.fs.stat(settingsFile);
+            if (
+                !Number.isSafeInteger(stat.size)
+                || stat.size < 0
+                || stat.size > MAX_PROJECT_SETTINGS_BYTES
+            ) return undefined;
             const content = await vscode.workspace.fs.readFile(
                 settingsFile,
             );
+            if (content.byteLength > MAX_PROJECT_SETTINGS_BYTES) return undefined;
             const parsed: unknown = JSON.parse(new TextDecoder().decode(content));
             if (!isValidProjectSettings(parsed)) return undefined;
             return {

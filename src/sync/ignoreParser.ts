@@ -9,6 +9,31 @@ import { IGNORE_FILE, VAR_MAIN_TEX, VAR_MAIN_PDF, DEFAULT_IGNORE_PATTERNS } from
 import { ProjectSettings } from '../utils/settingsManager';
 import { assertSafeWorkspacePath, isFileNotFoundError } from '../utils/pathSafety';
 
+export const MAX_IGNORE_FILE_BYTES = 1024 * 1024;
+export const MAX_IGNORE_PATTERNS = 10_000;
+export const MAX_IGNORE_PATTERN_LENGTH = 4096;
+
+function validateIgnorePatterns(patterns: readonly string[]): string[] {
+    if (patterns.length > MAX_IGNORE_PATTERNS) {
+        throw new Error('The .leafignore file contains too many patterns.');
+    }
+    const validated = patterns.map(pattern => {
+        if (
+            typeof pattern !== 'string'
+            || pattern.length > MAX_IGNORE_PATTERN_LENGTH
+            || pattern.includes('\0')
+        ) {
+            throw new Error('The .leafignore file contains an invalid or oversized pattern.');
+        }
+        return pattern;
+    });
+    const encodedSize = new TextEncoder().encode(`${validated.join('\n')}\n`).byteLength;
+    if (encodedSize > MAX_IGNORE_FILE_BYTES) {
+        throw new Error('The .leafignore file exceeds the size limit.');
+    }
+    return validated;
+}
+
 function escapeGlobLiteral(value: string): string {
     return value.replace(/([*?\[\]{}()!+@\\])/g, '\\$1');
 }
@@ -39,7 +64,18 @@ export class IgnoreParser {
         try {
             const ignoreFilePath = this.getIgnoreFilePath();
             await assertSafeWorkspacePath(this.workspaceFolder, ignoreFilePath);
+            const stat = await vscode.workspace.fs.stat(ignoreFilePath);
+            if (
+                !Number.isSafeInteger(stat.size)
+                || stat.size < 0
+                || stat.size > MAX_IGNORE_FILE_BYTES
+            ) {
+                throw new Error('The .leafignore file exceeds the size limit.');
+            }
             const content = await vscode.workspace.fs.readFile(ignoreFilePath);
+            if (content.byteLength > MAX_IGNORE_FILE_BYTES) {
+                throw new Error('The .leafignore file exceeds the size limit.');
+            }
             const text = new TextDecoder().decode(content);
             this.patterns = this.parseIgnoreFile(text);
         } catch (error) {
@@ -53,10 +89,10 @@ export class IgnoreParser {
      * Parse .leafignore file content
      */
     private parseIgnoreFile(content: string): string[] {
-        return content
+        return validateIgnorePatterns(content
             .split('\n')
             .map(line => line.trim())
-            .filter(line => line && !line.startsWith('#')); // Remove empty lines and comments
+            .filter(line => line && !line.startsWith('#'))); // Remove empty lines and comments
     }
 
     /**
@@ -132,10 +168,10 @@ export class IgnoreParser {
      * Save patterns to .leafignore file
      */
     async save(patterns: string[]): Promise<void> {
-        this.patterns = patterns;
+        this.patterns = validateIgnorePatterns(patterns);
         this.resolveVariables();
 
-        const content = patterns.join('\n') + '\n';
+        const content = this.patterns.join('\n') + '\n';
         const ignoreFilePath = this.getIgnoreFilePath();
         await assertSafeWorkspacePath(this.workspaceFolder, ignoreFilePath);
         await vscode.workspace.fs.writeFile(

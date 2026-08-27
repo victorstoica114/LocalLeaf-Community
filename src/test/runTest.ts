@@ -357,10 +357,13 @@ const mockWorkspaceFs = {
         if (!entry || entry.type !== 1) throw new MockFileSystemError('File not found', 'FileNotFound');
         return new TextEncoder().encode(entry.content ?? '');
     },
-    async stat(uri: MockUri | string): Promise<{ type: number }> {
+    async stat(uri: MockUri | string): Promise<{ type: number; size: number }> {
         const entry = mockFileEntries.get(mockUriKey(uri));
         if (!entry) throw new MockFileSystemError('File not found', 'FileNotFound');
-        return { type: entry.type };
+        return {
+            type: entry.type,
+            size: new TextEncoder().encode(entry.content ?? '').byteLength,
+        };
     },
     async readDirectory(uri: MockUri | string): Promise<Array<[string, number]>> {
         const directoryPath = mockUriKey(uri);
@@ -2211,9 +2214,10 @@ async function run(): Promise<void> {
     assert.throws(() => validateServerUrl('https://overleaf.com@attacker.example'), /embedded credentials/);
     assert.throws(() => validateServerUrl('file:///tmp/overleaf'), /HTTP or HTTPS/);
 
-    const { SettingsManager, isValidProjectSettings } = require(
+    const { MAX_PROJECT_SETTINGS_BYTES, SettingsManager, isValidProjectSettings } = require(
         path.join('..', 'utils', 'settingsManager')
     ) as {
+        MAX_PROJECT_SETTINGS_BYTES: number;
         SettingsManager: {
             clearCurrentWorkspaceFolder(): void;
             getInstance(uri: MockUri): {
@@ -2231,6 +2235,7 @@ async function run(): Promise<void> {
                 settings: { projectId: string; projectName: string };
             }>>;
             inspectFolder(uri: MockUri): Promise<{ kind: string }>;
+            loadSettings(uri: MockUri): Promise<unknown>;
             resolveCurrentInstance(): Promise<{
                 getWorkspaceFolder(): MockUri;
             } | undefined>;
@@ -2268,6 +2273,12 @@ async function run(): Promise<void> {
         projectId: 'project-id',
         projectName: 'Project',
     }), false, 'project settings must reject non-HTTP server URLs');
+    assert.equal(isValidProjectSettings({
+        serverUrl: 'https://overleaf.example',
+        projectId: 'project-id',
+        projectName: 'Project',
+        lastSynced: 'not-a-date',
+    }), false, 'last-synchronized metadata must be a bounded valid timestamp');
 
     const linkedSettings = JSON.stringify({
         serverUrl: 'https://overleaf.example',
@@ -2298,6 +2309,17 @@ async function run(): Promise<void> {
     assert.equal(pathManager.getRelativePath(mockFileUri('d:\\WORKSPACE')), '/');
     assert.equal(pathManager.getRelativePath(mockFileUri('D:\\workspace-evil\\file.tex')), undefined);
     assert.equal(pathManager.getRelativePath(mockFileUri('E:\\workspace\\file.tex')), undefined);
+
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.localleaf', { type: 2 }],
+        [
+            'D:\\workspace\\.localleaf\\settings.json',
+            { type: 1, content: 'x'.repeat(MAX_PROJECT_SETTINGS_BYTES + 1) },
+        ],
+    ]);
+    assert.equal(await SettingsManager.loadSettings(workspaceRoot), undefined,
+        'oversized project settings must be rejected before parsing');
 
     resetMockWorkspace([workspaceRoot], [
         ['D:\\workspace', { type: 2 }],
@@ -2408,9 +2430,38 @@ async function run(): Promise<void> {
     await noFolderProvider.refresh();
     assert.equal(noFolderProvider.state.status, 'no-folder');
 
-    const { IgnoreParser } = require(path.join('..', 'sync', 'ignoreParser')) as {
+    const {
+        IgnoreParser,
+        MAX_IGNORE_FILE_BYTES,
+        MAX_IGNORE_PATTERNS,
+        MAX_IGNORE_PATTERN_LENGTH,
+    } = require(path.join('..', 'sync', 'ignoreParser')) as {
         IgnoreParser: { prototype: object };
+        MAX_IGNORE_FILE_BYTES: number;
+        MAX_IGNORE_PATTERNS: number;
+        MAX_IGNORE_PATTERN_LENGTH: number;
     };
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.leafignore', { type: 1, content: 'x'.repeat(MAX_IGNORE_FILE_BYTES + 1) }],
+    ]);
+    const boundedIgnoreParser = Object.create(IgnoreParser.prototype) as any;
+    boundedIgnoreParser.workspaceFolder = workspaceRoot;
+    await assert.rejects(
+        () => boundedIgnoreParser.load(),
+        /exceeds the size limit/,
+        'oversized ignore files must be rejected before parsing',
+    );
+    assert.throws(
+        () => boundedIgnoreParser.parseIgnoreFile(
+            new Array(MAX_IGNORE_PATTERNS + 1).fill('*.tmp').join('\n')
+        ),
+        /too many patterns/,
+    );
+    assert.throws(
+        () => boundedIgnoreParser.parseIgnoreFile('x'.repeat(MAX_IGNORE_PATTERN_LENGTH + 1)),
+        /invalid or oversized pattern/,
+    );
     const ignoreParser = Object.create(IgnoreParser.prototype) as any;
     ignoreParser.patterns = ['$MAIN_TEX', '$MAIN_PDF', '*.aux'];
     ignoreParser.settings = {};
