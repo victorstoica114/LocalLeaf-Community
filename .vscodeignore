@@ -5,6 +5,7 @@
 .leafignore
 .mailmap
 docs/**
+!docs/CONTRIBUTOR_INTEGRATION.md
 src/**
 patches/**
 out/**

@@ -494,6 +494,21 @@ async function setAuthState(state: AuthState): Promise<void> {
     await refreshGui();
 }
 
+function createCredentialTooltip(
+    credential: ServerCredential,
+    expired: boolean,
+): vscode.MarkdownString {
+    const tooltip = new vscode.MarkdownString();
+    tooltip.appendMarkdown(expired ? '**Session Expired**\n\n' : '**Logged in to Overleaf**\n\n');
+    tooltip.appendText(`Email: ${credential.userEmail}`);
+    tooltip.appendMarkdown('\n\n');
+    tooltip.appendText(`Server: ${credential.serverUrl}`);
+    if (expired) {
+        tooltip.appendMarkdown('\n\n_Click to refresh your cookie_');
+    }
+    return tooltip;
+}
+
 /**
  * Update login status bar
  */
@@ -513,32 +528,19 @@ async function updateLoginStatus() {
     if (credential && authState === 'valid') {
         // Logged in with valid session
         loginStatusItem.text = `$(account) ${credential.userEmail}`;
-        loginStatusItem.tooltip = new vscode.MarkdownString(
-            `**Logged in to Overleaf**\n\n` +
-            `Email: ${credential.userEmail}\n\n` +
-            `Server: ${credential.serverUrl}`
-        );
+        loginStatusItem.tooltip = createCredentialTooltip(credential, false);
         loginStatusItem.backgroundColor = undefined;
         loginStatusItem.command = COMMANDS.LOGOUT;
     } else if (credential && authState === 'expired') {
         // Session expired - show warning state
         loginStatusItem.text = `$(warning) ${credential.userEmail} (expired)`;
-        loginStatusItem.tooltip = new vscode.MarkdownString(
-            `**Session Expired**\n\n` +
-            `Email: ${credential.userEmail}\n\n` +
-            `Server: ${credential.serverUrl}\n\n` +
-            `Click to refresh your cookie`
-        );
+        loginStatusItem.tooltip = createCredentialTooltip(credential, true);
         loginStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
         loginStatusItem.command = COMMANDS.REFRESH_COOKIE;
     } else if (credential) {
         // Credential exists but auth state not confirmed yet (assume valid until proven otherwise)
         loginStatusItem.text = `$(account) ${credential.userEmail}`;
-        loginStatusItem.tooltip = new vscode.MarkdownString(
-            `**Logged in to Overleaf**\n\n` +
-            `Email: ${credential.userEmail}\n\n` +
-            `Server: ${credential.serverUrl}`
-        );
+        loginStatusItem.tooltip = createCredentialTooltip(credential, false);
         loginStatusItem.backgroundColor = undefined;
         loginStatusItem.command = COMMANDS.LOGOUT;
     } else {

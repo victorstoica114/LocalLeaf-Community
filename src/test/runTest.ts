@@ -1881,6 +1881,16 @@ async function run(): Promise<void> {
         'an explicit project-link workflow must record synchronization consent');
     assert.match(extensionSource, /revokeSyncAuthorization[\s\S]*settingsManager\.delete\(\)/,
         'unlinking must revoke the folder-specific synchronization consent');
+    assert.match(
+        extensionSource,
+        /createCredentialTooltip[\s\S]*appendText\(`Email: \$\{credential\.userEmail\}`\)[\s\S]*appendText\(`Server: \$\{credential\.serverUrl\}`\)/,
+        'server-provided account fields must be appended as text instead of interpreted as Markdown',
+    );
+    assert.doesNotMatch(
+        extensionSource,
+        /new vscode\.MarkdownString\([^)]*credential\.(?:userEmail|serverUrl)/,
+        'credential fields must never be interpolated into a MarkdownString constructor',
+    );
     assert.equal(extensionSource.match(/new SyncEngine/g)?.length, 1,
         'all connection and reconnection paths must pass through the authorized initializer');
     const pullCommandStart = extensionSource.indexOf('async function cmdPullFromOverleaf');

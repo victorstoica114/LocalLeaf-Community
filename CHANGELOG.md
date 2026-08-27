@@ -20,6 +20,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Added per-workspace synchronization authorization and strengthened remote path, entity, OT, collaborator, webview-message, and account-cookie validation
 - Bounded pending remote events, OT payload memory, remote project trees, and recursive local project scans
 - Made `localleaf.autoSync` and the linked-project `autoSync` flag actually disable watcher-triggered local uploads
+- Prevented server-provided account fields from being interpreted as Markdown in status tooltips
 
 ## [0.2.1] - 2026-08-23
 
