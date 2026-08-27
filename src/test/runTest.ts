@@ -1062,6 +1062,31 @@ async function run(): Promise<void> {
     assert.equal(typeof boundedBaselines.baseHashes.get('/evicted.tex'), 'string',
         'evicted content must retain its server hash for safe conflict detection');
 
+    const boundedSuppressions = Object.create(SyncEngine.prototype) as any;
+    boundedSuppressions.suppressedRemoteDocumentUpdates = new Map();
+    boundedSuppressions.suppressedDocumentUpdateCount = 0;
+    boundedSuppressions.maxSuppressedDocumentUpdates = 2;
+    const sensitiveUpdate = {
+        doc: 'doc',
+        v: 1,
+        op: [{ p: 0, i: 'sensitive document payload' }],
+    };
+    const suppressionFingerprint = boundedSuppressions.documentUpdateFingerprint(sensitiveUpdate);
+    assert.equal(suppressionFingerprint.length, 64);
+    assert.equal(suppressionFingerprint.includes('sensitive'), false,
+        'OT echo suppression must retain only a fixed-size digest, not document text');
+    boundedSuppressions.suppressRemoteDocumentUpdate(sensitiveUpdate);
+    boundedSuppressions.suppressRemoteDocumentUpdate({ ...sensitiveUpdate, v: 2 });
+    boundedSuppressions.suppressRemoteDocumentUpdate({ ...sensitiveUpdate, v: 3 });
+    assert.equal(boundedSuppressions.suppressedDocumentUpdateCount, 2);
+    assert.equal(boundedSuppressions.consumeSuppressedRemoteDocumentUpdate(sensitiveUpdate), false,
+        'the oldest suppression must be evicted when the aggregate bound is reached');
+    assert.equal(
+        boundedSuppressions.consumeSuppressedRemoteDocumentUpdate({ ...sensitiveUpdate, v: 3 }),
+        true,
+    );
+    assert.equal(boundedSuppressions.suppressedDocumentUpdateCount, 1);
+
     const boundedDiffs = Object.create(SyncEngine.prototype) as any;
     boundedDiffs.remoteDiffContents = new Map();
     boundedDiffs.remoteDiffCharacters = 0;

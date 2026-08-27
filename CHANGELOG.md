@@ -36,6 +36,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Preserved ignored and local-only files when a synchronized remote folder is deleted or moved out of scope
 - Prevented full pulls from creating protected or ignored remote directories locally
 - Kept failed local changes eligible for retry instead of caching them as successful synchronization echoes
+- Replaced retained Socket.IO echo payloads with bounded SHA-256 fingerprints and capped stale suppression state
 
 ## [0.2.1] - 2026-08-23
 

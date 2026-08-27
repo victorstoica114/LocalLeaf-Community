@@ -31,6 +31,10 @@ const MAX_LOCAL_SCAN_ENTITIES = 100_000;
 const MAX_LOCAL_SCAN_DEPTH = 256;
 const MAX_RETAINED_DOCUMENT_BYTES = 64 * 1024 * 1024;
 const MAX_REMOTE_DIFF_CHARACTERS = 20 * 1024 * 1024;
+const MAX_SUPPRESSED_DOCUMENT_UPDATES = 10_000;
+const MAX_SUPPRESSED_RENAME_ENTITIES = 10_000;
+const MAX_SUPPRESSED_RENAMES_PER_ENTITY = 16;
+const MAX_SUPPRESSED_DELETES = 10_000;
 const SYNCHRONIZED_CONTENT_MARKER = new Uint8Array(0);
 
 /**
@@ -142,6 +146,8 @@ export class SyncEngine {
     private suppressedRemoteDeletes: Set<string> = new Set();
     private suppressedRemoteRenames: Map<string, Set<string>> = new Map();
     private suppressedRemoteDocumentUpdates: Map<string, Set<string>> = new Map();
+    private suppressedDocumentUpdateCount = 0;
+    private readonly maxSuppressedDocumentUpdates = MAX_SUPPRESSED_DOCUMENT_UPDATES;
     private logFn?: (message: string) => void;
     private disposed = false;
     private readonly pendingWaits = new Map<NodeJS.Timeout, (active: boolean) => void>();
@@ -950,8 +956,20 @@ export class SyncEngine {
     }
 
     private suppressRemoteRename(entityId: string, newName: string): void {
+        if (
+            !this.suppressedRemoteRenames.has(entityId)
+            && this.suppressedRemoteRenames.size >= MAX_SUPPRESSED_RENAME_ENTITIES
+        ) {
+            const oldestEntity = this.suppressedRemoteRenames.keys().next().value as string | undefined;
+            if (oldestEntity !== undefined) this.suppressedRemoteRenames.delete(oldestEntity);
+        }
         const names = this.suppressedRemoteRenames.get(entityId) || new Set<string>();
         names.add(newName);
+        while (names.size > MAX_SUPPRESSED_RENAMES_PER_ENTITY) {
+            const oldestName = names.values().next().value as string | undefined;
+            if (oldestName === undefined) break;
+            names.delete(oldestName);
+        }
         this.suppressedRemoteRenames.set(entityId, names);
     }
 
@@ -967,25 +985,93 @@ export class SyncEngine {
     }
 
     private documentUpdateFingerprint(update: DocumentUpdate): string {
-        return JSON.stringify([update.v, update.lastV, update.op || []]);
+        const digest = createHash('sha256');
+        const append = (label: string, value: string): void => {
+            digest.update(label);
+            digest.update(':');
+            digest.update(String(value.length));
+            digest.update(':');
+            digest.update(value);
+            digest.update(';');
+        };
+        append('version', String(update.v));
+        append('lastVersion', update.lastV === undefined ? '' : String(update.lastV));
+        append('operationCount', String(update.op?.length ?? 0));
+        for (const operation of update.op ?? []) {
+            append('position', String(operation.p));
+            append('insertPresent', operation.i === undefined ? '0' : '1');
+            if (operation.i !== undefined) append('insert', operation.i);
+            append('deletePresent', operation.d === undefined ? '0' : '1');
+            if (operation.d !== undefined) append('delete', operation.d);
+            append('undo', operation.u === undefined ? '' : String(operation.u));
+        }
+        return digest.digest('hex');
+    }
+
+    private ensureSuppressedDocumentUpdateCount(): void {
+        if (!(this.suppressedRemoteDocumentUpdates instanceof Map)) {
+            this.suppressedRemoteDocumentUpdates = new Map();
+        }
+        if (
+            Number.isSafeInteger(this.suppressedDocumentUpdateCount)
+            && this.suppressedDocumentUpdateCount >= 0
+        ) return;
+        this.suppressedDocumentUpdateCount = [...this.suppressedRemoteDocumentUpdates.values()]
+            .reduce((total, fingerprints) => total + fingerprints.size, 0);
+    }
+
+    private clearSuppressedDocumentUpdates(docId: string): void {
+        this.ensureSuppressedDocumentUpdateCount();
+        const fingerprints = this.suppressedRemoteDocumentUpdates.get(docId);
+        if (fingerprints) this.suppressedDocumentUpdateCount -= fingerprints.size;
+        this.suppressedRemoteDocumentUpdates.delete(docId);
     }
 
     private suppressRemoteDocumentUpdate(update: DocumentUpdate): void {
+        this.ensureSuppressedDocumentUpdateCount();
         const fingerprints = this.suppressedRemoteDocumentUpdates.get(update.doc) || new Set<string>();
+        const previousSize = fingerprints.size;
         fingerprints.add(this.documentUpdateFingerprint(update));
+        this.suppressedDocumentUpdateCount += fingerprints.size - previousSize;
         while (fingerprints.size > 100) {
             const oldest = fingerprints.values().next().value as string | undefined;
             if (oldest === undefined) break;
             fingerprints.delete(oldest);
+            this.suppressedDocumentUpdateCount--;
         }
         this.suppressedRemoteDocumentUpdates.set(update.doc, fingerprints);
+
+        const maximum = this.maxSuppressedDocumentUpdates ?? MAX_SUPPRESSED_DOCUMENT_UPDATES;
+        while (this.suppressedDocumentUpdateCount > maximum) {
+            const oldestDocument = this.suppressedRemoteDocumentUpdates.entries().next().value as
+                | [string, Set<string>]
+                | undefined;
+            const oldestFingerprint = oldestDocument?.[1].values().next().value as string | undefined;
+            if (!oldestDocument || oldestFingerprint === undefined) break;
+            oldestDocument[1].delete(oldestFingerprint);
+            this.suppressedDocumentUpdateCount--;
+            if (oldestDocument[1].size === 0) {
+                this.suppressedRemoteDocumentUpdates.delete(oldestDocument[0]);
+            }
+        }
     }
 
     private consumeSuppressedRemoteDocumentUpdate(update: DocumentUpdate): boolean {
+        this.ensureSuppressedDocumentUpdateCount();
         const fingerprints = this.suppressedRemoteDocumentUpdates.get(update.doc);
         if (!fingerprints?.delete(this.documentUpdateFingerprint(update))) return false;
+        this.suppressedDocumentUpdateCount--;
         if (fingerprints.size === 0) this.suppressedRemoteDocumentUpdates.delete(update.doc);
         return true;
+    }
+
+    private suppressRemoteDelete(entityId: string): void {
+        this.suppressedRemoteDeletes.add(entityId);
+        while (this.suppressedRemoteDeletes.size > MAX_SUPPRESSED_DELETES) {
+            const oldest = this.suppressedRemoteDeletes.values().next().value as string | undefined;
+            if (oldest === undefined) break;
+            this.suppressedRemoteDeletes.delete(oldest);
+        }
     }
 
     private rebaseTrackedPathMap<T>(map: Map<string, T>, oldPath: string, newPath: string): void {
@@ -1041,6 +1127,7 @@ export class SyncEngine {
             this.fileTree.delete(id);
             this.fileTreeByPath.delete(entry.path);
             this.joinedDocs.delete(id);
+            this.clearSuppressedDocumentUpdates(id);
         }
         for (const key of [...this.baseContent.keys()]) {
             if (matches(key)) this.deleteBaseContent(key);
@@ -1442,7 +1529,7 @@ export class SyncEngine {
     private async deleteRemoteEntry(entry: FileTreeEntry, preserveLocal = false): Promise<void> {
         const projectSettings = this.settings.getSettings()!;
         if (preserveLocal) {
-            this.suppressedRemoteDeletes.add(entry.id);
+            this.suppressRemoteDelete(entry.id);
         }
 
         const result = await this.api.deleteEntity(projectSettings.projectId, entry.type, entry.id);
@@ -1454,6 +1541,7 @@ export class SyncEngine {
         }
 
         this.fileTree.delete(entry.id);
+        this.clearSuppressedDocumentUpdates(entry.id);
         this.suppressedRemoteRenames.delete(entry.id);
         if (this.fileTreeByPath.get(entry.path)?.id === entry.id) {
             this.fileTreeByPath.delete(entry.path);
@@ -3082,6 +3170,7 @@ export class SyncEngine {
         this.disposables = [];
         this.syncLock.clear();
         this.suppressedRemoteDocumentUpdates.clear();
+        this.suppressedDocumentUpdateCount = 0;
         this.suppressedRemoteDeletes.clear();
         this.suppressedRemoteRenames.clear();
         this.remoteDiffContents.clear();
