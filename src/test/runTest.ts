@@ -108,6 +108,8 @@ let useSocketIoMock = true;
 
 class FakeSocket {
     private readonly listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    disconnectCount = 0;
+    removeAllListenersCount = 0;
 
     constructor(
         private readonly onEmit?: (event: string, args: unknown[]) => void,
@@ -132,10 +134,12 @@ class FakeSocket {
     }
 
     disconnect(): this {
+        this.disconnectCount++;
         return this;
     }
 
     removeAllListeners(): this {
+        this.removeAllListenersCount++;
         this.listeners.clear();
         return this;
     }
@@ -590,6 +594,7 @@ async function run(): Promise<void> {
                 onFileRenamed?: (entityId: string, newName: string) => void;
                 onFileChanged?: (update: unknown) => void;
                 onUserCursorUpdated?: (update: unknown) => void;
+                onDisconnected?: (isAuthError?: boolean) => void;
             }): void;
             joinProject(): Promise<unknown>;
             joinDoc(docId: string): Promise<{ lines: string[]; version: number }>;
@@ -788,6 +793,27 @@ async function run(): Promise<void> {
         /invalid connected-user list/,
     );
     boundaryClient.disconnect();
+
+    const stalledSocket = new FakeSocket();
+    const stalledClient = new SocketIOAPI({
+        initSocket: () => stalledSocket,
+    }, { cookies: 'cookie', csrfToken: 'csrf' }, 'project');
+    let timeoutDisconnectNotifications = 0;
+    stalledClient.registerHandlers({
+        onDisconnected: () => { timeoutDisconnectNotifications++; },
+    });
+    (stalledClient as any)._connected = true;
+    (stalledClient as any).socketEventTimeoutMs = 1;
+    await assert.rejects(
+        () => stalledClient.joinDoc('doc-id'),
+        /Socket event "joinDoc" timed out/,
+        'an unanswered ACK must terminate the stalled socket instead of retaining its callback',
+    );
+    assert.equal(stalledSocket.removeAllListenersCount, 1);
+    assert.equal(stalledSocket.disconnectCount, 1);
+    assert.equal(timeoutDisconnectNotifications, 1,
+        'a timed-out live socket must surface the connection loss exactly once');
+    assert.equal((stalledClient as any).socket, undefined);
 
     assert.throws(
         () => validateRemoteDocumentLines(new Array(MAX_REMOTE_DOCUMENT_LINES + 1).fill('')),
@@ -2880,6 +2906,33 @@ async function run(): Promise<void> {
     assert.match(socketTransportSource, /headers:\s*extraHeaders\s*\|\|\s*\{\}/);
     assert.match(socketTransportSource, /\.onopen\s*=/);
     assert.match(socketTransportSource, /\.onmessage\s*=/);
+    const socketLifecycleSource = fs.readFileSync(
+        path.join(
+            __dirname,
+            '..',
+            '..',
+            'node_modules',
+            'socket.io-client',
+            'lib',
+            'socket.js',
+        ),
+        'utf8',
+    );
+    assert.match(socketLifecycleSource, /this\.namespaces\[endpoint\]\.acks\s*=\s*\{\}/);
+    assert.match(socketLifecycleSource, /this\.buffer\s*=\s*\[\]/);
+    const legacySocketClient = require('socket.io-client') as any;
+    const legacySocketManager = new legacySocketClient.Socket({
+        'auto connect': false,
+        reconnect: false,
+    });
+    const legacyCleanupNamespace = legacySocketManager.of('/cleanup-test');
+    legacyCleanupNamespace.acks[1] = () => undefined;
+    legacySocketManager.buffer = [{ sensitive: 'queued payload' }];
+    legacySocketManager.onDisconnect('booted');
+    assert.deepStrictEqual(Object.keys(legacyCleanupNamespace.acks), [],
+        'legacy disconnects must release every pending ACK callback');
+    assert.deepStrictEqual(legacySocketManager.buffer, [],
+        'legacy disconnects must release queued payloads');
     await verifyWebSocketCompatibility();
     await verifyHardenedXmlHttpRequest();
 

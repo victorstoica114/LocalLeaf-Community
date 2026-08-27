@@ -16,7 +16,7 @@ index 0820a52..e1885fb 100644
    // In the optional fourth stage, we recursively walk the new structure, passing
    // each name/value pair to a reviver function for possible transformation.
 diff --git a/node_modules/socket.io-client/lib/socket.js b/node_modules/socket.io-client/lib/socket.js
-index 07c1c3f..e208abc 100644
+index 07c1c3f..862ebcd 100644
 --- a/node_modules/socket.io-client/lib/socket.js
 +++ b/node_modules/socket.io-client/lib/socket.js
 @@ -152,11 +152,27 @@
@@ -69,6 +69,22 @@ index 07c1c3f..e208abc 100644
      xhr.send(null);
  
      // handle disconnection immediately
+@@ -476,5 +498,14 @@
+     this.connected = false;
+     this.connecting = false;
+     this.open = false;
+-
++
++    // ACK callbacks and queued packets belong to the disconnected transport.
++    // Retaining them indefinitely leaks callbacks and potentially sensitive data.
++    for (var endpoint in this.namespaces) {
++      if (this.namespaces.hasOwnProperty(endpoint)) {
++        this.namespaces[endpoint].acks = {};
++      }
++    }
++    this.buffer = [];
++
+     if (wasConnected || wasConnecting) {
 diff --git a/node_modules/socket.io-client/lib/transports/websocket.js b/node_modules/socket.io-client/lib/transports/websocket.js
 index 0dfa483..d878bbb 100644
 --- a/node_modules/socket.io-client/lib/transports/websocket.js

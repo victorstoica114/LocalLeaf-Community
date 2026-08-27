@@ -317,6 +317,7 @@ export class SocketIOAPI {
     private _handshakeResolve!: () => void;
     private _connectionFailurePromise!: Promise<Error>;
     private _connectionFailureResolve!: (error: Error) => void;
+    private socketEventTimeoutMs = 5000;
 
     constructor(
         private readonly api: BaseAPI,
@@ -382,9 +383,21 @@ export class SocketIOAPI {
         ]);
     }
 
-    private withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    private withTimeout<T>(
+        promise: Promise<T>,
+        timeoutMs: number,
+        message: string,
+        onTimeout?: () => void,
+    ): Promise<T> {
         return new Promise<T>((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+            const timer = setTimeout(() => {
+                try {
+                    onTimeout?.();
+                } catch (error) {
+                    log(`Failed to clean up a timed-out socket operation: ${errorMessage(error)}`);
+                }
+                reject(new Error(message));
+            }, timeoutMs);
             promise.then(
                 value => {
                     clearTimeout(timer);
@@ -396,6 +409,17 @@ export class SocketIOAPI {
                 },
             );
         });
+    }
+
+    private abortTimedOutSocket(socket: SocketIOClient.Socket): void {
+        if (this.socket !== socket) return;
+
+        const wasConnected = this._connected;
+        this.teardownSocket();
+        this._connected = false;
+        if (wasConnected) {
+            this.handlers.forEach(handler => handler.onDisconnected?.(false));
+        }
     }
 
     private emit(event: string, ...args: unknown[]): Promise<unknown[]> {
@@ -412,7 +436,12 @@ export class SocketIOAPI {
                 }
             });
         });
-        return this.withTimeout(response, 5000, `Socket event "${event}" timed out`);
+        return this.withTimeout(
+            response,
+            this.socketEventTimeoutMs,
+            `Socket event "${event}" timed out`,
+            () => this.abortTimedOutSocket(socket),
+        );
     }
 
     /**

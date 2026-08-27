@@ -37,6 +37,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Prevented full pulls from creating protected or ignored remote directories locally
 - Kept failed local changes eligible for retry instead of caching them as successful synchronization echoes
 - Replaced retained Socket.IO echo payloads with bounded SHA-256 fingerprints and capped stale suppression state
+- Closed stalled Socket.IO connections on event timeouts and cleared legacy ACK callbacks and queued payloads on disconnect
 
 ## [0.2.1] - 2026-08-23
 
