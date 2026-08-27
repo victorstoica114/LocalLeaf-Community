@@ -22,6 +22,10 @@ The disposition of every public pull request and every PR #3 commit is recorded 
 
 Victor contributed fixes for file creation and binary synchronization, integrated and refined the new interface, addressed review and security findings, improved Windows path handling, and added compatibility fixes for self-hosted Overleaf servers. He maintains the community repository and the releases produced from it.
 
+## OpenAI Codex
+
+OpenAI Codex is used as a coding and review assistant for ongoing maintenance, including repository analysis, implementation support, testing, and documentation. Changes remain subject to review and acceptance by the human maintainer; this credit records tool-assisted work without replacing the authorship of Teddy, Asixa, Victor, or other contributors.
+
 ## Community branding
 
 The current two-document-and-leaf identity was created for LocalLeaf Community in August 2026. It replaces the original pixel-art logo and should not be read as branding supplied or approved by the original project or by Overleaf.
