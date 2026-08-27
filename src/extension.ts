@@ -15,7 +15,11 @@ import { setOutputChannel } from './api/socketio';
 import { ProjectsWebviewProvider } from './views/projectsWebviewProvider';
 import { MainWebviewProvider } from './views/mainWebviewProvider';
 import { AccountPanel, AccountPanelAction, AccountPanelState } from './views/accountPanel';
-import { LinkOperationGate, shouldConfirmProjectLink } from './utils/linkSafety';
+import {
+    LinkOperationGate,
+    resolveRequestedProject,
+    shouldConfirmProjectLink,
+} from './utils/linkSafety';
 import { validateServerUrl, ValidatedServerUrl } from './utils/serverUrl';
 import { assertSafeWorkspacePath, normalizeProjectPath } from './utils/pathSafety';
 import { removeStandaloneLatexComments } from './utils/latexComments';
@@ -332,7 +336,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.LOGIN, cmdLogin),
         vscode.commands.registerCommand(COMMANDS.LOGOUT, cmdLogout),
         vscode.commands.registerCommand(COMMANDS.SHOW_ACCOUNT_PANEL, () => cmdShowAccountPanel(context)),
-        vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: ProjectInfo) => cmdLinkFolder(context, project)),
+        vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: unknown) => cmdLinkFolder(context, project)),
         vscode.commands.registerCommand(COMMANDS.LINK_FOLDER, () => cmdLinkFolder(context)),
         vscode.commands.registerCommand(COMMANDS.UNLINK_FOLDER, cmdUnlinkFolder),
         vscode.commands.registerCommand(COMMANDS.SYNC_NOW, cmdSyncNow),
@@ -947,7 +951,7 @@ async function cmdLogout() {
 /**
  * Link current folder to an Overleaf project
  */
-async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?: ProjectInfo) {
+async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?: unknown) {
     if (!linkOperationGate.tryEnter()) {
         void vscode.window.showInformationMessage('LocalLeaf: A project link is already in progress');
         return;
@@ -979,22 +983,33 @@ async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?
             return;
         }
 
-        let project = requestedProject;
-        if (!project) {
-            const api = new BaseAPI(serverUrl);
-            api.setIdentity(credential.identity);
-            let projectsResult: Awaited<ReturnType<BaseAPI['getProjects']>>;
-            try {
-                projectsResult = await api.getProjects();
-            } finally {
-                api.dispose();
-            }
-            if (projectsResult.type !== 'success' || !projectsResult.projects) {
-                void vscode.window.showErrorMessage(`LocalLeaf: Failed to get projects - ${projectsResult.message}`);
+        // Commands are a public extension boundary. Resolve even a webview
+        // selection against a fresh authenticated list and use only that
+        // canonical server object.
+        const api = new BaseAPI(serverUrl);
+        api.setIdentity(credential.identity);
+        let projectsResult: Awaited<ReturnType<BaseAPI['getProjects']>>;
+        try {
+            projectsResult = await api.getProjects();
+        } finally {
+            api.dispose();
+        }
+        if (projectsResult.type !== 'success' || !projectsResult.projects) {
+            void vscode.window.showErrorMessage(`LocalLeaf: Failed to get projects - ${projectsResult.message}`);
+            return;
+        }
+
+        const activeProjects = projectsResult.projects.filter(p => !p.archived && !p.trashed);
+        let project: ProjectInfo | undefined;
+        if (requestedProject !== undefined) {
+            project = resolveRequestedProject(activeProjects, requestedProject);
+            if (!project) {
+                void vscode.window.showErrorMessage(
+                    'LocalLeaf: The requested project is not available for the authenticated account.'
+                );
                 return;
             }
-
-            const activeProjects = projectsResult.projects.filter(p => !p.archived && !p.trashed);
+        } else {
             const items = activeProjects.map(p => ({
                 label: p.name,
                 description: `${p.accessLevel}${p.lastUpdated ? ` - ${new Date(p.lastUpdated).toLocaleDateString()}` : ''}`,
@@ -1009,17 +1024,27 @@ async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?
         }
 
         const workspaceEntries = await vscode.workspace.fs.readDirectory(workspaceFolder);
-        if (shouldConfirmProjectLink(workspaceEntries.map(([name]) => name))) {
-            const confirmation = await vscode.window.showWarningMessage(
-                `Link this folder to "${project.name}"?`,
-                {
-                    modal: true,
-                    detail: 'LocalLeaf will compare the existing files with Overleaf and ask before resolving conflicts.',
-                },
-                'Link and Synchronize',
-            );
-            if (confirmation !== 'Link and Synchronize') return;
-        }
+        const containsExistingContent = shouldConfirmProjectLink(
+            workspaceEntries.map(([name]) => name)
+        );
+        const confirmation = await vscode.window.showWarningMessage(
+            `Link this folder to "${project.name}" and allow synchronization?`,
+            {
+                modal: true,
+                detail: [
+                    `Folder: ${workspaceFolder.fsPath}`,
+                    `Server: ${serverUrl}`,
+                    `Project: ${project.name}`,
+                    '',
+                    containsExistingContent
+                        ? 'LocalLeaf will compare existing files with Overleaf and ask before resolving content conflicts.'
+                        : 'Remote project files can be downloaded into this folder.',
+                    'Saved local changes can be uploaded to Overleaf.',
+                ].join('\n'),
+            },
+            'Link and Synchronize',
+        );
+        if (confirmation !== 'Link and Synchronize') return;
 
         // Create settings
         const settings = SettingsManager.createDefaultSettings(serverUrl, project.id, project.name);

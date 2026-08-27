@@ -1999,10 +1999,11 @@ async function run(): Promise<void> {
     assert.doesNotMatch(projectsSource, /Ã|â€¦/,
         'project loading text must not contain mojibake');
 
-    const { LinkOperationGate, shouldConfirmProjectLink } = require(
+    const { LinkOperationGate, resolveRequestedProject, shouldConfirmProjectLink } = require(
         path.join('..', 'utils', 'linkSafety')
     ) as {
         LinkOperationGate: new () => { tryEnter(): boolean; leave(): void; isActive: boolean };
+        resolveRequestedProject<T extends { id: string }>(projects: readonly T[], requested: unknown): T | undefined;
         shouldConfirmProjectLink(entryNames: readonly string[]): boolean;
     };
     const linkGate = new LinkOperationGate();
@@ -2013,6 +2014,14 @@ async function run(): Promise<void> {
     assert.equal(shouldConfirmProjectLink(['.localleaf', '.leafignore']), false);
     assert.equal(shouldConfirmProjectLink(['.localleaf', 'chapter.tex']), true,
         'folders containing user files must require confirmation');
+    const canonicalProject = { id: 'project-1', name: 'Canonical project' };
+    assert.strictEqual(
+        resolveRequestedProject([canonicalProject], { id: 'project-1', name: 'Injected name' }),
+        canonicalProject,
+        'public command arguments must resolve to the canonical authenticated project object',
+    );
+    assert.equal(resolveRequestedProject([canonicalProject], { id: 'other-project' }), undefined);
+    assert.equal(resolveRequestedProject([canonicalProject], { id: 'project-1\nInjected' }), undefined);
 
     const { createNonce } = require(path.join('..', 'views', 'webviewUtils')) as {
         createNonce(): string;

@@ -22,6 +22,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Made `localleaf.autoSync` and the linked-project `autoSync` flag actually disable watcher-triggered local uploads
 - Prevented server-provided account fields from being interpreted as Markdown in status tooltips
 - Removed legacy synchronous child-process XHR and JSON `eval` fallbacks, rejected credential-preserving redirects, and bounded legacy XHR responses
+- Revalidated public project-link command arguments against the authenticated server and required explicit synchronization approval for every folder
 
 ## [0.2.1] - 2026-08-23
 

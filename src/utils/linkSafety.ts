@@ -27,3 +27,27 @@ export class LinkOperationGate {
 export function shouldConfirmProjectLink(entryNames: readonly string[]): boolean {
     return entryNames.some(name => !LOCALLEAF_METADATA.has(name));
 }
+
+/**
+ * Resolve a project supplied through VS Code's public command boundary against
+ * a freshly authenticated server response. Never trust the command argument's
+ * name, access level, or other fields: another extension can invoke commands.
+ */
+export function resolveRequestedProject<T extends { id: string }>(
+    availableProjects: readonly T[],
+    requested: unknown,
+): T | undefined {
+    if (!requested || typeof requested !== 'object' || Array.isArray(requested)) {
+        return undefined;
+    }
+    const id = (requested as { id?: unknown }).id;
+    if (
+        typeof id !== 'string'
+        || id.length === 0
+        || id.length > 1024
+        || /[\0\r\n]/.test(id)
+    ) {
+        return undefined;
+    }
+    return availableProjects.find(project => project.id === id);
+}
