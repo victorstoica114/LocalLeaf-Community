@@ -238,7 +238,12 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
             }
             return;
         }
-        if (message.type === 'jumpToUser' && typeof message.clientId === 'string') {
+        if (
+            message.type === 'jumpToUser'
+            && typeof message.clientId === 'string'
+            && message.clientId.length > 0
+            && message.clientId.length <= 1024
+        ) {
             await vscode.commands.executeCommand(COMMANDS.JUMP_TO_COLLABORATOR, message.clientId);
         }
     }

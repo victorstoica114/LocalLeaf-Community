@@ -23,6 +23,10 @@ import {
     validateOverleafId,
 } from '../utils/remoteValidation';
 
+const MAX_PENDING_REMOTE_EVENTS = 10_000;
+const MAX_PENDING_REMOTE_EVENT_CHARACTERS = 20 * 1024 * 1024;
+const DEFAULT_REMOTE_EVENT_COST = 4096;
+
 /**
  * Sync status
  */
@@ -132,6 +136,8 @@ export class SyncEngine {
     private disposed = false;
     private readonly pendingWaits = new Map<NodeJS.Timeout, (active: boolean) => void>();
     private remoteEventQueue: Promise<void> = Promise.resolve();
+    private pendingRemoteEventCount = 0;
+    private pendingRemoteEventCost = 0;
     private readonly remoteDiffContents = new Map<string, string>();
     private remoteDiffChangeEmitter?: vscode.EventEmitter<vscode.Uri>;
 
@@ -173,7 +179,26 @@ export class SyncEngine {
         }
     }
 
-    private enqueueRemoteEvent(operation: () => Promise<void>): void {
+    private enqueueRemoteEvent(
+        operation: () => Promise<void>,
+        estimatedCost: number = DEFAULT_REMOTE_EVENT_COST,
+    ): void {
+        const safeCost = Number.isSafeInteger(estimatedCost) && estimatedCost > 0
+            ? estimatedCost
+            : DEFAULT_REMOTE_EVENT_COST;
+        if (
+            this.pendingRemoteEventCount >= MAX_PENDING_REMOTE_EVENTS
+            || this.pendingRemoteEventCost + safeCost > MAX_PENDING_REMOTE_EVENT_CHARACTERS
+        ) {
+            const message = 'Remote event queue limit exceeded; reconnect before continuing synchronization.';
+            this.log(message);
+            this.setStatus('error', message);
+            this.socket?.disconnect();
+            return;
+        }
+
+        this.pendingRemoteEventCount++;
+        this.pendingRemoteEventCost += safeCost;
         this.remoteEventQueue = this.remoteEventQueue
             .then(async () => {
                 if (!this.disposed) await operation();
@@ -189,7 +214,19 @@ export class SyncEngine {
                         authErr,
                     );
                 }
+            })
+            .finally(() => {
+                this.pendingRemoteEventCount--;
+                this.pendingRemoteEventCost -= safeCost;
             });
+    }
+
+    private estimateDocumentUpdateCost(update: DocumentUpdate): number {
+        let cost = update.doc.length + 128;
+        for (const operation of update.op ?? []) {
+            cost += 128 + (operation.i?.length ?? 0) + (operation.d?.length ?? 0);
+        }
+        return cost;
     }
 
     /**
@@ -244,7 +281,8 @@ export class SyncEngine {
                     () => this.handleRemoteFileMoved(entityId, newParentId)
                 ),
                 onFileChanged: (update) => this.enqueueRemoteEvent(
-                    () => this.handleRemoteFileChanged(update)
+                    () => this.handleRemoteFileChanged(update),
+                    this.estimateDocumentUpdateCost(update),
                 ),
                 onRootDocUpdated: (rootDocId) => this.enqueueRemoteEvent(
                     () => this.handleRootDocumentUpdated(rootDocId)

@@ -90,9 +90,20 @@ export class AccountPanel {
         if (message.type === 'logout') return { type: 'logout' };
         if (message.type === 'openTutorial') return { type: 'openTutorial' };
         if (message.type === 'loginCookies') {
-            const serverUrl = String(message.serverUrl || '').trim();
-            const cookies = String(message.cookies || '').trim();
-            if (serverUrl && cookies) return { type: 'loginCookies', serverUrl, cookies };
+            if (typeof message.serverUrl !== 'string' || typeof message.cookies !== 'string') {
+                return undefined;
+            }
+            const serverUrl = message.serverUrl.trim();
+            const cookies = message.cookies.trim();
+            if (
+                serverUrl
+                && serverUrl.length <= 8192
+                && cookies
+                && cookies.length <= 65536
+                && !/[\r\n\0]/.test(cookies)
+            ) {
+                return { type: 'loginCookies', serverUrl, cookies };
+            }
         }
         return undefined;
     }

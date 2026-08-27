@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { BaseAPI, ProjectEntity, FileEntity } from './base';
 import { Identity } from '../utils/credentialManager';
+import { validateProjectEntityName } from '../utils/pathSafety';
 import {
     MAX_REMOTE_DOCUMENT_CHARACTERS,
     MAX_REMOTE_DOCUMENT_OPERATIONS,
@@ -281,6 +282,23 @@ function parseUserCursorUpdate(value: unknown): UserCursorUpdate | undefined {
     return { id, user_id: userId, name, email, doc_id: docId, row, column };
 }
 
+function parseFileEntityEvent(
+    value: unknown,
+    type: FileEntity['_type'],
+): FileEntity | undefined {
+    const record = objectRecord(value);
+    if (!record) return undefined;
+    try {
+        return {
+            _id: validateOverleafId(record._id, 'entity ID'),
+            _type: type,
+            name: validateProjectEntityName(record.name as string),
+        };
+    } catch {
+        return undefined;
+    }
+}
+
 /**
  * Socket.io API for real-time communication with Overleaf
  * Reference: Overleaf-Workshop/src/api/socketio.ts
@@ -429,7 +447,7 @@ export class SocketIOAPI {
 
         socket.on('error', (err: unknown) => {
             if (this.socket !== socket) return;
-            log(`Socket error: ${err}`);
+            log(`Socket error: ${errorMessage(err).slice(0, MAX_PROFILE_FIELD_LENGTH)}`);
         });
 
         socket.on('disconnect', () => {
@@ -508,32 +526,69 @@ export class SocketIOAPI {
     private attachHandlers(socket: SocketIOClient.Socket, handlers: SocketEventHandlers): void {
         // File events
         if (handlers.onFileCreated) {
-            socket.on('reciveNewDoc', (parentFolderId: string, doc: FileEntity) => {
-                handlers.onFileCreated!(parentFolderId, 'doc', doc);
+            socket.on('reciveNewDoc', (parentValue: unknown, docValue: unknown) => {
+                const doc = parseFileEntityEvent(docValue, 'doc');
+                try {
+                    if (doc) handlers.onFileCreated!(validateOverleafId(parentValue, 'parent folder ID'), 'doc', doc);
+                } catch {
+                    // Ignore malformed filesystem events.
+                }
             });
-            socket.on('reciveNewFile', (parentFolderId: string, file: FileEntity) => {
-                handlers.onFileCreated!(parentFolderId, 'file', file);
+            socket.on('reciveNewFile', (parentValue: unknown, fileValue: unknown) => {
+                const file = parseFileEntityEvent(fileValue, 'file');
+                try {
+                    if (file) handlers.onFileCreated!(validateOverleafId(parentValue, 'parent folder ID'), 'file', file);
+                } catch {
+                    // Ignore malformed filesystem events.
+                }
             });
-            socket.on('reciveNewFolder', (parentFolderId: string, folder: FileEntity) => {
-                handlers.onFileCreated!(parentFolderId, 'folder', folder);
+            socket.on('reciveNewFolder', (parentValue: unknown, folderValue: unknown) => {
+                const folder = parseFileEntityEvent(folderValue, 'folder');
+                try {
+                    if (folder) handlers.onFileCreated!(
+                        validateOverleafId(parentValue, 'parent folder ID'),
+                        'folder',
+                        folder,
+                    );
+                } catch {
+                    // Ignore malformed filesystem events.
+                }
             });
         }
 
         if (handlers.onFileRenamed) {
-            socket.on('reciveEntityRename', (entityId: string, newName: string) => {
-                handlers.onFileRenamed!(entityId, newName);
+            socket.on('reciveEntityRename', (entityValue: unknown, nameValue: unknown) => {
+                try {
+                    handlers.onFileRenamed!(
+                        validateOverleafId(entityValue, 'entity ID'),
+                        validateProjectEntityName(nameValue as string),
+                    );
+                } catch {
+                    // Ignore malformed filesystem events.
+                }
             });
         }
 
         if (handlers.onFileRemoved) {
-            socket.on('removeEntity', (entityId: string) => {
-                handlers.onFileRemoved!(entityId);
+            socket.on('removeEntity', (value: unknown) => {
+                try {
+                    handlers.onFileRemoved!(validateOverleafId(value, 'entity ID'));
+                } catch {
+                    // Ignore malformed filesystem events.
+                }
             });
         }
 
         if (handlers.onFileMoved) {
-            socket.on('reciveEntityMove', (entityId: string, folderId: string) => {
-                handlers.onFileMoved!(entityId, folderId);
+            socket.on('reciveEntityMove', (entityValue: unknown, folderValue: unknown) => {
+                try {
+                    handlers.onFileMoved!(
+                        validateOverleafId(entityValue, 'entity ID'),
+                        validateOverleafId(folderValue, 'parent folder ID'),
+                    );
+                } catch {
+                    // Ignore malformed filesystem events.
+                }
             });
         }
 
@@ -564,14 +619,19 @@ export class SocketIOAPI {
 
         // Project settings events
         if (handlers.onRootDocUpdated) {
-            socket.on('rootDocUpdated', (rootDocId: string) => {
-                handlers.onRootDocUpdated!(rootDocId);
+            socket.on('rootDocUpdated', (value: unknown) => {
+                try {
+                    handlers.onRootDocUpdated!(value === '' ? '' : validateOverleafId(value, 'root document ID'));
+                } catch {
+                    // Ignore malformed project events.
+                }
             });
         }
 
         if (handlers.onCompilerUpdated) {
-            socket.on('compilerUpdated', (compiler: string) => {
-                handlers.onCompilerUpdated!(compiler);
+            socket.on('compilerUpdated', (value: unknown) => {
+                const compiler = boundedString(value, 255);
+                if (compiler) handlers.onCompilerUpdated!(compiler);
             });
         }
     }

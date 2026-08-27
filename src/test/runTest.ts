@@ -486,6 +486,7 @@ async function run(): Promise<void> {
         SocketIOAPI: new (api: unknown, identity: unknown, projectId: string) => {
             registerHandlers(handlers: {
                 onConnected?: (publicId: string) => void;
+                onFileCreated?: (parentId: string, type: string, entity: unknown) => void;
                 onFileRenamed?: (entityId: string, newName: string) => void;
                 onFileChanged?: (update: unknown) => void;
                 onUserCursorUpdated?: (update: unknown) => void;
@@ -563,6 +564,7 @@ async function run(): Promise<void> {
     const negotiatedQueries: Array<string | undefined> = [];
     const negotiatedSockets: FakeSocket[] = [];
     let renamedEvent: [string, string] | undefined;
+    let createdEventCount = 0;
     let documentUpdateCount = 0;
     let cursorUpdateCount = 0;
     const negotiationApi = {
@@ -594,6 +596,7 @@ async function run(): Promise<void> {
         'query project/with spaces',
     );
     negotiatedClient.registerHandlers({
+        onFileCreated: () => { createdEventCount++; },
         onFileRenamed: (entityId, newName) => { renamedEvent = [entityId, newName]; },
         onFileChanged: () => { documentUpdateCount++; },
         onUserCursorUpdated: () => { cursorUpdateCount++; },
@@ -605,6 +608,17 @@ async function run(): Promise<void> {
     negotiatedSockets[1].trigger('reciveEntityRename', 'doc-id', 'renamed.tex');
     assert.deepStrictEqual(renamedEvent, ['doc-id', 'renamed.tex'],
         'event handlers must survive Socket.IO protocol negotiation');
+    negotiatedSockets[1].trigger('reciveEntityRename', 'doc-id', '../outside.tex');
+    assert.deepStrictEqual(renamedEvent, ['doc-id', 'renamed.tex'],
+        'unsafe remote entity names must be discarded at the socket boundary');
+    negotiatedSockets[1].trigger('reciveNewDoc', 'folder-id', {
+        _id: 'new-doc',
+        name: 'new.tex',
+        ignoredPayload: { deeply: 'nested' },
+    });
+    negotiatedSockets[1].trigger('reciveNewDoc', 'folder-id', { _id: 'new-doc', name: '..' });
+    assert.equal(createdEventCount, 1,
+        'remote filesystem events must be validated and reduced to safe entity fields');
     negotiatedSockets[1].trigger('otUpdateApplied', { doc: 'doc-id', v: 1, op: [{ p: 0, i: 'x' }] });
     negotiatedSockets[1].trigger('otUpdateApplied', { doc: 'doc-id', v: 1, op: [null] });
     assert.equal(documentUpdateCount, 1, 'malformed OT events must be discarded at the socket boundary');
@@ -1442,6 +1456,28 @@ async function run(): Promise<void> {
     );
     assert.equal(watchFailureStatus, 'error');
 
+    const floodedRemoteQueue = Object.create(SyncEngine.prototype) as any;
+    floodedRemoteQueue.pendingRemoteEventCount = 10_000;
+    floodedRemoteQueue.pendingRemoteEventCost = 0;
+    floodedRemoteQueue.log = () => undefined;
+    let floodedQueueStatus: string | undefined;
+    floodedRemoteQueue.setStatus = (status: string) => { floodedQueueStatus = status; };
+    let floodedSocketDisconnected = false;
+    floodedRemoteQueue.socket = { disconnect: () => { floodedSocketDisconnected = true; } };
+    floodedRemoteQueue.enqueueRemoteEvent(async () => undefined);
+    assert.equal(floodedQueueStatus, 'error');
+    assert.equal(floodedSocketDisconnected, true,
+        'a server must not be able to grow the pending remote-event queue without a bound');
+
+    floodedQueueStatus = undefined;
+    floodedSocketDisconnected = false;
+    floodedRemoteQueue.pendingRemoteEventCount = 0;
+    floodedRemoteQueue.pendingRemoteEventCost = 20 * 1024 * 1024;
+    floodedRemoteQueue.enqueueRemoteEvent(async () => undefined, 1);
+    assert.equal(floodedQueueStatus, 'error');
+    assert.equal(floodedSocketDisconnected, true,
+        'large queued OT payloads must be bounded independently from event count');
+
     const protectedPaths = Object.create(SyncEngine.prototype) as any;
     protectedPaths.ignoreParser = { shouldIgnore: () => false };
     assert.equal(protectedPaths.shouldSync('/.git/config'), false);
@@ -1736,6 +1772,27 @@ async function run(): Promise<void> {
     const cookiePost = accountSource.indexOf("vscode.postMessage({ type: 'loginCookies'", cookieHandler);
     assert.ok(cookieHandler >= 0 && cookieClear > cookieHandler && cookieClear < cookiePost,
         'session cookies must be removed from the DOM before the login message is posted');
+    const { AccountPanel } = require(path.join('..', 'views', 'accountPanel')) as { AccountPanel: any };
+    const accountParser = Object.create(AccountPanel.prototype) as any;
+    assert.deepStrictEqual(accountParser.parseAction({
+        type: 'loginCookies',
+        serverUrl: 'https://overleaf.example',
+        cookies: 'session=safe',
+    }), {
+        type: 'loginCookies',
+        serverUrl: 'https://overleaf.example',
+        cookies: 'session=safe',
+    });
+    assert.equal(accountParser.parseAction({
+        type: 'loginCookies',
+        serverUrl: { toString: () => 'https://attacker.example' },
+        cookies: 'session=safe',
+    }), undefined, 'account messages must not coerce attacker-controlled objects into URLs');
+    assert.equal(accountParser.parseAction({
+        type: 'loginCookies',
+        serverUrl: 'https://overleaf.example',
+        cookies: 'session=safe\r\nInjected: header',
+    }), undefined, 'cookie messages containing header delimiters must be rejected in the webview host');
 
     const extensionSource = fs.readFileSync(
         path.join(__dirname, '..', '..', 'src', 'extension.ts'),
