@@ -209,6 +209,7 @@ let mockFileWrites: Array<{ uri: MockUri | string; content: Uint8Array }> = [];
 let mockFileDeletes: Array<{ uri: MockUri | string; recursive: boolean }> = [];
 let mockFileRenames: Array<{ oldUri: MockUri | string; newUri: MockUri | string }> = [];
 let mockApplyEditResult = true;
+let mockAutomaticSyncSetting = true;
 
 function mockFileUri(fsPath: string): MockUri {
     const normalizedFsPath = path.win32.normalize(fsPath);
@@ -257,6 +258,7 @@ function resetMockWorkspace(
     mockFileDeletes = [];
     mockFileRenames = [];
     mockApplyEditResult = true;
+    mockAutomaticSyncSetting = true;
 }
 
 const mockWorkspaceFs = {
@@ -354,6 +356,9 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             workspace: {
                 get workspaceFolders() { return mockWorkspaceFolders; },
                 get textDocuments() { return mockTextDocuments; },
+                getConfiguration: () => ({
+                    get: (_name: string, fallback: unknown) => mockAutomaticSyncSetting ?? fallback,
+                }),
                 fs: mockWorkspaceFs,
                 applyEdit: async (edit: MockWorkspaceEdit) => {
                     mockAppliedWorkspaceEdits.push(edit);
@@ -1477,6 +1482,53 @@ async function run(): Promise<void> {
     assert.equal(floodedQueueStatus, 'error');
     assert.equal(floodedSocketDisconnected, true,
         'large queued OT payloads must be bounded independently from event count');
+
+    const automaticSync = Object.create(SyncEngine.prototype) as any;
+    const automaticSyncWorkspace = mockFileUri('D:\\automatic-sync-workspace');
+    automaticSync.settings = {
+        getSettings: () => ({ autoSync: true }),
+        getWorkspaceFolder: () => automaticSyncWorkspace,
+    };
+    assert.equal(automaticSync.automaticSyncEnabled, true);
+    mockAutomaticSyncSetting = false;
+    assert.equal(automaticSync.automaticSyncEnabled, false,
+        'the VS Code autoSync setting must actually disable automatic local uploads');
+    mockAutomaticSyncSetting = true;
+    automaticSync.settings.getSettings = () => ({ autoSync: false });
+    assert.equal(automaticSync.automaticSyncEnabled, false,
+        'the linked-project autoSync setting must actually disable automatic local uploads');
+
+    const scanWorkspace = mockFileUri('D:\\scan-workspace');
+    resetMockWorkspace([scanWorkspace], [
+        [scanWorkspace.fsPath, { type: 2 }],
+        ['D:\\scan-workspace\\known.tex', { type: 1, content: 'known' }],
+        ['D:\\scan-workspace\\new.tex', { type: 1, content: 'new' }],
+        ['D:\\scan-workspace\\nested', { type: 2 }],
+        ['D:\\scan-workspace\\nested\\other.tex', { type: 1, content: 'other' }],
+        ['D:\\scan-workspace\\outside-link', { type: 2 | 64 }],
+    ]);
+    const boundedLocalScan = Object.create(SyncEngine.prototype) as any;
+    boundedLocalScan.settings = { getWorkspaceFolder: () => scanWorkspace };
+    boundedLocalScan.assertNoSymbolicLinks = async () => undefined;
+    boundedLocalScan.shouldSync = () => true;
+    boundedLocalScan.log = () => undefined;
+    boundedLocalScan.fileTreeByPath = new Map([['/known.tex', {}]]);
+    boundedLocalScan.baseContent = new Map();
+    assert.deepStrictEqual(
+        await boundedLocalScan.findLocalOnlyFiles(),
+        ['/new.tex', '/nested/other.tex'],
+        'local discovery must stay inside ordinary non-symlink directories',
+    );
+    await assert.rejects(
+        () => boundedLocalScan.findLocalOnlyFiles(1, 256),
+        /too many files or directories/,
+        'the local project scan must have a hard entity bound',
+    );
+    await assert.rejects(
+        () => boundedLocalScan.findLocalOnlyFiles(100, 0),
+        /excessively deep directory tree/,
+        'the local project scan must have a hard recursion bound',
+    );
 
     const protectedPaths = Object.create(SyncEngine.prototype) as any;
     protectedPaths.ignoreParser = { shouldIgnore: () => false };

@@ -1134,7 +1134,9 @@ async function cmdPushToOverleaf() {
         return;
     }
 
-    void vscode.window.showInformationMessage('LocalLeaf: Push is automatic via real-time sync');
+    void vscode.window.showInformationMessage(syncEngine.automaticSyncEnabled
+        ? 'LocalLeaf: Push is automatic via real-time sync'
+        : 'LocalLeaf: Automatic local push is disabled. Run Sync Now to review and upload local changes.');
 }
 
 interface LatexCommentEditCandidate {

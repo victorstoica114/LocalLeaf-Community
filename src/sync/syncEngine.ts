@@ -26,6 +26,8 @@ import {
 const MAX_PENDING_REMOTE_EVENTS = 10_000;
 const MAX_PENDING_REMOTE_EVENT_CHARACTERS = 20 * 1024 * 1024;
 const DEFAULT_REMOTE_EVENT_COST = 4096;
+const MAX_LOCAL_SCAN_ENTITIES = 100_000;
+const MAX_LOCAL_SCAN_DEPTH = 256;
 
 /**
  * Sync status
@@ -162,6 +164,20 @@ export class SyncEngine {
      */
     get status(): SyncStatus {
         return this._status;
+    }
+
+    /**
+     * Automatic local uploads can be disabled either for this linked project
+     * or through the VS Code setting. Read both values dynamically so changing
+     * either setting does not require reconnecting the socket.
+     */
+    get automaticSyncEnabled(): boolean {
+        const projectSetting = this.settings.getSettings()?.autoSync ?? true;
+        const editorSetting = vscode.workspace.getConfiguration(
+            'localleaf',
+            this.settings.getWorkspaceFolder(),
+        ).get<boolean>('autoSync', true);
+        return projectSetting && editorSetting;
     }
 
     /**
@@ -511,8 +527,9 @@ export class SyncEngine {
 
         const localWatcher = vscode.workspace.createFileSystemWatcher(pattern);
 
-        const run = (operation: Promise<void>) => {
-            void operation.catch(error => {
+        const run = (operation: () => Promise<void>) => {
+            if (!this.automaticSyncEnabled) return;
+            void operation().catch(error => {
                 if (!this.disposed) {
                     console.error('[LocalLeaf] Local filesystem event failed:', error);
                     const authErr = isAuthError(error);
@@ -527,9 +544,9 @@ export class SyncEngine {
         };
 
         this.disposables.push(
-            localWatcher.onDidChange(uri => run(this.handleLocalFileChange(uri))),
-            localWatcher.onDidCreate(uri => run(this.handleLocalFileCreate(uri))),
-            localWatcher.onDidDelete(uri => run(this.handleLocalFileDelete(uri))),
+            localWatcher.onDidChange(uri => run(() => this.handleLocalFileChange(uri))),
+            localWatcher.onDidCreate(uri => run(() => this.handleLocalFileCreate(uri))),
+            localWatcher.onDidDelete(uri => run(() => this.handleLocalFileDelete(uri))),
             localWatcher
         );
     }
@@ -2455,6 +2472,70 @@ export class SyncEngine {
     }
 
     /**
+     * Find local files that have not been seen on Overleaf. Directory reads
+     * may legitimately fail because of permissions, but traversal limits and
+     * path-safety failures must propagate instead of being silently swallowed.
+     */
+    private async findLocalOnlyFiles(
+        maxEntities: number = MAX_LOCAL_SCAN_ENTITIES,
+        maxDepth: number = MAX_LOCAL_SCAN_DEPTH,
+    ): Promise<string[]> {
+        const localOnlyPaths: string[] = [];
+        const workspaceFolder = this.settings.getWorkspaceFolder();
+        await this.assertNoSymbolicLinks(workspaceFolder);
+        let scannedEntities = 0;
+
+        const scanDirectory = async (
+            directoryUri: vscode.Uri,
+            basePath: string = '/',
+            depth: number = 0,
+        ): Promise<void> => {
+            if (depth > maxDepth) {
+                throw new Error('Local project contains an excessively deep directory tree.');
+            }
+
+            let entries: [string, vscode.FileType][];
+            try {
+                entries = await vscode.workspace.fs.readDirectory(directoryUri);
+            } catch (error) {
+                debugLog(`Error scanning directory: ${basePath}`, error);
+                return;
+            }
+
+            for (const [name, type] of entries) {
+                scannedEntities++;
+                if (scannedEntities > maxEntities) {
+                    throw new Error('Local project contains too many files or directories to scan safely.');
+                }
+
+                const relativePath = basePath + name;
+                const isDirectory = (type & vscode.FileType.Directory) !== 0;
+                const fullPath = isDirectory ? `${relativePath}/` : relativePath;
+
+                if (!this.shouldSync(fullPath)) continue;
+
+                // Never traverse or upload a symbolic link. It may point
+                // outside the workspace even though its visible path is inside.
+                if ((type & vscode.FileType.SymbolicLink) !== 0) {
+                    this.log(`Skipped symbolic link: ${fullPath}`);
+                    continue;
+                }
+
+                if (isDirectory) {
+                    const childUri = vscode.Uri.joinPath(directoryUri, name);
+                    await this.assertNoSymbolicLinks(childUri);
+                    await scanDirectory(childUri, fullPath, depth + 1);
+                } else if (!this.fileTreeByPath.has(fullPath) && !this.baseContent.has(fullPath)) {
+                    localOnlyPaths.push(fullPath);
+                }
+            }
+        };
+
+        await scanDirectory(workspaceFolder);
+        return localOnlyPaths;
+    }
+
+    /**
      * Perform full sync (pull all files)
      */
     async pullAll(): Promise<void> {
@@ -2675,42 +2756,7 @@ export class SyncEngine {
             }
 
             // Detect local-only files (exist locally but not on Overleaf or in baseContent)
-            const localOnlyPaths: string[] = [];
-            const workspaceFolder = this.settings.getWorkspaceFolder();
-            await this.assertNoSymbolicLinks(workspaceFolder);
-            const scanLocalFiles = async (dirUri: vscode.Uri, basePath: string = '/'): Promise<void> => {
-                try {
-                    const entries = await vscode.workspace.fs.readDirectory(dirUri);
-                    for (const [name, type] of entries) {
-                        const relativePath = basePath + name;
-                        const fullPath = (type & vscode.FileType.Directory) !== 0
-                            ? relativePath + '/'
-                            : relativePath;
-
-                        // Skip ignored files
-                        if (!this.shouldSync(fullPath)) continue;
-
-                        // Never traverse or upload a symbolic link. It may point
-                        // outside the workspace even though its visible path is inside.
-                        if ((type & vscode.FileType.SymbolicLink) !== 0) {
-                            this.log(`Skipped symbolic link: ${fullPath}`);
-                            continue;
-                        }
-
-                        if ((type & vscode.FileType.Directory) !== 0) {
-                            await scanLocalFiles(vscode.Uri.joinPath(dirUri, name), fullPath);
-                        } else {
-                            // Check if this file is known to Overleaf or baseContent
-                            if (!this.fileTreeByPath.has(fullPath) && !this.baseContent.has(fullPath)) {
-                                localOnlyPaths.push(fullPath);
-                            }
-                        }
-                    }
-                } catch (error) {
-                    debugLog(`Error scanning directory: ${basePath}`, error);
-                }
-            };
-            await scanLocalFiles(workspaceFolder);
+            const localOnlyPaths = await this.findLocalOnlyFiles();
             if (localOnlyPaths.length > 0) {
                 await this.handleLocalOnlyFiles(localOnlyPaths);
             }
