@@ -1265,6 +1265,10 @@ async function run(): Promise<void> {
             _parentId: string,
             name: string
         ) => {
+            assert.equal(binaryReplacement.fileTreeByPath.has('/figure.pdf'), false,
+                'the original path must be released before its replacement is uploaded');
+            const backup = binaryReplacement.fileTree.get('old/binary?id');
+            assert.match(backup.path, /^\/figure\.pdf\.localleaf-[0-9a-f]{12}-/);
             replacementOperations.push(`upload:${name}`);
             return {
                 type: 'success',
@@ -1273,7 +1277,7 @@ async function run(): Promise<void> {
         },
     };
     const oldBinary = {
-        id: 'old-binary-id',
+        id: 'old/binary?id',
         type: 'file',
         name: 'figure.pdf',
         path: '/figure.pdf',
@@ -1301,8 +1305,10 @@ async function run(): Promise<void> {
     assert.equal(replacementOperations[0].startsWith('rename:figure.pdf.localleaf-'), true);
     assert.deepStrictEqual(replacementOperations.slice(1), [
         'upload:figure.pdf',
-        'delete:old-binary-id',
+        'delete:old/binary?id',
     ]);
+    assert.doesNotMatch(replacementOperations[0], /[/?]/,
+        'opaque remote IDs must be hashed before they are used in a temporary filename');
 
     const failedReplacement = Object.create(SyncEngine.prototype) as any;
     failedReplacement.settings = {
@@ -1347,6 +1353,39 @@ async function run(): Promise<void> {
         failedReplacement.baseContent.get('/figure.pdf'),
         oldBinaryContent
     );
+    assert.equal(failedReplacement.fileTreeByPath.get('/figure.pdf').id, oldBinary.id,
+        'a failed replacement must restore the original in-memory path');
+
+    const uncertainReplacement = Object.create(SyncEngine.prototype) as any;
+    uncertainReplacement.settings = {
+        getSettings: () => ({ projectId: 'project' }),
+    };
+    uncertainReplacement.api = {
+        renameEntity: async () => ({ type: 'success' }),
+        uploadFile: async () => ({ type: 'success' }),
+    };
+    uncertainReplacement.fileTree = new Map([[oldBinary.id, { ...oldBinary }]]);
+    uncertainReplacement.fileTreeByPath = new Map([
+        [oldBinary.path, uncertainReplacement.fileTree.get(oldBinary.id)],
+    ]);
+    uncertainReplacement.baseContent = new Map([[oldBinary.path, oldBinaryContent]]);
+    uncertainReplacement.fileCache = new Map();
+    uncertainReplacement.suppressedRemoteRenames = new Map();
+    uncertainReplacement.refreshProjectFileTree = async () => undefined;
+    let uncertainDeleteCount = 0;
+    uncertainReplacement.deleteRemoteEntry = async () => { uncertainDeleteCount++; };
+    await assert.rejects(
+        () => uncertainReplacement.replaceRemoteFile(
+            uncertainReplacement.fileTree.get(oldBinary.id),
+            Uint8Array.from([9, 8, 7]),
+        ),
+        /replacement identity could not be verified.*backup was kept/,
+        'an untracked successful upload must keep the original rollback copy',
+    );
+    assert.equal(uncertainDeleteCount, 0,
+        'the original backup must not be deleted before the replacement is tracked');
+    assert.equal(uncertainReplacement.fileTree.has(oldBinary.id), true);
+    assert.equal(uncertainReplacement.fileTreeByPath.has('/figure.pdf'), false);
 
     const invalidUploadTracker = Object.create(SyncEngine.prototype) as any;
     invalidUploadTracker.fileTree = new Map();
@@ -1360,6 +1399,19 @@ async function run(): Promise<void> {
         ),
         /invalid uploaded entity type/,
         'file upload tracking must reject impossible server entity types',
+    );
+    invalidUploadTracker.fileTreeByPath.set('/occupied.pdf', {
+        id: 'occupied', type: 'file', name: 'occupied.pdf', path: '/occupied.pdf', parentId: 'folder',
+    });
+    assert.throws(
+        () => invalidUploadTracker.trackUploadedEntity(
+            { file: { _id: 'different', _type: 'file', name: 'occupied.pdf' } },
+            'folder',
+            'occupied.pdf',
+            '/occupied.pdf',
+        ),
+        /duplicate uploaded entity path/,
+        'upload responses must not overwrite a concurrently tracked entity',
     );
 
     const folderRebase = Object.create(SyncEngine.prototype) as any;
