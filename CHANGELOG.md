@@ -23,6 +23,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Prevented server-provided account fields from being interpreted as Markdown in status tooltips
 - Removed legacy synchronous child-process XHR and JSON `eval` fallbacks, rejected credential-preserving redirects, and bounded legacy XHR responses
 - Revalidated public project-link command arguments against the authenticated server and required explicit synchronization approval for every folder
+- Preserved unknown or legacy files under `.localleaf` when unlinking a workspace instead of deleting the metadata directory recursively
 
 ## [0.2.1] - 2026-08-23
 

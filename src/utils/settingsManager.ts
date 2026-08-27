@@ -279,12 +279,24 @@ export class SettingsManager {
      */
     async delete(): Promise<void> {
         try {
-            await assertSafeWorkspacePath(this.workspaceFolder, this.configDir);
-            await vscode.workspace.fs.delete(this.configDir, { recursive: true });
-            this.settings = undefined;
+            await assertSafeWorkspacePath(this.workspaceFolder, this.settingsFile);
+            await vscode.workspace.fs.delete(this.settingsFile, { recursive: false });
         } catch (error) {
             if (!isFileNotFoundError(error)) throw error;
-            this.settings = undefined;
+        }
+        this.settings = undefined;
+
+        // `.localleaf` may contain state created by an older release or files
+        // owned by the user. Unlinking removes only this extension's settings;
+        // clean up the directory itself only when it is now empty.
+        try {
+            await assertSafeWorkspacePath(this.workspaceFolder, this.configDir);
+            const remainingEntries = await vscode.workspace.fs.readDirectory(this.configDir);
+            if (remainingEntries.length === 0) {
+                await vscode.workspace.fs.delete(this.configDir, { recursive: false });
+            }
+        } catch (error) {
+            if (!isFileNotFoundError(error)) throw error;
         }
     }
 

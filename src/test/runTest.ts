@@ -2108,6 +2108,7 @@ async function run(): Promise<void> {
         SettingsManager: {
             clearCurrentWorkspaceFolder(): void;
             getInstance(uri: MockUri): {
+                delete(): Promise<void>;
                 getFilePath(relativePath: string): MockUri;
                 getRelativePath(uri: MockUri): string | undefined;
             };
@@ -2188,6 +2189,34 @@ async function run(): Promise<void> {
     assert.equal(pathManager.getRelativePath(mockFileUri('d:\\WORKSPACE')), '/');
     assert.equal(pathManager.getRelativePath(mockFileUri('D:\\workspace-evil\\file.tex')), undefined);
     assert.equal(pathManager.getRelativePath(mockFileUri('E:\\workspace\\file.tex')), undefined);
+
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.localleaf', { type: 2 }],
+        ['D:\\workspace\\.localleaf\\settings.json', { type: 1, content: linkedSettings }],
+        ['D:\\workspace\\.localleaf\\legacy-cache.json', { type: 1, content: '{}' }],
+    ]);
+    await pathManager.delete();
+    assert.deepStrictEqual(
+        mockFileDeletes.map(item => [mockUriKey(item.uri), item.recursive]),
+        [['D:\\workspace\\.localleaf\\settings.json', false]],
+        'unlinking must preserve unknown files under .localleaf',
+    );
+
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.localleaf', { type: 2 }],
+        ['D:\\workspace\\.localleaf\\settings.json', { type: 1, content: linkedSettings }],
+    ]);
+    await pathManager.delete();
+    assert.deepStrictEqual(
+        mockFileDeletes.map(item => [mockUriKey(item.uri), item.recursive]),
+        [
+            ['D:\\workspace\\.localleaf\\settings.json', false],
+            ['D:\\workspace\\.localleaf', false],
+        ],
+        'unlinking may remove an empty metadata directory without recursive deletion',
+    );
 
     resetMockWorkspace([workspaceRoot], [
         ['D:\\workspace', { type: 2 }],
