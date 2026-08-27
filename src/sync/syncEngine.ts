@@ -554,6 +554,57 @@ export class SyncEngine {
         return true;
     }
 
+    private getOpenTextDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
+        const target = uri.toString();
+        return vscode.workspace.textDocuments.find(document => document.uri.toString() === target);
+    }
+
+    private getOpenDocumentContent(document: vscode.TextDocument): Uint8Array {
+        return new TextEncoder().encode(document.getText());
+    }
+
+    /**
+     * Replace a dirty editor through the VS Code edit API so the user's previous
+     * buffer remains recoverable with Undo. The expected version prevents a
+     * response to an older conflict prompt from overwriting newer typing.
+     */
+    private async applyRemoteContentToOpenDocument(
+        document: vscode.TextDocument,
+        expectedVersion: number,
+        content: Uint8Array,
+    ): Promise<'applied' | 'unchanged' | 'stale' | 'failed'> {
+        if (document.version !== expectedVersion) return 'stale';
+
+        const currentText = document.getText();
+        const nextText = new TextDecoder().decode(content);
+        if (currentText === nextText) return 'unchanged';
+
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(
+            document.uri,
+            new vscode.Range(document.positionAt(0), document.positionAt(currentText.length)),
+            nextText,
+        );
+
+        if (!(await vscode.workspace.applyEdit(edit))) return 'failed';
+        return document.getText() === nextText ? 'applied' : 'stale';
+    }
+
+    private keepLocalDocumentAfterRemoteUpdate(
+        path: string,
+        remoteContent: Uint8Array,
+        diskContent: Uint8Array | undefined,
+        message: string,
+    ): void {
+        // The server base must still advance so the next OT operation is applied
+        // to the correct revision. Keep the cache tied to disk so a later save of
+        // the dirty buffer is observed and pushed instead of being mistaken for an echo.
+        this.baseContent.set(path, remoteContent);
+        this.fileCache.set(path, hashContent(diskContent));
+        this.log(message);
+        this.setStatus('idle', message, path);
+    }
+
     /**
      * Acquire sync lock for a path
      */
@@ -1621,12 +1672,18 @@ export class SyncEngine {
             // Get current local content
             const localUri = this.settings.getFilePath(entry.path);
             await this.assertNoSymbolicLinks(localUri);
-            let localBytes: Uint8Array | undefined;
+            let diskBytes: Uint8Array | undefined;
             try {
-                localBytes = await vscode.workspace.fs.readFile(localUri);
+                diskBytes = await vscode.workspace.fs.readFile(localUri);
             } catch {
-                localBytes = undefined;
+                diskBytes = undefined;
             }
+
+            const openDocument = this.getOpenTextDocument(localUri);
+            const openDocumentVersion = openDocument?.version;
+            const localBytes = openDocument?.isDirty
+                ? this.getOpenDocumentContent(openDocument)
+                : diskBytes;
 
             const baseBytes = this.baseContent.get(entry.path);
             let contentBytes: Uint8Array | undefined;
@@ -1680,24 +1737,41 @@ export class SyncEngine {
             }
 
             const hasUnsynchronizedLocalChanges = localBytes !== undefined
-                && baseBytes !== undefined
-                && !contentEquals(localBytes, baseBytes);
+                && (baseBytes === undefined
+                    ? Boolean(openDocument?.isDirty)
+                    : !contentEquals(localBytes, baseBytes));
             if (hasUnsynchronizedLocalChanges) {
                 const resolution = await this.askConflictResolution(entry.path, localUri, contentBytes);
                 this.throwIfDisposed();
                 if (resolution === 'skip') {
-                    this.baseContent.set(entry.path, contentBytes);
-                    this.fileCache.set(entry.path, hashContent(localBytes));
-                    this.setStatus('idle', `Skipped conflicting remote update for ${entry.path}`, entry.path);
+                    this.keepLocalDocumentAfterRemoteUpdate(
+                        entry.path,
+                        contentBytes,
+                        diskBytes,
+                        `Kept local edits; Overleaf update was not applied to ${entry.path}`,
+                    );
                     return;
                 }
                 if (resolution === 'useLocal') {
                     if (!this.socket) {
                         throw new Error(`Cannot update ${entry.path}: real-time connection is unavailable`);
                     }
-                    await this.pushDocumentChanges(entry.id, entry.path, localBytes!);
-                    this.baseContent.set(entry.path, localBytes!);
-                    this.fileCache.set(entry.path, hashContent(localBytes));
+
+                    const latestOpenDocument = this.getOpenTextDocument(localUri);
+                    let latestLocalBytes = latestOpenDocument?.isDirty
+                        ? this.getOpenDocumentContent(latestOpenDocument)
+                        : undefined;
+                    if (!latestLocalBytes) {
+                        try {
+                            latestLocalBytes = await vscode.workspace.fs.readFile(localUri);
+                        } catch {
+                            latestLocalBytes = localBytes;
+                        }
+                    }
+
+                    await this.pushDocumentChanges(entry.id, entry.path, latestLocalBytes!);
+                    this.baseContent.set(entry.path, latestLocalBytes!);
+                    this.fileCache.set(entry.path, hashContent(latestLocalBytes));
                     this.setStatus('idle');
                     return;
                 }
@@ -1707,7 +1781,59 @@ export class SyncEngine {
             if (!contentEquals(localBytes, contentBytes)) {
                 this.setStatus('pulling', `Updating ${entry.path}`, entry.path);
                 this.throwIfDisposed();
-                await vscode.workspace.fs.writeFile(localUri, contentBytes);
+
+                const currentOpenDocument = this.getOpenTextDocument(localUri);
+                if (currentOpenDocument) {
+                    if (
+                        openDocumentVersion === undefined
+                        || currentOpenDocument.version !== openDocumentVersion
+                    ) {
+                        this.keepLocalDocumentAfterRemoteUpdate(
+                            entry.path,
+                            contentBytes,
+                            diskBytes,
+                            `Kept newer editor changes; retry synchronization for ${entry.path}`,
+                        );
+                        return;
+                    }
+
+                    if (currentOpenDocument.isDirty) {
+                        const result = await this.applyRemoteContentToOpenDocument(
+                            currentOpenDocument,
+                            openDocumentVersion,
+                            contentBytes,
+                        );
+                        this.throwIfDisposed();
+                        if (result === 'stale' || result === 'failed') {
+                            this.keepLocalDocumentAfterRemoteUpdate(
+                                entry.path,
+                                contentBytes,
+                                diskBytes,
+                                `Kept newer editor changes; retry synchronization for ${entry.path}`,
+                            );
+                            return;
+                        }
+                    } else {
+                        await vscode.workspace.fs.writeFile(localUri, contentBytes);
+                    }
+                } else {
+                    let latestDiskBytes: Uint8Array | undefined;
+                    try {
+                        latestDiskBytes = await vscode.workspace.fs.readFile(localUri);
+                    } catch {
+                        latestDiskBytes = undefined;
+                    }
+                    if (!contentEquals(latestDiskBytes, diskBytes)) {
+                        this.keepLocalDocumentAfterRemoteUpdate(
+                            entry.path,
+                            contentBytes,
+                            latestDiskBytes,
+                            `Kept newer local changes; retry synchronization for ${entry.path}`,
+                        );
+                        return;
+                    }
+                    await vscode.workspace.fs.writeFile(localUri, contentBytes);
+                }
                 this.log(`Remote update: ${entry.path}`);
             }
 

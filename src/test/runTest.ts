@@ -141,8 +141,41 @@ interface MockFileEntry {
     content?: string;
 }
 
+interface MockTextDocument {
+    uri: MockUri;
+    isDirty: boolean;
+    version: number;
+    getText(): string;
+    positionAt(offset: number): { offset: number };
+    applyText(text: string): void;
+}
+
+interface MockWorkspaceReplacement {
+    uri: MockUri;
+    text: string;
+}
+
+class MockRange {
+    constructor(
+        readonly start: { offset: number },
+        readonly end: { offset: number },
+    ) {}
+}
+
+class MockWorkspaceEdit {
+    readonly replacements: MockWorkspaceReplacement[] = [];
+
+    replace(uri: MockUri, _range: MockRange, text: string): void {
+        this.replacements.push({ uri, text });
+    }
+}
+
 let mockWorkspaceFolders: Array<{ uri: MockUri }> | undefined;
 let mockFileEntries = new Map<string, MockFileEntry>();
+let mockTextDocuments: MockTextDocument[] = [];
+let mockAppliedWorkspaceEdits: MockWorkspaceEdit[] = [];
+let mockFileWrites: Array<{ uri: MockUri | string; content: Uint8Array }> = [];
+let mockApplyEditResult = true;
 
 function mockFileUri(fsPath: string): MockUri {
     const normalizedFsPath = path.win32.normalize(fsPath);
@@ -160,6 +193,22 @@ function mockUriKey(uri: MockUri | string): string {
     return path.win32.normalize(typeof uri === 'string' ? uri : uri.fsPath);
 }
 
+function createMockTextDocument(uri: MockUri, initialText: string, isDirty: boolean = true): MockTextDocument {
+    let text = initialText;
+    const document: MockTextDocument = {
+        uri,
+        isDirty,
+        version: 1,
+        getText: () => text,
+        positionAt: offset => ({ offset }),
+        applyText: nextText => {
+            text = nextText;
+            document.version++;
+        },
+    };
+    return document;
+}
+
 function resetMockWorkspace(
     folders?: MockUri[],
     entries: Array<[string, MockFileEntry]> = [],
@@ -169,6 +218,10 @@ function resetMockWorkspace(
         path.win32.normalize(entryPath),
         entry,
     ]));
+    mockTextDocuments = [];
+    mockAppliedWorkspaceEdits = [];
+    mockFileWrites = [];
+    mockApplyEditResult = true;
 }
 
 const mockWorkspaceFs = {
@@ -195,7 +248,9 @@ const mockWorkspaceFs = {
         return children;
     },
     async createDirectory(): Promise<void> {},
-    async writeFile(): Promise<void> {},
+    async writeFile(uri: MockUri | string, content: Uint8Array): Promise<void> {
+        mockFileWrites.push({ uri, content });
+    },
     async delete(): Promise<void> {},
 };
 
@@ -229,12 +284,26 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
                     toString: () => `${components.scheme}:${components.path}`,
                 }),
             },
+            Range: MockRange,
+            WorkspaceEdit: MockWorkspaceEdit,
             commands: {
                 executeCommand: (...args: unknown[]) => executeCommandImpl(...args),
             },
             workspace: {
                 get workspaceFolders() { return mockWorkspaceFolders; },
+                get textDocuments() { return mockTextDocuments; },
                 fs: mockWorkspaceFs,
+                applyEdit: async (edit: MockWorkspaceEdit) => {
+                    mockAppliedWorkspaceEdits.push(edit);
+                    if (!mockApplyEditResult) return false;
+                    for (const replacement of edit.replacements) {
+                        const document = mockTextDocuments.find(candidate =>
+                            candidate.uri.toString() === replacement.uri.toString()
+                        );
+                        document?.applyText(replacement.text);
+                    }
+                    return true;
+                },
             },
         };
     }
@@ -794,6 +863,109 @@ async function run(): Promise<void> {
         'server!',
         'remote operations must be applied to the known server base, not an unsaved local edit',
     );
+
+    const createDirtyRemoteOt = (
+        resolveConflict: (document: MockTextDocument) => Promise<'useRemote' | 'useLocal' | 'skip'>,
+    ) => {
+        const uri = mockFileUri('D:\\dirty-ot-workspace\\chapter.tex');
+        resetMockWorkspace([mockFileUri('D:\\dirty-ot-workspace')], [
+            ['D:\\dirty-ot-workspace', { type: 2 }],
+            ['D:\\dirty-ot-workspace\\chapter.tex', { type: 1, content: 'server' }],
+        ]);
+        const document = createMockTextDocument(uri, 'local edit');
+        mockTextDocuments = [document];
+
+        const engine = Object.create(SyncEngine.prototype) as any;
+        engine.disposed = false;
+        engine.socket = { publicId: 'this-client' };
+        engine.suppressedRemoteDocumentUpdates = new Map();
+        engine.fileTree = new Map([[
+            'doc',
+            { id: 'doc', type: 'doc', name: 'chapter.tex', path: '/chapter.tex' },
+        ]]);
+        engine.baseContent = new Map([[
+            '/chapter.tex',
+            new TextEncoder().encode('server'),
+        ]]);
+        engine.fileCache = new Map();
+        engine.settings = {
+            getFilePath: () => uri,
+            getSettings: () => ({ projectId: 'project' }),
+        };
+        engine.api = {};
+        engine.shouldSync = () => true;
+        engine.acquireLockWhenAvailable = async () => true;
+        engine.releaseLock = () => undefined;
+        engine.assertNoSymbolicLinks = async () => undefined;
+        engine.askConflictResolution = async () => resolveConflict(document);
+        engine.setStatus = () => undefined;
+
+        return { engine, document };
+    };
+    const remoteEdit = {
+        doc: 'doc',
+        v: 2,
+        op: [{ p: 6, i: '!' }],
+        meta: { source: 'other-client', ts: Date.now(), user_id: 'other' },
+    };
+
+    let conflictPrompts = 0;
+    const skippedDirtyRemote = createDirtyRemoteOt(async () => {
+        conflictPrompts++;
+        return 'skip';
+    });
+    await skippedDirtyRemote.engine.handleRemoteFileChanged(remoteEdit);
+    assert.equal(conflictPrompts, 1, 'a dirty editor must be treated as local content, not as its stale disk file');
+    assert.equal(skippedDirtyRemote.document.getText(), 'local edit');
+    assert.equal(mockAppliedWorkspaceEdits.length, 0);
+    assert.equal(mockFileWrites.length, 0, 'skipping a dirty conflict must not overwrite the editor or disk');
+    assert.equal(
+        new TextDecoder().decode(skippedDirtyRemote.engine.baseContent.get('/chapter.tex')),
+        'server!',
+        'the server base must advance even while dirty local edits are retained',
+    );
+    assert.equal(
+        skippedDirtyRemote.engine.shouldPropagate('/chapter.tex', new TextEncoder().encode('server')),
+        false,
+        'the cache must continue to represent disk after retaining a dirty editor',
+    );
+    assert.equal(
+        skippedDirtyRemote.engine.shouldPropagate('/chapter.tex', new TextEncoder().encode('local edit')),
+        true,
+        'saving retained dirty edits must still trigger a push',
+    );
+
+    const keptDirtyRemote = createDirtyRemoteOt(async () => 'useLocal');
+    let pushedDirtyContent: string | undefined;
+    keptDirtyRemote.engine.pushDocumentChanges = async (
+        _docId: string,
+        _path: string,
+        content: Uint8Array,
+    ) => {
+        pushedDirtyContent = new TextDecoder().decode(content);
+        return true;
+    };
+    await keptDirtyRemote.engine.handleRemoteFileChanged(remoteEdit);
+    assert.equal(pushedDirtyContent, 'local edit', 'Keep Local must push the in-memory editor, not stale disk');
+    assert.equal(mockAppliedWorkspaceEdits.length, 0);
+    assert.equal(mockFileWrites.length, 0);
+
+    const acceptedDirtyRemote = createDirtyRemoteOt(async () => 'useRemote');
+    await acceptedDirtyRemote.engine.handleRemoteFileChanged(remoteEdit);
+    assert.equal(mockAppliedWorkspaceEdits.length, 1, 'Use Remote must be one reversible workspace edit');
+    assert.deepStrictEqual(mockAppliedWorkspaceEdits[0].replacements.map(edit => edit.text), ['server!']);
+    assert.equal(acceptedDirtyRemote.document.getText(), 'server!');
+    assert.equal(mockFileWrites.length, 0, 'a dirty editor must not be replaced behind VS Code through the filesystem');
+
+    const changedDuringPrompt = createDirtyRemoteOt(async document => {
+        document.applyText('newer typing');
+        return 'useRemote';
+    });
+    await changedDuringPrompt.engine.handleRemoteFileChanged(remoteEdit);
+    assert.equal(changedDuringPrompt.document.getText(), 'newer typing');
+    assert.equal(mockAppliedWorkspaceEdits.length, 0,
+        'typing that occurs while the conflict prompt is open must never be overwritten');
+    assert.equal(mockFileWrites.length, 0);
 
     const protectedPaths = Object.create(SyncEngine.prototype) as any;
     protectedPaths.ignoreParser = { shouldIgnore: () => false };
