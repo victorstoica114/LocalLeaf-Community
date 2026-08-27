@@ -1977,6 +1977,33 @@ async function run(): Promise<void> {
     assert.equal(protectedPaths.shouldSync('/.localleaf/settings.json'), false);
     assert.equal(protectedPaths.shouldSync('/chapter.tex'), true);
 
+    const protectedPull = Object.create(SyncEngine.prototype) as any;
+    protectedPull.disposed = false;
+    protectedPull.project = { name: 'Protected project', rootFolder: [] };
+    const protectedRoot = { id: 'root', type: 'folder', path: '/' };
+    const protectedFolder = { id: 'git', type: 'folder', path: '/.git/' };
+    protectedPull.fileTree = new Map([
+        [protectedRoot.id, protectedRoot],
+        [protectedFolder.id, protectedFolder],
+    ]);
+    protectedPull.fileTreeByPath = new Map([
+        [protectedRoot.path, protectedRoot],
+        [protectedFolder.path, protectedFolder],
+    ]);
+    protectedPull.baseContent = new Map();
+    protectedPull.baseHashes = new Map();
+    protectedPull.fileCache = new Map();
+    protectedPull.shouldSync = (projectPath: string) => projectPath === '/';
+    protectedPull.assertNoSymbolicLinks = async () => {
+        throw new Error('ignored remote folders must not reach the local filesystem');
+    };
+    protectedPull.findLocalOnlyFiles = async () => [];
+    protectedPull.settings = { updateLastSynced: async () => undefined };
+    protectedPull.setStatus = () => undefined;
+    await protectedPull.pullAll();
+    assert.equal(protectedPull.baseContent.has('/.git/'), false,
+        'a full pull must not materialize or track protected remote folders');
+
     const cancellableLock = Object.create(SyncEngine.prototype) as any;
     cancellableLock.disposed = false;
     cancellableLock.syncLock = new Set(['/busy.tex']);

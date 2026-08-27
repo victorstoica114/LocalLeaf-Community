@@ -2840,21 +2840,22 @@ export class SyncEngine {
                 this.throwIfDisposed();
                 debugLog('pullAll: Processing', entry.path, entry.type);
 
-                if (entry.type === 'folder') {
-                    if (entry.path === '/') {
-                        this.setBaseContent('/', SYNCHRONIZED_CONTENT_MARKER);
-                        return;
-                    }
-                    const localUri = this.settings.getFilePath(entry.path);
-                    await this.assertNoSymbolicLinks(localUri);
-                    await vscode.workspace.fs.createDirectory(localUri);
-                    // Track folders in baseContent with empty content
-                    this.setBaseContent(entry.path, SYNCHRONIZED_CONTENT_MARKER);
+                if (entry.path === '/') {
+                    this.setBaseContent('/', SYNCHRONIZED_CONTENT_MARKER);
                     return;
                 }
 
                 if (!this.shouldSync(entry.path)) {
                     debugLog('pullAll: Ignored', entry.path);
+                    return;
+                }
+
+                if (entry.type === 'folder') {
+                    const localUri = this.settings.getFilePath(entry.path);
+                    await this.assertNoSymbolicLinks(localUri);
+                    await vscode.workspace.fs.createDirectory(localUri);
+                    // Track folders in baseContent with empty content
+                    this.setBaseContent(entry.path, SYNCHRONIZED_CONTENT_MARKER);
                     return;
                 }
 
