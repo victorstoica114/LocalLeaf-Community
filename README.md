@@ -24,9 +24,11 @@ The idea is deliberately simple: write with the local tools you already like, an
 - Remove old ignored artifacts from the remote project after confirmation
 - Work alongside LaTeX Workshop for local compilation and PDF preview
 
-## Releases
+## Installation
 
-Download the latest `.vsix` from [GitHub Releases](https://github.com/victorstoica114/LocalLeaf-Community/releases/latest), then install it with **Extensions: Install from VSIX...** in VS Code.
+Install [LocalLeaf Community from the Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=victorstoica114.localleaf-community), or search for `LocalLeaf Community` in the VS Code Extensions view.
+
+For a manual or offline installation, download the latest `.vsix` from [GitHub Releases](https://github.com/victorstoica114/LocalLeaf-Community/releases/latest), then run **Extensions: Install from VSIX...** in VS Code.
 
 To build the extension yourself:
 
