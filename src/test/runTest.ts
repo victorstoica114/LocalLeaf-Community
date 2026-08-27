@@ -2,6 +2,8 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
+import * as vm from 'vm';
+import * as esbuild from 'esbuild';
 import { removeStandaloneLatexComments } from '../utils/latexComments';
 import {
     approveSyncTarget,
@@ -42,6 +44,64 @@ function readLockedPackageVersions(packageName: string): string[] {
     assert.ok(versions.length > 0, `${packageName} must be present in package-lock.json`);
     assert.ok(versions.every(version => typeof version === 'string'));
     return [...new Set(versions as string[])].sort();
+}
+
+function verifyBundledLegacySocketClient(): void {
+    const workspaceRoot = path.join(__dirname, '..', '..');
+    const result = esbuild.buildSync({
+        stdin: {
+            contents: 'module.exports = require("socket.io-client");',
+            resolveDir: workspaceRoot,
+            sourcefile: 'socket-io-bundle-smoke.js',
+            loader: 'js',
+        },
+        bundle: true,
+        format: 'cjs',
+        platform: 'node',
+        target: 'node18',
+        write: false,
+        logLevel: 'silent',
+    });
+    const output = result.outputFiles?.[0];
+    assert.ok(output, 'esbuild must return the bundled Socket.IO smoke-test output');
+
+    const filename = path.join(workspaceRoot, '.socket-io-bundle-smoke.cjs');
+    const bundledModule: { exports: unknown } = { exports: {} };
+    const executeBundle = vm.runInThisContext(
+        `(function (module, exports, require, __filename, __dirname) {${output.text}\n})`,
+        { filename },
+    ) as (
+        targetModule: { exports: unknown },
+        exports: unknown,
+        requireFn: NodeRequire,
+        moduleFilename: string,
+        moduleDirectory: string,
+    ) => void;
+    const runtimeRequire = ((request: string) => {
+        assert.ok(
+            !request.startsWith('.'),
+            `the production bundle must not retain a relative runtime require: ${request}`,
+        );
+        return require(request);
+    }) as NodeRequire;
+    executeBundle(
+        bundledModule,
+        bundledModule.exports,
+        runtimeRequire,
+        filename,
+        path.dirname(filename),
+    );
+
+    const socketClient = bundledModule.exports as {
+        version?: string;
+        connect?: unknown;
+    };
+    assert.equal(socketClient.version, '0.9.17-overleaf-5');
+    assert.equal(
+        typeof socketClient.connect,
+        'function',
+        'the legacy Socket.IO client must initialize after production bundling',
+    );
 }
 
 async function verifyWebSocketCompatibility(): Promise<void> {
@@ -3040,6 +3100,7 @@ async function run(): Promise<void> {
         /node-xmlhttprequest-(?:content|sync)/,
         'the production bundle must not contain legacy XHR temporary-file helpers',
     );
+    verifyBundledLegacySocketClient();
     const bundle = require(bundlePath) as { activate?: unknown; deactivate?: unknown };
     assert.equal(typeof bundle.activate, 'function', 'the bundle must export activate');
     assert.equal(typeof bundle.deactivate, 'function', 'the bundle must export deactivate');

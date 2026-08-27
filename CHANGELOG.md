@@ -46,6 +46,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Capped concurrent Socket.IO events awaiting acknowledgements and closed connections that exceed the limit
 - Required a verified remote entity identity before treating new binary uploads as synchronized
 - Closed server-forced socket sessions immediately and bounded live-watch failure diagnostics
+- Made the legacy Socket.IO client independent of CommonJS parent-module state so the bundled production extension can establish real-time connections
 
 [0.2.2]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.1...v0.2.2
 

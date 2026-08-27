@@ -111,3 +111,133 @@ index 0dfa483..eab07d3 100644
  
      this.websocket.onopen = function () {
        self.onOpen();
+diff --git a/node_modules/socket.io-client/lib/events.js b/node_modules/socket.io-client/lib/events.js
+--- a/node_modules/socket.io-client/lib/events.js
++++ b/node_modules/socket.io-client/lib/events.js
+@@ -178,5 +178,5 @@
+ 
+ })(
+     'undefined' != typeof io ? io : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('./io')
+ );
+diff --git a/node_modules/socket.io-client/lib/io.js b/node_modules/socket.io-client/lib/io.js
+--- a/node_modules/socket.io-client/lib/io.js
++++ b/node_modules/socket.io-client/lib/io.js
+@@ -126,9 +126,8 @@
+ 
+     io.Transport.XHR = require('./transports/xhr').XHR;
+ 
+-    io.transports.forEach(function (t) {
+-      io.Transport[t] = require('./transports/' + t)[t];
+-    });
++    io.Transport.websocket = require('./transports/websocket').websocket;
++    io.Transport['xhr-polling'] = require('./transports/xhr-polling')['xhr-polling'];
+ 
+     /**
+      * Expose Socket
+diff --git a/node_modules/socket.io-client/lib/namespace.js b/node_modules/socket.io-client/lib/namespace.js
+--- a/node_modules/socket.io-client/lib/namespace.js
++++ b/node_modules/socket.io-client/lib/namespace.js
+@@ -238,5 +238,5 @@
+ 
+ })(
+     'undefined' != typeof io ? io : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('./io')
+ );
+diff --git a/node_modules/socket.io-client/lib/parser.js b/node_modules/socket.io-client/lib/parser.js
+--- a/node_modules/socket.io-client/lib/parser.js
++++ b/node_modules/socket.io-client/lib/parser.js
+@@ -258,5 +258,5 @@
+ 
+ })(
+     'undefined' != typeof io ? io : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('./io')
+ );
+diff --git a/node_modules/socket.io-client/lib/socket.js b/node_modules/socket.io-client/lib/socket.js
+--- a/node_modules/socket.io-client/lib/socket.js
++++ b/node_modules/socket.io-client/lib/socket.js
+@@ -576,6 +576,6 @@
+ 
+ })(
+     'undefined' != typeof io ? io : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('./io')
+   , this
+ );
+diff --git a/node_modules/socket.io-client/lib/transport.js b/node_modules/socket.io-client/lib/transport.js
+--- a/node_modules/socket.io-client/lib/transport.js
++++ b/node_modules/socket.io-client/lib/transport.js
+@@ -252,5 +252,5 @@
+   };
+ })(
+     'undefined' != typeof io ? io : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('./io')
+ );
+diff --git a/node_modules/socket.io-client/lib/transports/flashsocket.js b/node_modules/socket.io-client/lib/transports/flashsocket.js
+--- a/node_modules/socket.io-client/lib/transports/flashsocket.js
++++ b/node_modules/socket.io-client/lib/transports/flashsocket.js
+@@ -187,5 +187,5 @@
+   io.transports.push('flashsocket');
+ })(
+     'undefined' != typeof io ? io.Transport : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('../io')
+ );
+diff --git a/node_modules/socket.io-client/lib/transports/htmlfile.js b/node_modules/socket.io-client/lib/transports/htmlfile.js
+--- a/node_modules/socket.io-client/lib/transports/htmlfile.js
++++ b/node_modules/socket.io-client/lib/transports/htmlfile.js
+@@ -169,5 +169,5 @@
+ 
+ })(
+     'undefined' != typeof io ? io.Transport : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('../io')
+ );
+diff --git a/node_modules/socket.io-client/lib/transports/jsonp-polling.js b/node_modules/socket.io-client/lib/transports/jsonp-polling.js
+--- a/node_modules/socket.io-client/lib/transports/jsonp-polling.js
++++ b/node_modules/socket.io-client/lib/transports/jsonp-polling.js
+@@ -251,6 +251,6 @@
+ 
+ })(
+     'undefined' != typeof io ? io.Transport : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('../io')
+   , this
+ );
+diff --git a/node_modules/socket.io-client/lib/transports/websocket.js b/node_modules/socket.io-client/lib/transports/websocket.js
+--- a/node_modules/socket.io-client/lib/transports/websocket.js
++++ b/node_modules/socket.io-client/lib/transports/websocket.js
+@@ -192,6 +192,6 @@
+ 
+ })(
+     'undefined' != typeof io ? io.Transport : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('../io')
+   , this
+ );
+diff --git a/node_modules/socket.io-client/lib/transports/xhr-polling.js b/node_modules/socket.io-client/lib/transports/xhr-polling.js
+--- a/node_modules/socket.io-client/lib/transports/xhr-polling.js
++++ b/node_modules/socket.io-client/lib/transports/xhr-polling.js
+@@ -172,6 +172,6 @@
+ 
+ })(
+     'undefined' != typeof io ? io.Transport : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('../io')
+   , this
+ );
+diff --git a/node_modules/socket.io-client/lib/transports/xhr.js b/node_modules/socket.io-client/lib/transports/xhr.js
+--- a/node_modules/socket.io-client/lib/transports/xhr.js
++++ b/node_modules/socket.io-client/lib/transports/xhr.js
+@@ -212,6 +212,6 @@
+ 
+ })(
+     'undefined' != typeof io ? io.Transport : module.exports
+-  , 'undefined' != typeof io ? io : module.parent.exports
++  , 'undefined' != typeof io ? io : require('../io')
+   , this
+ );

@@ -28,6 +28,7 @@ npm-debug.log*
 # Local integration planning
 LOCAL_GUI_INTEGRATION_CHECKLIST.md
 local-pr3-artifacts/
+/.tmp-*/
 
 # Test workspace
 test-workspace/
