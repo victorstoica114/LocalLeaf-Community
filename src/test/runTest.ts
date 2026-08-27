@@ -966,6 +966,30 @@ async function run(): Promise<void> {
     assert.strictEqual(propagation.baseContent.get('/chapter.tex'), documentBaseline,
         'OT documents must retain their exact server baseline');
 
+    const boundedBaselines = Object.create(SyncEngine.prototype) as any;
+    boundedBaselines.baseContent = new Map();
+    boundedBaselines.baseHashes = new Map();
+    boundedBaselines.fileCache = new Map();
+    boundedBaselines.retainedDocumentBytes = 0;
+    boundedBaselines.maxRetainedDocumentBytes = 7;
+    const evictedServerBaseline = new TextEncoder().encode('server');
+    const retainedServerBaseline = new TextEncoder().encode('other!');
+    boundedBaselines.recordSynchronizedContent(
+        { type: 'doc', path: '/evicted.tex' },
+        evictedServerBaseline,
+    );
+    boundedBaselines.recordSynchronizedContent(
+        { type: 'doc', path: '/retained.tex' },
+        retainedServerBaseline,
+    );
+    const evictedDocumentMarker = boundedBaselines.baseContent.get('/evicted.tex');
+    assert.equal(evictedDocumentMarker.byteLength, 0,
+        'the oldest OT baseline must be evicted when the aggregate memory budget is exceeded');
+    assert.strictEqual(boundedBaselines.baseContent.get('/retained.tex'), retainedServerBaseline);
+    assert.equal(boundedBaselines.retainedDocumentBytes, retainedServerBaseline.byteLength);
+    assert.equal(typeof boundedBaselines.baseHashes.get('/evicted.tex'), 'string',
+        'evicted content must retain its server hash for safe conflict detection');
+
     assert.deepEqual(
         propagation.calculateOps('hello world', 'hello brave world'),
         [{ p: 6, i: 'brave ' }],
@@ -1361,6 +1385,56 @@ async function run(): Promise<void> {
         'server!',
         'remote operations must be applied to the known server base, not an unsaved local edit',
     );
+
+    const evictedOtUri = mockFileUri('D:\\evicted-ot-workspace\\chapter.tex');
+    resetMockWorkspace([mockFileUri('D:\\evicted-ot-workspace')], [
+        ['D:\\evicted-ot-workspace', { type: 2 }],
+        ['D:\\evicted-ot-workspace\\chapter.tex', { type: 1, content: 'server' }],
+    ]);
+    const evictedOt = Object.create(SyncEngine.prototype) as any;
+    evictedOt.disposed = false;
+    evictedOt.socket = { publicId: 'this-client' };
+    evictedOt.suppressedRemoteDocumentUpdates = new Map();
+    evictedOt.fileTree = new Map([[
+        'doc',
+        { id: 'doc', type: 'doc', name: 'chapter.tex', path: '/chapter.tex' },
+    ]]);
+    evictedOt.baseContent = new Map([['/chapter.tex', evictedDocumentMarker]]);
+    evictedOt.baseHashes = new Map([[
+        '/chapter.tex',
+        boundedBaselines.baseHashes.get('/evicted.tex'),
+    ]]);
+    evictedOt.fileCache = new Map();
+    evictedOt.settings = {
+        getFilePath: () => evictedOtUri,
+        getWorkspaceFolder: () => mockFileUri('D:\\evicted-ot-workspace'),
+        getSettings: () => ({ projectId: 'project' }),
+    };
+    let evictedRecoveryRequests = 0;
+    evictedOt.api = {
+        getDocContent: async () => {
+            evictedRecoveryRequests++;
+            return { type: 'success', lines: ['server!'] };
+        },
+    };
+    evictedOt.shouldSync = () => true;
+    evictedOt.acquireLockWhenAvailable = async () => true;
+    evictedOt.releaseLock = () => undefined;
+    evictedOt.assertNoSymbolicLinks = async () => undefined;
+    evictedOt.askConflictResolution = async () => {
+        throw new Error('an unchanged local baseline must not create a false conflict');
+    };
+    evictedOt.setStatus = () => undefined;
+    await evictedOt.handleRemoteFileChanged({
+        doc: 'doc',
+        v: 2,
+        op: [{ p: 6, i: '!' }],
+        meta: { source: 'other-client', ts: Date.now(), user_id: 'other' },
+    });
+    assert.equal(evictedRecoveryRequests, 1,
+        'an OT update with an evicted baseline must recover authoritative document content');
+    assert.equal(new TextDecoder().decode(mockFileWrites.at(-1)?.content), 'server!');
+    assert.equal(new TextDecoder().decode(evictedOt.baseContent.get('/chapter.tex')), 'server!');
 
     const createDirtyRemoteOt = (
         resolveConflict: (document: MockTextDocument) => Promise<'useRemote' | 'useLocal' | 'skip'>,

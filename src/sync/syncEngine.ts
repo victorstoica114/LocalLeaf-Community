@@ -29,7 +29,8 @@ const MAX_PENDING_REMOTE_EVENT_CHARACTERS = 20 * 1024 * 1024;
 const DEFAULT_REMOTE_EVENT_COST = 4096;
 const MAX_LOCAL_SCAN_ENTITIES = 100_000;
 const MAX_LOCAL_SCAN_DEPTH = 256;
-const SYNCHRONIZED_BINARY_MARKER = new Uint8Array(0);
+const MAX_RETAINED_DOCUMENT_BYTES = 64 * 1024 * 1024;
+const SYNCHRONIZED_CONTENT_MARKER = new Uint8Array(0);
 
 /**
  * Sync status
@@ -127,6 +128,9 @@ export class SyncEngine {
     private fileTreeByPath: Map<string, FileTreeEntry> = new Map();
     private fileCache: Map<string, string> = new Map();
     private baseContent: Map<string, Uint8Array> = new Map();
+    private baseHashes: Map<string, string> = new Map();
+    private retainedDocumentBytes = 0;
+    private readonly maxRetainedDocumentBytes = MAX_RETAINED_DOCUMENT_BYTES;
     private ignoreParser: IgnoreParser;
     private _status: SyncStatus = 'disconnected';
     private _onStatusChange = new vscode.EventEmitter<SyncStatusEvent>();
@@ -630,11 +634,76 @@ export class SyncEngine {
     }
 
     private recordSynchronizedContent(entry: FileTreeEntry, content: Uint8Array): void {
-        this.baseContent.set(
+        this.setBaseContent(
             entry.path,
-            entry.type === 'doc' ? content : SYNCHRONIZED_BINARY_MARKER,
+            entry.type === 'doc' ? content : SYNCHRONIZED_CONTENT_MARKER,
         );
         this.fileCache.set(entry.path, hashContent(content));
+    }
+
+    private ensureRetainedDocumentByteCount(): void {
+        if (Number.isSafeInteger(this.retainedDocumentBytes) && this.retainedDocumentBytes >= 0) return;
+        this.retainedDocumentBytes = [...this.baseContent.values()].reduce(
+            (total, value) => total + (
+                value === SYNCHRONIZED_CONTENT_MARKER ? 0 : value.byteLength
+            ),
+            0,
+        );
+    }
+
+    private getBaseHashes(): Map<string, string> {
+        if (!(this.baseHashes instanceof Map)) this.baseHashes = new Map();
+        return this.baseHashes;
+    }
+
+    private setBaseContent(path: string, content: Uint8Array): void {
+        this.ensureRetainedDocumentByteCount();
+        const previous = this.baseContent.get(path);
+        if (previous && previous !== SYNCHRONIZED_CONTENT_MARKER) {
+            this.retainedDocumentBytes -= previous.byteLength;
+        }
+        this.baseContent.delete(path);
+        this.baseContent.set(path, content);
+        if (content !== SYNCHRONIZED_CONTENT_MARKER) {
+            this.retainedDocumentBytes += content.byteLength;
+            this.getBaseHashes().set(path, hashContent(content));
+        } else {
+            this.getBaseHashes().delete(path);
+        }
+
+        const maximum = this.maxRetainedDocumentBytes ?? MAX_RETAINED_DOCUMENT_BYTES;
+        while (this.retainedDocumentBytes > maximum) {
+            let evicted = false;
+            for (const [candidatePath, candidateContent] of this.baseContent) {
+                if (
+                    candidatePath === path
+                    || candidateContent === SYNCHRONIZED_CONTENT_MARKER
+                    || candidateContent.byteLength === 0
+                ) continue;
+                this.baseContent.delete(candidatePath);
+                this.baseContent.set(candidatePath, SYNCHRONIZED_CONTENT_MARKER);
+                this.retainedDocumentBytes -= candidateContent.byteLength;
+                evicted = true;
+                break;
+            }
+            if (!evicted) break;
+        }
+    }
+
+    private deleteBaseContent(path: string): void {
+        this.ensureRetainedDocumentByteCount();
+        const previous = this.baseContent.get(path);
+        if (previous && previous !== SYNCHRONIZED_CONTENT_MARKER) {
+            this.retainedDocumentBytes -= previous.byteLength;
+        }
+        this.baseContent.delete(path);
+        this.getBaseHashes().delete(path);
+    }
+
+    private clearBaseContent(): void {
+        this.baseContent.clear();
+        this.getBaseHashes().clear();
+        this.retainedDocumentBytes = 0;
     }
 
     private getOpenTextDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
@@ -755,7 +824,7 @@ export class SyncEngine {
         // The server base must still advance so the next OT operation is applied
         // to the correct revision. Keep the cache tied to disk so a later save of
         // the dirty buffer is observed and pushed instead of being mistaken for an echo.
-        this.baseContent.set(path, remoteContent);
+        this.setBaseContent(path, remoteContent);
         this.fileCache.set(path, hashContent(diskContent));
         this.log(message);
         if (updateStatus) this.setStatus('idle', message, path);
@@ -893,6 +962,7 @@ export class SyncEngine {
             this.fileTreeByPath.set(update.newPath, update.entry);
         }
         this.rebaseTrackedPathMap(this.baseContent, oldPath, newPath);
+        this.rebaseTrackedPathMap(this.getBaseHashes(), oldPath, newPath);
         this.rebaseTrackedPathMap(this.fileCache, oldPath, newPath);
     }
 
@@ -906,7 +976,7 @@ export class SyncEngine {
             this.joinedDocs.delete(id);
         }
         for (const key of [...this.baseContent.keys()]) {
-            if (matches(key)) this.baseContent.delete(key);
+            if (matches(key)) this.deleteBaseContent(key);
         }
         for (const key of [...this.fileCache.keys()]) {
             if (matches(key)) this.fileCache.delete(key);
@@ -930,7 +1000,7 @@ export class SyncEngine {
         const matches = (candidate: string) => candidate === path
             || (path.endsWith('/') && candidate.startsWith(path));
         for (const key of [...this.baseContent.keys()]) {
-            if (matches(key)) this.baseContent.delete(key);
+            if (matches(key)) this.deleteBaseContent(key);
         }
         for (const key of [...this.fileCache.keys()]) {
             if (matches(key)) this.fileCache.delete(key);
@@ -995,7 +1065,7 @@ export class SyncEngine {
 
         if (entry.type === 'folder') {
             await vscode.workspace.fs.createDirectory(localUri);
-            this.baseContent.set(entry.path, new Uint8Array(0));
+            this.setBaseContent(entry.path, SYNCHRONIZED_CONTENT_MARKER);
             return 'downloaded';
         }
 
@@ -1322,7 +1392,7 @@ export class SyncEngine {
             this.fileTreeByPath.delete(entry.path);
         }
         if (!preserveLocal) {
-            this.baseContent.delete(entry.path);
+            this.deleteBaseContent(entry.path);
             this.fileCache.delete(entry.path);
         }
         if (entry.id === this.project?.rootDoc_id) {
@@ -1359,7 +1429,7 @@ export class SyncEngine {
         let renamedOriginal = false;
         let uploadedReplacement = false;
 
-        this.baseContent.set(entry.path, SYNCHRONIZED_BINARY_MARKER);
+        this.setBaseContent(entry.path, SYNCHRONIZED_CONTENT_MARKER);
         try {
             // Overleaf rejects duplicate names. Move the original aside first,
             // then keep it as a rollback copy until the replacement is tracked.
@@ -1400,9 +1470,9 @@ export class SyncEngine {
                         ? restoreError.message
                         : String(restoreError);
                     if (previousContent !== undefined) {
-                        this.baseContent.set(entry.path, previousContent);
+                        this.setBaseContent(entry.path, previousContent);
                     } else {
-                        this.baseContent.delete(entry.path);
+                        this.deleteBaseContent(entry.path);
                     }
                     throw new Error(
                         `${replacementMessage}; the original file remains on Overleaf under ` +
@@ -1413,9 +1483,9 @@ export class SyncEngine {
 
             if (!uploadedReplacement) {
                 if (previousContent !== undefined) {
-                    this.baseContent.set(entry.path, previousContent);
+                    this.setBaseContent(entry.path, previousContent);
                 } else {
-                    this.baseContent.delete(entry.path);
+                    this.deleteBaseContent(entry.path);
                 }
             }
             throw error;
@@ -1496,7 +1566,7 @@ export class SyncEngine {
                     if (this.fileTreeByPath.get(folderPath)?.type !== 'folder') {
                         throw new Error(`Create folder ${folderPath}: Overleaf returned no folder identity`);
                     }
-                    this.baseContent.set(folderPath, new Uint8Array(0));
+                    this.setBaseContent(folderPath, SYNCHRONIZED_CONTENT_MARKER);
                 });
 
                 this.log(`Created folder on Overleaf: ${folderPath}`);
@@ -1535,7 +1605,7 @@ export class SyncEngine {
                         if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
                             await this.refreshProjectFileTree();
                         }
-                        this.baseContent.set(relativePath, SYNCHRONIZED_BINARY_MARKER);
+                        this.setBaseContent(relativePath, SYNCHRONIZED_CONTENT_MARKER);
                         this.fileCache.set(relativePath, hashContent(content));
                     });
                 }
@@ -1934,12 +2004,15 @@ export class SyncEngine {
                 : diskBytes;
 
             const baseBytes = this.baseContent.get(entry.path);
+            const hasRetainedBase = baseBytes !== undefined
+                && baseBytes !== SYNCHRONIZED_CONTENT_MARKER;
+            const retainedBaseHash = this.getBaseHashes().get(entry.path);
             let contentBytes: Uint8Array | undefined;
 
             // Apply operations to the last known server state, never directly to
             // an unsynchronized local edit. If the state is unavailable or the
             // operation does not match it, recover from the authoritative copy.
-            if (baseBytes) {
+            if (hasRetainedBase) {
                 try {
                     let newContent = new TextDecoder().decode(baseBytes);
                     if (newContent.length > MAX_REMOTE_DOCUMENT_CHARACTERS) {
@@ -1988,9 +2061,11 @@ export class SyncEngine {
             }
 
             const hasUnsynchronizedLocalChanges = localBytes !== undefined
-                && (baseBytes === undefined
-                    ? Boolean(openDocument?.isDirty)
-                    : !contentEquals(localBytes, baseBytes));
+                && (hasRetainedBase
+                    ? !contentEquals(localBytes, baseBytes)
+                    : retainedBaseHash !== undefined
+                        ? hashContent(localBytes) !== retainedBaseHash
+                        : Boolean(openDocument?.isDirty));
             if (hasUnsynchronizedLocalChanges) {
                 const resolution = await this.askConflictResolution(entry.path, localUri, contentBytes);
                 this.throwIfDisposed();
@@ -2022,7 +2097,7 @@ export class SyncEngine {
                     }
 
                     await this.pushDocumentChanges(entry.id, entry.path, latestLocalBytes!);
-                    this.baseContent.set(entry.path, latestLocalBytes!);
+                    this.setBaseContent(entry.path, latestLocalBytes!);
                     this.fileCache.set(entry.path, hashContent(latestLocalBytes));
                     this.setStatus('idle');
                     return;
@@ -2090,7 +2165,7 @@ export class SyncEngine {
                 this.log(`Remote update: ${entry.path}`);
             }
 
-            this.baseContent.set(entry.path, contentBytes);
+            this.setBaseContent(entry.path, contentBytes);
             this.fileCache.set(entry.path, hashContent(contentBytes));
 
             this.setStatus('idle');
@@ -2318,7 +2393,7 @@ export class SyncEngine {
                     const localUri = this.settings.getFilePath(path);
                     await this.assertNoSymbolicLinks(localUri);
                     const outcome = await this.deleteLocalPath(path, localUri, false);
-                    this.baseContent.delete(path);
+                    this.deleteBaseContent(path);
                     this.fileCache.delete(path);
                     if (outcome === 'preserved') {
                         this.reportPreservedRemoteDeletion(path);
@@ -2343,7 +2418,7 @@ export class SyncEngine {
         } else {
             // Keep Locally - clear from baseContent so it's not tracked as synced
             for (const path of orphanedPaths) {
-                this.baseContent.delete(path);
+                this.deleteBaseContent(path);
                 debugLog(`Keeping local file, removed from sync tracking: ${path}`);
             }
         }
@@ -2452,7 +2527,7 @@ export class SyncEngine {
                     const canonicalFolder = existing || folderEntry;
                     this.fileTree.set(canonicalFolder.id, canonicalFolder);
                     this.fileTreeByPath.set(folderPath, canonicalFolder);
-                    this.baseContent.set(folderPath, new Uint8Array(0));
+                    this.setBaseContent(folderPath, SYNCHRONIZED_CONTENT_MARKER);
                     return canonicalFolder;
                 });
 
@@ -2507,7 +2582,7 @@ export class SyncEngine {
                 if (!this.trackUploadedEntity(result, parentId, name, relativePath)) {
                     await this.refreshProjectFileTree();
                 }
-                this.baseContent.set(relativePath, SYNCHRONIZED_BINARY_MARKER);
+                this.setBaseContent(relativePath, SYNCHRONIZED_CONTENT_MARKER);
                 this.fileCache.set(relativePath, hashContent(content));
             });
         }
@@ -2549,7 +2624,7 @@ export class SyncEngine {
 
             try {
                 await this.deleteRemoteEntry(entry, true);
-                this.baseContent.delete(path);
+                this.deleteBaseContent(path);
                 this.fileCache.delete(path);
                 this.log(`Deleted ignored file from Overleaf: ${path}`);
                 deleted++;
@@ -2660,14 +2735,14 @@ export class SyncEngine {
 
                 if (entry.type === 'folder') {
                     if (entry.path === '/') {
-                        this.baseContent.set('/', new Uint8Array(0));
+                        this.setBaseContent('/', SYNCHRONIZED_CONTENT_MARKER);
                         return;
                     }
                     const localUri = this.settings.getFilePath(entry.path);
                     await this.assertNoSymbolicLinks(localUri);
                     await vscode.workspace.fs.createDirectory(localUri);
                     // Track folders in baseContent with empty content
-                    this.baseContent.set(entry.path, new Uint8Array(0));
+                    this.setBaseContent(entry.path, SYNCHRONIZED_CONTENT_MARKER);
                     return;
                 }
 
@@ -2910,7 +2985,7 @@ export class SyncEngine {
         this.fileTree.clear();
         this.fileTreeByPath.clear();
         this.fileCache.clear();
-        this.baseContent.clear();
+        this.clearBaseContent();
         this.pendingLocalCreates.clear();
         this.joinedDocs.clear();
         this._status = 'disconnected';
