@@ -10,11 +10,10 @@ import type { RequestInit, Response } from 'node-fetch';
 import { Identity } from '../utils/credentialManager';
 import { validateServerUrl } from '../utils/serverUrl';
 import { validateProjectEntityName } from '../utils/pathSafety';
-import { validateRemoteDocumentLines } from '../utils/remoteValidation';
+import { MAX_REMOTE_FILE_BYTES, validateRemoteDocumentLines } from '../utils/remoteValidation';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024;
-const MAX_FILE_RESPONSE_BYTES = 100 * 1024 * 1024;
 const MAX_PARTIAL_DOWNLOADS = 10_000;
 
 type JsonObject = Record<string, unknown>;
@@ -459,7 +458,7 @@ export class BaseAPI {
             const res = await this.fetchRoute(route, {
                 method: 'GET',
                 headers,
-            }, MAX_FILE_RESPONSE_BYTES);
+            }, MAX_REMOTE_FILE_BYTES);
 
             if (res.status === 200) {
                 if (offset !== 0) {
@@ -495,7 +494,7 @@ export class BaseAPI {
                 || start !== offset
                 || end < start
                 || end >= total
-                || total > MAX_FILE_RESPONSE_BYTES
+                || total > MAX_REMOTE_FILE_BYTES
             ) {
                 this.discardResponseBody(res);
                 throw new ApiHttpError('The Overleaf server returned an unsafe partial download range.');
@@ -596,6 +595,12 @@ export class BaseAPI {
     ): Promise<ResponseSchema> {
         if (!this.identity) {
             return { type: 'error', message: 'Not authenticated' };
+        }
+        if (
+            !(fileContent instanceof Uint8Array)
+            || fileContent.byteLength > MAX_REMOTE_FILE_BYTES
+        ) {
+            return { type: 'error', message: 'The local file exceeds the synchronization size limit.' };
         }
 
         const FormData = require('form-data');

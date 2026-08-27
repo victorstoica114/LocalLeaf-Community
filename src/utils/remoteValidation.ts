@@ -8,6 +8,7 @@
 export const MAX_REMOTE_DOCUMENT_CHARACTERS = 10 * 1024 * 1024;
 export const MAX_REMOTE_DOCUMENT_LINES = 200_000;
 export const MAX_REMOTE_DOCUMENT_OPERATIONS = 10_000;
+export const MAX_REMOTE_FILE_BYTES = 100 * 1024 * 1024;
 export const MAX_OVERLEAF_ID_LENGTH = 1024;
 
 export function validateOverleafId(value: unknown, label: string): string {

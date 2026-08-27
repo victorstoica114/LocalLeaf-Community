@@ -11,6 +11,7 @@ import {
 } from '../utils/syncAuthorization';
 import {
     MAX_REMOTE_DOCUMENT_LINES,
+    MAX_REMOTE_FILE_BYTES,
     validateRemoteDocumentLines,
 } from '../utils/remoteValidation';
 
@@ -240,6 +241,7 @@ interface MockUri {
 interface MockFileEntry {
     type: number;
     content?: string;
+    size?: number;
 }
 
 interface MockTextDocument {
@@ -362,7 +364,7 @@ const mockWorkspaceFs = {
         if (!entry) throw new MockFileSystemError('File not found', 'FileNotFound');
         return {
             type: entry.type,
-            size: new TextEncoder().encode(entry.content ?? '').byteLength,
+            size: entry.size ?? new TextEncoder().encode(entry.content ?? '').byteLength,
         };
     },
     async readDirectory(uri: MockUri | string): Promise<Array<[string, number]>> {
@@ -812,6 +814,16 @@ async function run(): Promise<void> {
         _type: 'file',
         name: 'figure.pdf',
     });
+    assert.deepStrictEqual(
+        await api.uploadFile(
+            'project',
+            'folder',
+            'oversized.bin',
+            { byteLength: MAX_REMOTE_FILE_BYTES + 1 } as Uint8Array,
+        ),
+        { type: 'error', message: 'The local file exceeds the synchronization size limit.' },
+        'the HTTP upload boundary must reject invalid or oversized byte inputs before multipart encoding',
+    );
 
     fetchResponse = {
         ok: true,
@@ -1729,6 +1741,20 @@ async function run(): Promise<void> {
         () => boundedLocalScan.findLocalOnlyFiles(100, 0),
         /excessively deep directory tree/,
         'the local project scan must have a hard recursion bound',
+    );
+
+    const oversizedLocalWorkspace = mockFileUri('D:\\oversized-workspace');
+    const oversizedLocalUri = mockFileUri('D:\\oversized-workspace\\huge.bin');
+    resetMockWorkspace([oversizedLocalWorkspace], [
+        [oversizedLocalWorkspace.fsPath, { type: 2 }],
+        [oversizedLocalUri.fsPath, { type: 1, content: 'small mock', size: MAX_REMOTE_FILE_BYTES + 1 }],
+    ]);
+    const boundedLocalRead = Object.create(SyncEngine.prototype) as any;
+    boundedLocalRead.settings = { getWorkspaceFolder: () => oversizedLocalWorkspace };
+    await assert.rejects(
+        () => boundedLocalRead.readLocalFile(oversizedLocalUri),
+        /exceeds the synchronization size limit/,
+        'local uploads must reject oversized files before reading them into memory',
     );
 
     const protectedPaths = Object.create(SyncEngine.prototype) as any;

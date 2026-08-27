@@ -20,6 +20,7 @@ import {
 import {
     MAX_REMOTE_DOCUMENT_CHARACTERS,
     MAX_REMOTE_DOCUMENT_OPERATIONS,
+    MAX_REMOTE_FILE_BYTES,
     validateOverleafId,
 } from '../utils/remoteValidation';
 
@@ -567,6 +568,27 @@ export class SyncEngine {
         await assertSafeWorkspacePath(this.settings.getWorkspaceFolder(), uri);
     }
 
+    private async readLocalFile(uri: vscode.Uri): Promise<Uint8Array> {
+        await this.assertNoSymbolicLinks(uri);
+        const stat = await vscode.workspace.fs.stat(uri);
+        if ((stat.type & vscode.FileType.File) === 0) {
+            throw new Error(`Refusing to read a non-file synchronization path: ${uri.fsPath}`);
+        }
+        if (
+            !Number.isSafeInteger(stat.size)
+            || stat.size < 0
+            || stat.size > MAX_REMOTE_FILE_BYTES
+        ) {
+            throw new Error(`Local file exceeds the synchronization size limit: ${uri.fsPath}`);
+        }
+
+        const content = await vscode.workspace.fs.readFile(uri);
+        if (content.byteLength > MAX_REMOTE_FILE_BYTES) {
+            throw new Error(`Local file exceeds the synchronization size limit: ${uri.fsPath}`);
+        }
+        return content;
+    }
+
     /**
      * Check if path should be synced (not ignored)
      */
@@ -676,7 +698,15 @@ export class SyncEngine {
     }
 
     private getOpenDocumentContent(document: vscode.TextDocument): Uint8Array {
-        return new TextEncoder().encode(document.getText());
+        const text = document.getText();
+        if (text.length > MAX_REMOTE_DOCUMENT_CHARACTERS) {
+            throw new Error('The open document exceeds the synchronization size limit.');
+        }
+        const content = new TextEncoder().encode(text);
+        if (content.byteLength > MAX_REMOTE_FILE_BYTES) {
+            throw new Error('The open document exceeds the synchronization size limit.');
+        }
+        return content;
     }
 
     /**
@@ -1009,8 +1039,7 @@ export class SyncEngine {
             // Read file content - may throw if file was deleted between watcher event and now
             let content: Uint8Array;
             try {
-                await this.assertNoSymbolicLinks(uri);
-                content = await vscode.workspace.fs.readFile(uri);
+                content = await this.readLocalFile(uri);
             } catch (readError) {
                 // File was deleted between watcher event and read - this is normal during rapid operations
                 if (isFileNotFoundError(readError)) {
@@ -1074,6 +1103,9 @@ export class SyncEngine {
             const { lines: remoteLines, version } = await this.socket.joinDoc(docId);
             const remoteContent = remoteLines.join('\n');
             const localContent = new TextDecoder().decode(newContent);
+            if (localContent.length > MAX_REMOTE_DOCUMENT_CHARACTERS) {
+                throw new Error(`Cannot upload ${path}: document exceeds the synchronization size limit`);
+            }
 
             // Calculate diff and create OT operations
             const ops = this.calculateOps(remoteContent, localContent);
@@ -1465,7 +1497,7 @@ export class SyncEngine {
                 // Read file content - may throw if file was deleted
                 let content: Uint8Array;
                 try {
-                    content = await vscode.workspace.fs.readFile(uri);
+                    content = await this.readLocalFile(uri);
                 } catch (readError) {
                     if (isFileNotFoundError(readError)) {
                         debugLog(`File no longer exists (race condition): ${relativePath}`);
@@ -1882,8 +1914,9 @@ export class SyncEngine {
             await this.assertNoSymbolicLinks(localUri);
             let diskBytes: Uint8Array | undefined;
             try {
-                diskBytes = await vscode.workspace.fs.readFile(localUri);
-            } catch {
+                diskBytes = await this.readLocalFile(localUri);
+            } catch (error) {
+                if (!isFileNotFoundError(error)) throw error;
                 diskBytes = undefined;
             }
 
@@ -1974,8 +2007,9 @@ export class SyncEngine {
                         : undefined;
                     if (!latestLocalBytes) {
                         try {
-                            latestLocalBytes = await vscode.workspace.fs.readFile(localUri);
-                        } catch {
+                            latestLocalBytes = await this.readLocalFile(localUri);
+                        } catch (error) {
+                            if (!isFileNotFoundError(error)) throw error;
                             latestLocalBytes = localBytes;
                         }
                     }
@@ -2030,8 +2064,9 @@ export class SyncEngine {
                 } else {
                     let latestDiskBytes: Uint8Array | undefined;
                     try {
-                        latestDiskBytes = await vscode.workspace.fs.readFile(localUri);
-                    } catch {
+                        latestDiskBytes = await this.readLocalFile(localUri);
+                    } catch (error) {
+                        if (!isFileNotFoundError(error)) throw error;
                         latestDiskBytes = undefined;
                     }
                     if (!contentEquals(latestDiskBytes, diskBytes)) {
@@ -2116,7 +2151,7 @@ export class SyncEngine {
 
     private async readLocalFileIfExists(localUri: vscode.Uri): Promise<Uint8Array | undefined> {
         try {
-            return await vscode.workspace.fs.readFile(localUri);
+            return await this.readLocalFile(localUri);
         } catch (error) {
             if (isFileNotFoundError(error)) return undefined;
             throw error;
@@ -2436,7 +2471,7 @@ export class SyncEngine {
         const openDocument = isTextFile ? this.getOpenTextDocument(localUri) : undefined;
         const content = openDocument?.isDirty
             ? this.getOpenDocumentContent(openDocument)
-            : await vscode.workspace.fs.readFile(localUri);
+            : await this.readLocalFile(localUri);
         this.throwIfDisposed();
 
         // Ensure all parent folders exist (creates them if needed)
