@@ -555,6 +555,70 @@ export class SyncEngine {
         return vscode.workspace.textDocuments.find(document => document.uri.toString() === target);
     }
 
+    private getOpenTextDocumentsUnderProjectPath(projectPath: string): vscode.TextDocument[] {
+        const folderPrefix = projectPath.endsWith('/') ? projectPath : undefined;
+        return vscode.workspace.textDocuments.filter(document => {
+            let relativePath: string | undefined;
+            try {
+                relativePath = this.settings.getRelativePath(document.uri);
+            } catch {
+                return false;
+            }
+            return relativePath === projectPath
+                || Boolean(folderPrefix && relativePath?.startsWith(folderPrefix));
+        });
+    }
+
+    private async renameLocalPath(
+        projectPath: string,
+        oldUri: vscode.Uri,
+        newUri: vscode.Uri,
+    ): Promise<void> {
+        if (this.getOpenTextDocumentsUnderProjectPath(projectPath).length === 0) {
+            await vscode.workspace.fs.rename(oldUri, newUri);
+            return;
+        }
+
+        // WorkspaceEdit keeps open editor tabs (including dirty buffers)
+        // associated with the renamed file and makes the operation undoable.
+        const edit = new vscode.WorkspaceEdit();
+        edit.renameFile(oldUri, newUri, { overwrite: false, ignoreIfExists: false });
+        if (!(await vscode.workspace.applyEdit(edit))) {
+            throw new Error(`VS Code refused to rename the open local path ${projectPath}`);
+        }
+    }
+
+    private async deleteLocalPath(
+        projectPath: string,
+        localUri: vscode.Uri,
+        recursive: boolean,
+    ): Promise<'deleted' | 'preserved'> {
+        const openDocuments = this.getOpenTextDocumentsUnderProjectPath(projectPath);
+        if (openDocuments.some(document => document.isDirty)) {
+            return 'preserved';
+        }
+
+        if (openDocuments.length > 0) {
+            // Keep VS Code's editor model in sync with the filesystem and retain
+            // an Undo route for a clean file removed remotely.
+            const edit = new vscode.WorkspaceEdit();
+            edit.deleteFile(localUri, { recursive, ignoreIfNotExists: true });
+            if (!(await vscode.workspace.applyEdit(edit))) {
+                throw new Error(`VS Code refused to delete the open local path ${projectPath}`);
+            }
+        } else {
+            await vscode.workspace.fs.delete(localUri, { recursive });
+        }
+        return 'deleted';
+    }
+
+    private reportPreservedRemoteDeletion(projectPath: string): void {
+        const message = `Kept ${projectPath} locally because it contains unsaved editor changes; `
+            + 'run Sync Now when you are ready to reconcile the remote deletion.';
+        this.log(message);
+        void vscode.window.showWarningMessage(`LocalLeaf: ${message}`);
+    }
+
     private getOpenDocumentContent(document: vscode.TextDocument): Uint8Array {
         return new TextEncoder().encode(document.getText());
     }
@@ -1480,9 +1544,10 @@ export class SyncEngine {
             if (syncedBefore) {
                 try {
                     if (syncedAfter) {
-                        await vscode.workspace.fs.rename(oldUri, newUri);
+                        await this.renameLocalPath(oldPath, oldUri, newUri);
                     } else {
-                        await vscode.workspace.fs.delete(oldUri, { recursive: true });
+                        const outcome = await this.deleteLocalPath(oldPath, oldUri, true);
+                        if (outcome === 'preserved') this.reportPreservedRemoteDeletion(oldPath);
                         this.removeTrackedContent(oldPath);
                     }
                 } catch (error) {
@@ -1555,7 +1620,8 @@ export class SyncEngine {
             await this.assertNoSymbolicLinks(localUri);
             this.throwIfDisposed();
             try {
-                await vscode.workspace.fs.delete(localUri, { recursive: true });
+                const outcome = await this.deleteLocalPath(entry.path, localUri, true);
+                if (outcome === 'preserved') this.reportPreservedRemoteDeletion(entry.path);
             } catch (error) {
                 if (!isFileNotFoundError(error)) throw error;
             }
@@ -1616,9 +1682,10 @@ export class SyncEngine {
             if (syncedBefore) {
                 try {
                     if (syncedAfter) {
-                        await vscode.workspace.fs.rename(oldUri, newUri);
+                        await this.renameLocalPath(oldPath, oldUri, newUri);
                     } else {
-                        await vscode.workspace.fs.delete(oldUri, { recursive: true });
+                        const outcome = await this.deleteLocalPath(oldPath, oldUri, true);
+                        if (outcome === 'preserved') this.reportPreservedRemoteDeletion(oldPath);
                         this.removeTrackedContent(oldPath);
                     }
                 } catch (error) {
@@ -2059,10 +2126,14 @@ export class SyncEngine {
                 try {
                     const localUri = this.settings.getFilePath(path);
                     await this.assertNoSymbolicLinks(localUri);
-                    await vscode.workspace.fs.delete(localUri, { recursive: false });
+                    const outcome = await this.deleteLocalPath(path, localUri, false);
                     this.baseContent.delete(path);
                     this.fileCache.delete(path);
-                    this.log(`Deleted local file (removed from Overleaf): ${path}`);
+                    if (outcome === 'preserved') {
+                        this.reportPreservedRemoteDeletion(path);
+                    } else {
+                        this.log(`Deleted local file (removed from Overleaf): ${path}`);
+                    }
                 } catch (error) {
                     console.error(`[LocalLeaf] Failed to delete local file: ${path}`, error);
                 }
@@ -2205,14 +2276,16 @@ export class SyncEngine {
         const projectSettings = this.settings.getSettings()!;
         const localUri = this.settings.getFilePath(relativePath);
         await this.assertNoSymbolicLinks(localUri);
-        const content = await vscode.workspace.fs.readFile(localUri);
+        const name = relativePath.split('/').pop()!;
+        const isTextFile = this.isTextFile(name);
+        const openDocument = isTextFile ? this.getOpenTextDocument(localUri) : undefined;
+        const content = openDocument?.isDirty
+            ? this.getOpenDocumentContent(openDocument)
+            : await vscode.workspace.fs.readFile(localUri);
         this.throwIfDisposed();
 
         // Ensure all parent folders exist (creates them if needed)
         const parentId = await this.ensureParentFoldersExist(relativePath);
-
-        const name = relativePath.split('/').pop()!;
-        const isTextFile = this.isTextFile(name);
 
         this.setStatus('pushing', `Uploading ${relativePath}`, relativePath);
 

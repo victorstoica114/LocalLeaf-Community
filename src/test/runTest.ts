@@ -166,6 +166,16 @@ interface MockWorkspaceReplacement {
     text: string;
 }
 
+interface MockWorkspaceRename {
+    oldUri: MockUri;
+    newUri: MockUri;
+}
+
+interface MockWorkspaceDeletion {
+    uri: MockUri;
+    recursive: boolean;
+}
+
 class MockRange {
     constructor(
         readonly start: { offset: number },
@@ -175,9 +185,19 @@ class MockRange {
 
 class MockWorkspaceEdit {
     readonly replacements: MockWorkspaceReplacement[] = [];
+    readonly renames: MockWorkspaceRename[] = [];
+    readonly deletions: MockWorkspaceDeletion[] = [];
 
     replace(uri: MockUri, _range: MockRange, text: string): void {
         this.replacements.push({ uri, text });
+    }
+
+    renameFile(oldUri: MockUri, newUri: MockUri): void {
+        this.renames.push({ oldUri, newUri });
+    }
+
+    deleteFile(uri: MockUri, options?: { recursive?: boolean }): void {
+        this.deletions.push({ uri, recursive: options?.recursive === true });
     }
 }
 
@@ -186,6 +206,8 @@ let mockFileEntries = new Map<string, MockFileEntry>();
 let mockTextDocuments: MockTextDocument[] = [];
 let mockAppliedWorkspaceEdits: MockWorkspaceEdit[] = [];
 let mockFileWrites: Array<{ uri: MockUri | string; content: Uint8Array }> = [];
+let mockFileDeletes: Array<{ uri: MockUri | string; recursive: boolean }> = [];
+let mockFileRenames: Array<{ oldUri: MockUri | string; newUri: MockUri | string }> = [];
 let mockApplyEditResult = true;
 
 function mockFileUri(fsPath: string): MockUri {
@@ -232,6 +254,8 @@ function resetMockWorkspace(
     mockTextDocuments = [];
     mockAppliedWorkspaceEdits = [];
     mockFileWrites = [];
+    mockFileDeletes = [];
+    mockFileRenames = [];
     mockApplyEditResult = true;
 }
 
@@ -264,7 +288,26 @@ const mockWorkspaceFs = {
     async writeFile(uri: MockUri | string, content: Uint8Array): Promise<void> {
         mockFileWrites.push({ uri, content });
     },
-    async delete(): Promise<void> {},
+    async delete(uri: MockUri | string, options?: { recursive?: boolean }): Promise<void> {
+        mockFileDeletes.push({ uri, recursive: options?.recursive === true });
+        const target = mockUriKey(uri);
+        for (const entryPath of [...mockFileEntries.keys()]) {
+            if (entryPath === target || (options?.recursive && entryPath.startsWith(`${target}\\`))) {
+                mockFileEntries.delete(entryPath);
+            }
+        }
+    },
+    async rename(oldUri: MockUri | string, newUri: MockUri | string): Promise<void> {
+        mockFileRenames.push({ oldUri, newUri });
+        const oldPath = mockUriKey(oldUri);
+        const newPath = mockUriKey(newUri);
+        for (const [entryPath, entry] of [...mockFileEntries]) {
+            if (entryPath === oldPath || entryPath.startsWith(`${oldPath}\\`)) {
+                mockFileEntries.delete(entryPath);
+                mockFileEntries.set(`${newPath}${entryPath.slice(oldPath.length)}`, entry);
+            }
+        }
+    },
 };
 
 class MockEventEmitter {
@@ -301,6 +344,10 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             },
             Range: MockRange,
             WorkspaceEdit: MockWorkspaceEdit,
+            window: {
+                showWarningMessage: async () => undefined,
+                showInformationMessage: async () => undefined,
+            },
             commands: {
                 executeCommand: (...args: unknown[]) => executeCommandImpl(...args),
             },
@@ -316,6 +363,33 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
                             candidate.uri.toString() === replacement.uri.toString()
                         );
                         document?.applyText(replacement.text);
+                    }
+                    for (const rename of edit.renames) {
+                        const oldPath = mockUriKey(rename.oldUri);
+                        const newPath = mockUriKey(rename.newUri);
+                        for (const [entryPath, entry] of [...mockFileEntries]) {
+                            if (entryPath === oldPath || entryPath.startsWith(`${oldPath}\\`)) {
+                                mockFileEntries.delete(entryPath);
+                                mockFileEntries.set(`${newPath}${entryPath.slice(oldPath.length)}`, entry);
+                            }
+                        }
+                        for (const document of mockTextDocuments) {
+                            const documentPath = mockUriKey(document.uri);
+                            if (documentPath === oldPath || documentPath.startsWith(`${oldPath}\\`)) {
+                                document.uri = mockFileUri(`${newPath}${documentPath.slice(oldPath.length)}`);
+                            }
+                        }
+                    }
+                    for (const deletion of edit.deletions) {
+                        const target = mockUriKey(deletion.uri);
+                        for (const entryPath of [...mockFileEntries.keys()]) {
+                            if (
+                                entryPath === target
+                                || (deletion.recursive && entryPath.startsWith(`${target}\\`))
+                            ) {
+                                mockFileEntries.delete(entryPath);
+                            }
+                        }
                     }
                     return true;
                 },
@@ -1221,6 +1295,89 @@ async function run(): Promise<void> {
         'server!',
         'the remote base must advance when a full pull preserves newer editor text',
     );
+
+    const structuralWorkspace = mockFileUri('D:\\structural-workspace');
+    const structuralSource = mockFileUri('D:\\structural-workspace\\draft.tex');
+    const structuralTarget = mockFileUri('D:\\structural-workspace\\renamed.tex');
+    const structuralSettings = {
+        getRelativePath: (uri: MockUri): string | undefined => {
+            const relative = path.win32.relative(structuralWorkspace.fsPath, uri.fsPath);
+            if (relative.startsWith('..') || path.win32.isAbsolute(relative)) return undefined;
+            return relative.length === 0 ? '/' : `/${relative.replace(/\\/g, '/')}`;
+        },
+        getFilePath: () => structuralSource,
+        getSettings: () => ({ projectId: 'project' }),
+    };
+    resetMockWorkspace([structuralWorkspace], [
+        [structuralWorkspace.fsPath, { type: 2 }],
+        [structuralSource.fsPath, { type: 1, content: 'saved text' }],
+    ]);
+    const dirtyStructuralDocument = createMockTextDocument(structuralSource, 'unsaved text');
+    mockTextDocuments = [dirtyStructuralDocument];
+    const structuralEngine = Object.create(SyncEngine.prototype) as any;
+    structuralEngine.settings = structuralSettings;
+    assert.equal(
+        await structuralEngine.deleteLocalPath('/draft.tex', structuralSource, false),
+        'preserved',
+        'a remote deletion must never remove a dirty editor from disk',
+    );
+    assert.equal(mockAppliedWorkspaceEdits.length, 0);
+    assert.equal(mockFileDeletes.length, 0);
+
+    dirtyStructuralDocument.isDirty = false;
+    assert.equal(
+        await structuralEngine.deleteLocalPath('/draft.tex', structuralSource, false),
+        'deleted',
+    );
+    assert.equal(mockAppliedWorkspaceEdits.length, 1,
+        'deleting an open clean file must go through an undoable WorkspaceEdit');
+    assert.equal(mockAppliedWorkspaceEdits[0].deletions.length, 1);
+    assert.equal(mockFileDeletes.length, 0,
+        'an open editor must not be deleted behind VS Code through the raw filesystem API');
+
+    resetMockWorkspace([structuralWorkspace], [
+        [structuralWorkspace.fsPath, { type: 2 }],
+        [structuralSource.fsPath, { type: 1, content: 'saved text' }],
+    ]);
+    const renamedDirtyDocument = createMockTextDocument(structuralSource, 'unsaved text');
+    mockTextDocuments = [renamedDirtyDocument];
+    await structuralEngine.renameLocalPath('/draft.tex', structuralSource, structuralTarget);
+    assert.equal(mockAppliedWorkspaceEdits.length, 1,
+        'renaming an open file must go through a WorkspaceEdit');
+    assert.equal(mockAppliedWorkspaceEdits[0].renames.length, 1);
+    assert.equal(mockFileRenames.length, 0);
+    assert.equal(renamedDirtyDocument.uri.toString(), structuralTarget.toString());
+    assert.equal(renamedDirtyDocument.getText(), 'unsaved text');
+    assert.equal(renamedDirtyDocument.isDirty, true,
+        'a remote rename must preserve the unsaved editor buffer');
+
+    resetMockWorkspace([structuralWorkspace], [
+        [structuralWorkspace.fsPath, { type: 2 }],
+        [structuralSource.fsPath, { type: 1, content: 'saved text' }],
+    ]);
+    const reuploadedDirtyDocument = createMockTextDocument(structuralSource, 'unsaved text');
+    mockTextDocuments = [reuploadedDirtyDocument];
+    const reuploadEngine = Object.create(SyncEngine.prototype) as any;
+    reuploadEngine.disposed = false;
+    reuploadEngine.settings = structuralSettings;
+    reuploadEngine.baseContent = new Map();
+    reuploadEngine.fileCache = new Map();
+    reuploadEngine.assertNoSymbolicLinks = async () => undefined;
+    reuploadEngine.ensureParentFoldersExist = async () => 'root';
+    reuploadEngine.setStatus = () => undefined;
+    let reuploadedContent: string | undefined;
+    reuploadEngine.createTextDocumentWithContent = async (
+        _projectId: string,
+        _parentId: string,
+        _relativePath: string,
+        _name: string,
+        content: Uint8Array,
+    ) => {
+        reuploadedContent = new TextDecoder().decode(content);
+    };
+    await reuploadEngine.uploadLocalFile('/draft.tex');
+    assert.equal(reuploadedContent, 'unsaved text',
+        're-uploading a dirty text file must use its editor buffer rather than stale disk content');
 
     const protectedPaths = Object.create(SyncEngine.prototype) as any;
     protectedPaths.ignoreParser = { shouldIgnore: () => false };
