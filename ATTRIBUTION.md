@@ -14,7 +14,7 @@ Asixa opened [PR #3](https://github.com/Teddy-van-Jerry/LocalLeaf/pull/3) with a
 
 The preserved proposal contains 34 commits: 24 authored as **RFDT** and 10 authored as **Xingyu Chen**. Both author names belong to the Asixa contribution series and are retained exactly as recorded by Git.
 
-Parts of that proposal became the starting point for the interface used here. The integration was selective and received additional security and reliability work, but the original direction and code deserve clear credit. The original commit series is preserved in the `archive/asixa-pr-3` branch, and its ancestry is connected to the default branch so the original authorship remains visible to Git and GitHub.
+Parts of that proposal became the starting point for the interface used here. The integration was selective and received additional security and reliability work, but the original direction and code deserve clear credit. The original commit series is preserved in the `archive/asixa-pr-3` branch, while equivalent commits retaining Asixa's authorship are present on the default branch so that contribution is visible to Git and GitHub.
 
 The disposition of every public pull request and every PR #3 commit is recorded in [docs/CONTRIBUTOR_INTEGRATION.md](docs/CONTRIBUTOR_INTEGRATION.md), including the security reasons for the feature groups that are not shipped.
 

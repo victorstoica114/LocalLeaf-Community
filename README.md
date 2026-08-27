@@ -84,7 +84,7 @@ Contributions are welcome, whether they are code, documentation, bug reports, or
 
 LocalLeaf was started by **Teddy van Jerry (Wuqiong Zhao)**, who designed and built the original extension and maintained its first releases. **Xingyu Chen (Asixa / RFDT)** later contributed a substantial 34-commit proposal for a broader interface, synchronization workflow, local compilation, PDF tooling, and Source Control integration in PR #3. **Victor Stoica** integrated and hardened parts of that work, fixed synchronization and security issues, and now maintains this continuation.
 
-The full story is in [ATTRIBUTION.md](ATTRIBUTION.md), and the commit-by-commit review is in [docs/CONTRIBUTOR_INTEGRATION.md](docs/CONTRIBUTOR_INTEGRATION.md). The original commit history is preserved, and Asixa's original PR history is kept in the `archive/asixa-pr-3` branch and connected to the default branch for authorship visibility.
+The full story is in [ATTRIBUTION.md](ATTRIBUTION.md), and the commit-by-commit review is in [docs/CONTRIBUTOR_INTEGRATION.md](docs/CONTRIBUTOR_INTEGRATION.md). Asixa's original PR history is preserved in the `archive/asixa-pr-3` branch, while equivalent authored commits are present on the default branch for contributor visibility.
 
 ## Related projects
 

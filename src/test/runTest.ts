@@ -29,6 +29,21 @@ function readInstalledPackageVersion(...packagePath: string[]): string {
     return packageJson.version as string;
 }
 
+function readLockedPackageVersions(packageName: string): string[] {
+    const packageLock = JSON.parse(fs.readFileSync(
+        path.join(__dirname, '..', '..', 'package-lock.json'),
+        'utf8',
+    )) as { packages?: Record<string, { version?: string }> };
+    const packageSuffix = `node_modules/${packageName}`;
+    const versions = Object.entries(packageLock.packages ?? {})
+        .filter(([packagePath]) =>
+            packagePath === packageSuffix || packagePath.endsWith(`/${packageSuffix}`))
+        .map(([, packageMetadata]) => packageMetadata.version);
+    assert.ok(versions.length > 0, `${packageName} must be present in package-lock.json`);
+    assert.ok(versions.every(version => typeof version === 'string'));
+    return [...new Set(versions as string[])].sort();
+}
+
 async function verifyWebSocketCompatibility(): Promise<void> {
     const WebSocket = require('ws') as any;
 
@@ -3030,6 +3045,10 @@ async function run(): Promise<void> {
     assert.equal(readInstalledPackageVersion('form-data'), '4.0.6');
     assert.equal(readInstalledPackageVersion('minimatch'), '9.0.9');
     assert.equal(readInstalledPackageVersion('ws'), '5.2.7');
+    assert.deepStrictEqual(readLockedPackageVersions('brace-expansion'), ['1.1.18', '2.1.4']);
+    assert.deepStrictEqual(readLockedPackageVersions('minimatch'), ['3.1.5', '9.0.9']);
+    assert.deepStrictEqual(readLockedPackageVersions('form-data'), ['4.0.6']);
+    assert.deepStrictEqual(readLockedPackageVersions('ws'), ['5.2.7']);
     assert.equal(
         readInstalledPackageVersion(
             '@typescript-eslint',

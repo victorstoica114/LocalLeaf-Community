@@ -109,6 +109,7 @@ synchronization.
 
 The original PR #3 head (`1520b9d`) remains available in
 `archive/asixa-pr-3`. Its 24 commits authored as RFDT and 10 commits authored as
-Xingyu Chen remain intact. `.mailmap`, the connected history, README, and
+Xingyu Chen remain intact. `.mailmap`, equivalent authored commits on `main`,
+README, and
 [ATTRIBUTION.md](../ATTRIBUTION.md) make that work visible without presenting
 deferred code as shipped functionality.

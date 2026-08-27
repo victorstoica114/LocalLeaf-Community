@@ -4,9 +4,11 @@ All notable changes to LocalLeaf Community will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-27
+
 ### Changed
 
-- Connected Asixa's preserved PR #3 history to the default branch, documented both original author names, Xingyu Chen and RFDT, and added a mailmap entry that groups them under Xingyu Chen
+- Represented Asixa's PR #3 authorship on the default branch, preserved the original series in an archive branch, documented both author names, Xingyu Chen and RFDT, and added a mailmap entry that groups them under Xingyu Chen
 - Excluded this development checkout's LocalLeaf link metadata from Git and VSIX packages
 - Added a public contributor-integration audit covering every upstream pull request and all 34 commits in Asixa's PR #3
 - Reimplemented the safe parts of Asixa's comment-removal and editor-recovery work with explicit confirmation, bounded input, and undoable VS Code edits
@@ -44,6 +46,8 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Capped concurrent Socket.IO events awaiting acknowledgements and closed connections that exceed the limit
 - Required a verified remote entity identity before treating new binary uploads as synchronized
 - Closed server-forced socket sessions immediately and bounded live-watch failure diagnostics
+
+[0.2.2]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.1...v0.2.2
 
 ## [0.2.1] - 2026-08-23
 
