@@ -30,6 +30,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Bounded local filesystem reads and upload payloads, including text-document limits before OT generation
 - Replaced retained binary synchronization payloads with zero-byte markers while keeping content hashes for echo detection
 - Capped retained OT document baselines at 64 MiB and added hash-backed authoritative recovery for evicted baselines
+- Capped retained conflict-diff content at 20 MiB per synchronization session
 
 ## [0.2.1] - 2026-08-23
 

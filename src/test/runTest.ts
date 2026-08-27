@@ -990,6 +990,27 @@ async function run(): Promise<void> {
     assert.equal(typeof boundedBaselines.baseHashes.get('/evicted.tex'), 'string',
         'evicted content must retain its server hash for safe conflict detection');
 
+    const boundedDiffs = Object.create(SyncEngine.prototype) as any;
+    boundedDiffs.remoteDiffContents = new Map();
+    boundedDiffs.remoteDiffCharacters = 0;
+    boundedDiffs.maxRemoteDiffCharacters = 7;
+    const firstDiffUri = mockFileUri('D:\\diff-workspace\\first.tex');
+    const secondDiffUri = mockFileUri('D:\\diff-workspace\\second.tex');
+    boundedDiffs.setRemoteDiffContent(firstDiffUri, 'first');
+    boundedDiffs.setRemoteDiffContent(secondDiffUri, 'other');
+    assert.equal(boundedDiffs.remoteDiffContents.has(firstDiffUri.toString()), false,
+        'the oldest remote diff must be evicted when the aggregate memory budget is exceeded');
+    assert.equal(boundedDiffs.remoteDiffContents.get(secondDiffUri.toString()), 'other');
+    assert.equal(boundedDiffs.remoteDiffCharacters, 5);
+    boundedDiffs.setRemoteDiffContent(secondDiffUri, 'new');
+    assert.equal(boundedDiffs.remoteDiffCharacters, 3,
+        'replacing a remote diff must not leak the previous content into the byte budget');
+    assert.throws(
+        () => boundedDiffs.setRemoteDiffContent(firstDiffUri, 'oversized'),
+        /memory limit/,
+        'a single remote diff larger than the configured memory budget must be rejected',
+    );
+
     assert.deepEqual(
         propagation.calculateOps('hello world', 'hello brave world'),
         [{ p: 6, i: 'brave ' }],

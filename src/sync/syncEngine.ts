@@ -30,6 +30,7 @@ const DEFAULT_REMOTE_EVENT_COST = 4096;
 const MAX_LOCAL_SCAN_ENTITIES = 100_000;
 const MAX_LOCAL_SCAN_DEPTH = 256;
 const MAX_RETAINED_DOCUMENT_BYTES = 64 * 1024 * 1024;
+const MAX_REMOTE_DIFF_CHARACTERS = 20 * 1024 * 1024;
 const SYNCHRONIZED_CONTENT_MARKER = new Uint8Array(0);
 
 /**
@@ -148,6 +149,8 @@ export class SyncEngine {
     private pendingRemoteEventCount = 0;
     private pendingRemoteEventCost = 0;
     private readonly remoteDiffContents = new Map<string, string>();
+    private remoteDiffCharacters = 0;
+    private readonly maxRemoteDiffCharacters = MAX_REMOTE_DIFF_CHARACTERS;
     private remoteDiffChangeEmitter?: vscode.EventEmitter<vscode.Uri>;
 
     readonly onStatusChange = this._onStatusChange.event;
@@ -2240,6 +2243,37 @@ export class SyncEngine {
         }
     }
 
+    private setRemoteDiffContent(uri: vscode.Uri, content: string): void {
+        if (!Number.isSafeInteger(this.remoteDiffCharacters) || this.remoteDiffCharacters < 0) {
+            this.remoteDiffCharacters = [...this.remoteDiffContents.values()].reduce(
+                (total, value) => total + value.length,
+                0,
+            );
+        }
+
+        const key = uri.toString();
+        const previous = this.remoteDiffContents.get(key);
+        if (previous !== undefined) this.remoteDiffCharacters -= previous.length;
+        this.remoteDiffContents.delete(key);
+
+        const maximum = this.maxRemoteDiffCharacters ?? MAX_REMOTE_DIFF_CHARACTERS;
+        if (!Number.isSafeInteger(maximum) || maximum < 0 || content.length > maximum) {
+            throw new Error('Remote diff content exceeds the LocalLeaf memory limit.');
+        }
+
+        while (this.remoteDiffCharacters + content.length > maximum) {
+            const oldest = this.remoteDiffContents.entries().next().value as
+                | [string, string]
+                | undefined;
+            if (!oldest) break;
+            this.remoteDiffContents.delete(oldest[0]);
+            this.remoteDiffCharacters -= oldest[1].length;
+        }
+
+        this.remoteDiffContents.set(key, content);
+        this.remoteDiffCharacters += content.length;
+    }
+
     /**
      * Show diff between local and remote file
      */
@@ -2258,7 +2292,7 @@ export class SyncEngine {
             );
         }
 
-        this.remoteDiffContents.set(remoteUri.toString(), new TextDecoder().decode(remoteContent));
+        this.setRemoteDiffContent(remoteUri, new TextDecoder().decode(remoteContent));
         this.remoteDiffChangeEmitter.fire(remoteUri);
 
         await vscode.commands.executeCommand('vscode.diff',
@@ -2982,6 +3016,7 @@ export class SyncEngine {
         this.suppressedRemoteDeletes.clear();
         this.suppressedRemoteRenames.clear();
         this.remoteDiffContents.clear();
+        this.remoteDiffCharacters = 0;
         this.fileTree.clear();
         this.fileTreeByPath.clear();
         this.fileCache.clear();
