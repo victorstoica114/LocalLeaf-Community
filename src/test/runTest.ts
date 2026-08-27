@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
+import { removeStandaloneLatexComments } from '../utils/latexComments';
 
 const Module = require('module') as {
     _load: (request: string, parent: unknown, isMain: boolean) => unknown;
@@ -331,6 +332,43 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
 };
 
 async function run(): Promise<void> {
+    const latexCleanup = removeStandaloneLatexComments([
+        '% remove this\r\n',
+        'Text % keep inline\r\n',
+        '\\% keep escaped\r\n',
+        '\r\n',
+        '\\begin{verbatim}\r\n',
+        '% keep verbatim\r\n',
+        '\\end{verbatim}\r\n',
+        '\\begin{comment}\r\n',
+        'ignored content\r\n',
+        '\\end{comment}\r\n',
+        'After\r\n',
+    ].join(''));
+    assert.equal(latexCleanup.removedLines, 4);
+    assert.equal(latexCleanup.removedBlocks, 1);
+    assert.equal(latexCleanup.content, [
+        'Text % keep inline\r\n',
+        '\\% keep escaped\r\n',
+        '\r\n',
+        '\\begin{verbatim}\r\n',
+        '% keep verbatim\r\n',
+        '\\end{verbatim}\r\n',
+        'After\r\n',
+    ].join(''), 'comment cleanup must preserve inline text, verbatim content, blank lines, and CRLF endings');
+
+    const incompleteCommentEnvironment = '\\begin{comment}\nkeep this text\n';
+    assert.deepStrictEqual(
+        removeStandaloneLatexComments(incompleteCommentEnvironment),
+        { content: incompleteCommentEnvironment, removedLines: 0, removedBlocks: 0 },
+        'an unterminated comment environment must be preserved fail-safe',
+    );
+    assert.deepStrictEqual(
+        removeStandaloneLatexComments('prefix\n  % remove\nsuffix'),
+        { content: 'prefix\nsuffix', removedLines: 1, removedBlocks: 0 },
+        'standalone comments must be removed without adding or collapsing unrelated lines',
+    );
+
     useSocketIoMock = false;
     const { SocketIOAPI } = require(path.join('..', 'api', 'socketio')) as {
         SocketIOAPI: new (api: unknown, identity: unknown, projectId: string) => {

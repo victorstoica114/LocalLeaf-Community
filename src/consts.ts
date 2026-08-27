@@ -71,4 +71,5 @@ export const COMMANDS = {
     JUMP_TO_COLLABORATOR: 'localleaf.jumpToCollaborator',
     VERIFY_CREDENTIALS: 'localleaf.verifyCredentials',
     REFRESH_COOKIE: 'localleaf.refreshCookie',
+    REMOVE_COMMENTS: 'localleaf.removeComments',
 } as const;

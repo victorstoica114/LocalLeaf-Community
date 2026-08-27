@@ -135,6 +135,10 @@
       {
         "command": "localleaf.refreshCookie",
         "title": "LocalLeaf: Refresh Cookie"
+      },
+      {
+        "command": "localleaf.removeComments",
+        "title": "LocalLeaf: Remove Standalone LaTeX Comments"
       }
     ],
     "configuration": {

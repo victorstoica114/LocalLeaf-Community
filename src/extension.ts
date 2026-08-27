@@ -18,6 +18,7 @@ import { AccountPanel, AccountPanelAction, AccountPanelState } from './views/acc
 import { LinkOperationGate, shouldConfirmProjectLink } from './utils/linkSafety';
 import { validateServerUrl, ValidatedServerUrl } from './utils/serverUrl';
 import { assertSafeWorkspacePath, normalizeProjectPath } from './utils/pathSafety';
+import { removeStandaloneLatexComments } from './utils/latexComments';
 
 /**
  * Auth state type
@@ -263,6 +264,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
         vscode.commands.registerCommand(COMMANDS.VERIFY_CREDENTIALS, cmdVerifyCredentials),
         vscode.commands.registerCommand(COMMANDS.REFRESH_COOKIE, cmdRefreshCookie),
+        vscode.commands.registerCommand(COMMANDS.REMOVE_COMMENTS, cmdRemoveComments),
     );
 }
 
@@ -1041,6 +1043,139 @@ async function cmdPushToOverleaf() {
     }
 
     void vscode.window.showInformationMessage('LocalLeaf: Push is automatic via real-time sync');
+}
+
+interface LatexCommentEditCandidate {
+    document: vscode.TextDocument;
+    originalContent: string;
+    cleanedContent: string;
+    removedLines: number;
+    removedBlocks: number;
+    version: number;
+    displayPath: string;
+}
+
+const MAX_COMMENT_CLEANUP_FILES = 500;
+const MAX_COMMENT_CLEANUP_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Remove only standalone LaTeX comments after a dry run and an explicit
+ * confirmation. A single WorkspaceEdit keeps the operation in VS Code's Undo
+ * history and preserves unsaved editor content.
+ */
+async function cmdRemoveComments(): Promise<void> {
+    if (!vscode.workspace.isTrusted) {
+        void vscode.window.showWarningMessage('LocalLeaf: Trust this workspace before editing LaTeX files.');
+        return;
+    }
+
+    const workspaceFolder = SettingsManager.getCurrentInstance()?.getWorkspaceFolder()
+        ?? await chooseWorkspaceFolder();
+    if (!workspaceFolder) {
+        void vscode.window.showWarningMessage('LocalLeaf: No workspace folder is available.');
+        return;
+    }
+
+    try {
+        const texFiles = await vscode.workspace.findFiles(
+            new vscode.RelativePattern(workspaceFolder, '**/*.tex'),
+            new vscode.RelativePattern(workspaceFolder, '**/{.git,.localleaf,node_modules}/**'),
+            MAX_COMMENT_CLEANUP_FILES + 1,
+        );
+        if (texFiles.length > MAX_COMMENT_CLEANUP_FILES) {
+            throw new Error(
+                `More than ${MAX_COMMENT_CLEANUP_FILES} .tex files matched; narrow the workspace before cleanup.`,
+            );
+        }
+
+        const candidates: LatexCommentEditCandidate[] = [];
+        let inspectedBytes = 0;
+        for (const uri of texFiles) {
+            await assertSafeWorkspacePath(workspaceFolder, uri);
+            const document = await vscode.workspace.openTextDocument(uri);
+            const originalContent = document.getText();
+            inspectedBytes += Buffer.byteLength(originalContent, 'utf8');
+            if (inspectedBytes > MAX_COMMENT_CLEANUP_BYTES) {
+                throw new Error('Matched LaTeX sources exceed the 50 MiB safety limit.');
+            }
+
+            const removal = removeStandaloneLatexComments(originalContent);
+            if (removal.content === originalContent) continue;
+            candidates.push({
+                document,
+                originalContent,
+                cleanedContent: removal.content,
+                removedLines: removal.removedLines,
+                removedBlocks: removal.removedBlocks,
+                version: document.version,
+                displayPath: vscode.workspace.asRelativePath(uri, false),
+            });
+        }
+
+        if (candidates.length === 0) {
+            void vscode.window.showInformationMessage('LocalLeaf: No standalone LaTeX comments were found.');
+            return;
+        }
+
+        const removedLines = candidates.reduce((total, candidate) => total + candidate.removedLines, 0);
+        const removedBlocks = candidates.reduce((total, candidate) => total + candidate.removedBlocks, 0);
+        const visibleFiles = candidates.slice(0, 12)
+            .map(candidate => `${candidate.displayPath}: ${candidate.removedLines} line(s)`);
+        if (candidates.length > visibleFiles.length) {
+            visibleFiles.push(`... and ${candidates.length - visibleFiles.length} more file(s)`);
+        }
+
+        const confirmation = await vscode.window.showWarningMessage(
+            `Remove ${removedLines} standalone comment line(s) from ${candidates.length} LaTeX file(s)?`,
+            {
+                modal: true,
+                detail: [
+                    ...visibleFiles,
+                    '',
+                    `${removedBlocks} complete comment environment(s) are included.`,
+                    'Inline comments and verbatim-like environments are intentionally preserved.',
+                    'The changes are applied through VS Code and can be undone before saving.',
+                ].join('\n'),
+            },
+            'Remove Standalone Comments',
+        );
+        if (confirmation !== 'Remove Standalone Comments') return;
+
+        const changedWhileConfirming = candidates.find(candidate =>
+            candidate.document.version !== candidate.version
+            || candidate.document.getText() !== candidate.originalContent
+        );
+        if (changedWhileConfirming) {
+            void vscode.window.showWarningMessage(
+                `LocalLeaf: ${changedWhileConfirming.displayPath} changed during confirmation; no comments were removed.`,
+            );
+            return;
+        }
+
+        const edit = new vscode.WorkspaceEdit();
+        for (const candidate of candidates) {
+            edit.replace(
+                candidate.document.uri,
+                new vscode.Range(
+                    candidate.document.positionAt(0),
+                    candidate.document.positionAt(candidate.originalContent.length),
+                ),
+                candidate.cleanedContent,
+            );
+        }
+        if (!(await vscode.workspace.applyEdit(edit))) {
+            throw new Error('VS Code rejected the workspace edit.');
+        }
+
+        void vscode.window.showInformationMessage(
+            `LocalLeaf: Removed ${removedLines} standalone comment line(s) from ${candidates.length} file(s).`,
+        );
+    } catch (error) {
+        log(`Remove standalone comments failed: ${errorMessage(error)}`);
+        void vscode.window.showErrorMessage(
+            `LocalLeaf: Remove comments failed - ${errorMessage(error)}`,
+        );
+    }
 }
 
 /**
