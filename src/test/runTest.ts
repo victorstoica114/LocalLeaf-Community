@@ -1,5 +1,6 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
+import * as http from 'http';
 import * as path from 'path';
 import { removeStandaloneLatexComments } from '../utils/latexComments';
 import {
@@ -136,6 +137,95 @@ class FakeSocket {
     removeAllListeners(): this {
         this.listeners.clear();
         return this;
+    }
+}
+
+async function verifyHardenedXmlHttpRequest(): Promise<void> {
+    interface XmlHttpRequestLike {
+        readyState: number;
+        status: number;
+        onreadystatechange: (() => void) | null;
+        onerror: (() => void) | null;
+        open(method: string, url: string, async: boolean): void;
+        send(): void;
+    }
+
+    const { XMLHttpRequest } = require('xmlhttprequest') as {
+        XMLHttpRequest: new () => XmlHttpRequestLike;
+    };
+
+    assert.throws(
+        () => new XMLHttpRequest().open('GET', 'file:///localleaf-test.txt', true),
+        /Only HTTP and HTTPS requests are allowed/,
+        'the bundled legacy transport must not read local files',
+    );
+    assert.throws(
+        () => new XMLHttpRequest().open('GET', 'http://127.0.0.1/', false),
+        /Synchronous XMLHttpRequest is disabled/,
+        'the bundled legacy transport must not spawn a synchronous helper process',
+    );
+
+    let targetHits = 0;
+    const server = http.createServer((request, response) => {
+        if (request.url === '/redirect') {
+            response.writeHead(302, { Location: '/target' });
+            response.end();
+            return;
+        }
+        if (request.url === '/target') {
+            targetHits += 1;
+        }
+        response.writeHead(200);
+        response.end('ok');
+    });
+
+    await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+    });
+
+    try {
+        const address = server.address();
+        assert.ok(address && typeof address !== 'string');
+
+        await new Promise<void>((resolve, reject) => {
+            const request = new XMLHttpRequest();
+            let settled = false;
+            let timeout: ReturnType<typeof setTimeout>;
+            const finish = (error?: Error): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(timeout);
+                error ? reject(error) : resolve();
+            };
+            const verifyRejectedRedirect = (): void => {
+                if (request.readyState !== 4) {
+                    return;
+                }
+                try {
+                    assert.equal(request.status, 0, 'redirected legacy XHR must fail closed');
+                    finish();
+                } catch (error) {
+                    finish(error as Error);
+                }
+            };
+
+            timeout = setTimeout(
+                () => finish(new Error('XMLHttpRequest redirect test timed out')),
+                5000,
+            );
+
+            request.onreadystatechange = verifyRejectedRedirect;
+            request.onerror = verifyRejectedRedirect;
+            request.open('GET', `http://127.0.0.1:${address.port}/redirect`, true);
+            request.send();
+        });
+
+        assert.equal(targetHits, 0, 'legacy XHR must not follow redirects with authentication headers');
+    } finally {
+        await new Promise<void>(resolve => server.close(() => resolve()));
     }
 }
 
@@ -2241,6 +2331,22 @@ async function run(): Promise<void> {
 
     const bundlePath = path.join(__dirname, '..', '..', 'dist', 'extension.js');
     assert.ok(fs.statSync(bundlePath).size > 0, 'the extension bundle must be generated');
+    const bundleSource = fs.readFileSync(bundlePath, 'utf8');
+    assert.doesNotMatch(
+        bundleSource,
+        /require\(["']child_process["']\)/,
+        'the production bundle must not contain the legacy synchronous XHR helper',
+    );
+    assert.doesNotMatch(
+        bundleSource,
+        /\beval\(/,
+        'the production bundle must not contain the legacy JSON eval fallback',
+    );
+    assert.doesNotMatch(
+        bundleSource,
+        /node-xmlhttprequest-(?:content|sync)/,
+        'the production bundle must not contain legacy XHR temporary-file helpers',
+    );
     const bundle = require(bundlePath) as { activate?: unknown; deactivate?: unknown };
     assert.equal(typeof bundle.activate, 'function', 'the bundle must export activate');
     assert.equal(typeof bundle.deactivate, 'function', 'the bundle must export deactivate');
@@ -2277,6 +2383,7 @@ async function run(): Promise<void> {
     assert.match(socketTransportSource, /\.onopen\s*=/);
     assert.match(socketTransportSource, /\.onmessage\s*=/);
     await verifyWebSocketCompatibility();
+    await verifyHardenedXmlHttpRequest();
 
     Module._load = originalLoad;
     console.log('LocalLeaf synchronization and UI contract regression tests passed.');

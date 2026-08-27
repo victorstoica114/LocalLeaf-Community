@@ -1,3 +1,20 @@
+diff --git a/node_modules/socket.io-client/lib/json.js b/node_modules/socket.io-client/lib/json.js
+index 0820a52..e1885fb 100644
+--- a/node_modules/socket.io-client/lib/json.js
++++ b/node_modules/socket.io-client/lib/json.js
+@@ -301,8 +301,9 @@
+   // JavaScript structure. The '{' operator is subject to a syntactic ambiguity
+   // in JavaScript: it can begin a block or an object literal. We wrap the text
+   // in parens to eliminate the ambiguity.
+-
+-          j = eval('(' + text + ')');
+-
++          if (typeof global === 'undefined' || !global.JSON || !global.JSON.parse) {
++              throw new SyntaxError('Native JSON.parse is required');
++          }
++          j = global.JSON.parse(text);
+   // In the optional fourth stage, we recursively walk the new structure, passing
+   // each name/value pair to a reviver function for possible transformation.
 diff --git a/node_modules/socket.io-client/lib/socket.js b/node_modules/socket.io-client/lib/socket.js
 index 07c1c3f..e208abc 100644
 --- a/node_modules/socket.io-client/lib/socket.js

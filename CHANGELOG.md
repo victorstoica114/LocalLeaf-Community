@@ -21,6 +21,7 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Bounded pending remote events, OT payload memory, remote project trees, and recursive local project scans
 - Made `localleaf.autoSync` and the linked-project `autoSync` flag actually disable watcher-triggered local uploads
 - Prevented server-provided account fields from being interpreted as Markdown in status tooltips
+- Removed legacy synchronous child-process XHR and JSON `eval` fallbacks, rejected credential-preserving redirects, and bounded legacy XHR responses
 
 ## [0.2.1] - 2026-08-23
 
