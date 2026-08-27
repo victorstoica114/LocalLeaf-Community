@@ -6,6 +6,16 @@
 import * as vscode from 'vscode';
 import { BaseAPI, ProjectEntity, FileEntity } from './base';
 import { Identity } from '../utils/credentialManager';
+import {
+    MAX_REMOTE_DOCUMENT_CHARACTERS,
+    MAX_REMOTE_DOCUMENT_OPERATIONS,
+    validateOverleafId,
+    validateRemoteDocumentLines,
+} from '../utils/remoteValidation';
+
+const MAX_CONNECTED_USERS = 1000;
+const MAX_CONNECTED_USER_RESPONSE_ITEMS = 10_000;
+const MAX_PROFILE_FIELD_LENGTH = 4096;
 
 // Output channel for logging (visible to user)
 let outputChannel: vscode.OutputChannel | undefined;
@@ -102,6 +112,173 @@ function projectFromResponse(value: unknown): ProjectEntity {
         throw new Error('Overleaf returned an invalid project response.');
     }
     return value as ProjectEntity;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : undefined;
+}
+
+function boundedString(value: unknown, maximumLength: number): string | undefined {
+    return typeof value === 'string' && value.length <= maximumLength ? value : undefined;
+}
+
+function safePosition(value: unknown): number | undefined {
+    return Number.isSafeInteger(value) && (value as number) >= 0
+        ? value as number
+        : undefined;
+}
+
+function decodeSocketDocumentLines(value: unknown): string[] {
+    const encodedLines = validateRemoteDocumentLines(value, 'Socket.IO document content');
+    const lines = encodedLines.map(line => Buffer.from(line, 'ascii').toString('utf-8'));
+    return validateRemoteDocumentLines(lines, 'decoded Socket.IO document content');
+}
+
+function parseDocumentUpdate(value: unknown): DocumentUpdate | undefined {
+    const record = objectRecord(value);
+    if (!record) return undefined;
+
+    let doc: string;
+    try {
+        doc = validateOverleafId(record.doc, 'document ID');
+    } catch {
+        return undefined;
+    }
+
+    const version = safePosition(record.v);
+    if (version === undefined) return undefined;
+
+    let operations: DocumentUpdate['op'];
+    if (record.op !== undefined) {
+        if (!Array.isArray(record.op) || record.op.length > MAX_REMOTE_DOCUMENT_OPERATIONS) {
+            return undefined;
+        }
+        operations = [];
+        let operationCharacters = 0;
+        for (const value of record.op) {
+            const operation = objectRecord(value);
+            const position = safePosition(operation?.p);
+            if (!operation || position === undefined) return undefined;
+
+            const insert = operation.i;
+            const deletion = operation.d;
+            const undo = operation.u;
+            if (
+                (insert !== undefined && typeof insert !== 'string')
+                || (deletion !== undefined && typeof deletion !== 'string')
+                || (undo !== undefined && typeof undo !== 'boolean')
+            ) {
+                return undefined;
+            }
+            operationCharacters += (insert as string | undefined)?.length ?? 0;
+            operationCharacters += (deletion as string | undefined)?.length ?? 0;
+            if (operationCharacters > MAX_REMOTE_DOCUMENT_CHARACTERS) return undefined;
+
+            operations.push({
+                p: position,
+                ...(insert !== undefined ? { i: insert as string } : {}),
+                ...(deletion !== undefined ? { d: deletion as string } : {}),
+                ...(undo !== undefined ? { u: undo as boolean } : {}),
+            });
+        }
+    }
+
+    const lastVersion = record.lastV === undefined ? undefined : safePosition(record.lastV);
+    if (record.lastV !== undefined && lastVersion === undefined) return undefined;
+    const hash = record.hash === undefined ? undefined : boundedString(record.hash, 1024);
+    if (record.hash !== undefined && hash === undefined) return undefined;
+
+    let meta: DocumentUpdate['meta'];
+    if (record.meta !== undefined) {
+        const metaRecord = objectRecord(record.meta);
+        const source = boundedString(metaRecord?.source, 1024);
+        const timestamp = metaRecord ? Number(metaRecord.ts) : Number.NaN;
+        const userId = boundedString(metaRecord?.user_id, 1024);
+        if (!metaRecord || source === undefined || !Number.isFinite(timestamp) || userId === undefined) {
+            return undefined;
+        }
+        meta = { source, ts: timestamp, user_id: userId };
+    }
+
+    return {
+        doc,
+        v: version,
+        ...(operations !== undefined ? { op: operations } : {}),
+        ...(lastVersion !== undefined ? { lastV: lastVersion } : {}),
+        ...(hash !== undefined ? { hash } : {}),
+        ...(meta !== undefined ? { meta } : {}),
+    };
+}
+
+function parseOnlineUser(value: unknown): OnlineUser | undefined {
+    const record = objectRecord(value);
+    if (!record) return undefined;
+
+    let clientId: string;
+    try {
+        clientId = validateOverleafId(record.client_id, 'client ID');
+    } catch {
+        return undefined;
+    }
+
+    const userId = boundedString(record.user_id, 1024);
+    const firstName = boundedString(record.first_name, MAX_PROFILE_FIELD_LENGTH);
+    const lastName = record.last_name === undefined
+        ? undefined
+        : boundedString(record.last_name, MAX_PROFILE_FIELD_LENGTH);
+    const email = boundedString(record.email, MAX_PROFILE_FIELD_LENGTH);
+    if (userId === undefined || firstName === undefined || email === undefined) return undefined;
+    if (record.last_name !== undefined && lastName === undefined) return undefined;
+
+    const cursor = record.cursorData === undefined ? undefined : objectRecord(record.cursorData);
+    if (record.cursorData !== undefined && !cursor) return undefined;
+    const docId = cursor ? boundedString(cursor.doc_id, 1024) : '';
+    const row = cursor ? safePosition(cursor.row) : 0;
+    const column = cursor ? safePosition(cursor.column) : 0;
+    if (docId === undefined || row === undefined || column === undefined) return undefined;
+
+    const rawLastUpdated = Number(record.last_updated_at);
+    return {
+        clientId,
+        userId,
+        name: [firstName, lastName].filter(Boolean).join(' '),
+        email,
+        docId,
+        row,
+        column,
+        lastUpdated: Number.isFinite(rawLastUpdated) ? rawLastUpdated : Date.now(),
+    };
+}
+
+function parseUserCursorUpdate(value: unknown): UserCursorUpdate | undefined {
+    const record = objectRecord(value);
+    if (!record) return undefined;
+
+    let id: string;
+    try {
+        id = validateOverleafId(record.id, 'client ID');
+    } catch {
+        return undefined;
+    }
+    const userId = boundedString(record.user_id, 1024);
+    const name = boundedString(record.name, MAX_PROFILE_FIELD_LENGTH);
+    const email = boundedString(record.email, MAX_PROFILE_FIELD_LENGTH);
+    const docId = boundedString(record.doc_id, 1024);
+    const row = safePosition(record.row);
+    const column = safePosition(record.column);
+    if (
+        userId === undefined
+        || name === undefined
+        || email === undefined
+        || docId === undefined
+        || row === undefined
+        || column === undefined
+    ) {
+        return undefined;
+    }
+    return { id, user_id: userId, name, email, doc_id: docId, row, column };
 }
 
 /**
@@ -238,8 +415,10 @@ export class SocketIOAPI {
             this.failConnection(socket, error);
         });
 
-        socket.on('forceDisconnect', (message: string) => {
+        socket.on('forceDisconnect', (value: unknown) => {
             if (this.socket !== socket) return;
+            const message = boundedString(value, MAX_PROFILE_FIELD_LENGTH)
+                ?? 'Overleaf forced the socket to disconnect';
             log(`Force disconnected: ${message}`);
             this._connected = false;
             this.failConnection(socket, new Error(message || 'Overleaf forced the socket to disconnect'));
@@ -267,19 +446,24 @@ export class SocketIOAPI {
 
         socket.on('connectionRejected', (err: unknown) => {
             if (this.socket !== socket) return;
-            const message = err instanceof Error
+            const rawMessage = err instanceof Error
                 ? err.message
                 : typeof err === 'object' && err !== null && 'message' in err
                     ? String(err.message)
                     : String(err);
+            const message = rawMessage.slice(0, MAX_PROFILE_FIELD_LENGTH);
             log(`Connection rejected: ${message}`);
             this._connected = false;
             this.failConnection(socket, new Error(message || 'Socket connection rejected'));
         });
 
-        socket.on('connectionAccepted', (_session: unknown, publicId: string) => {
+        socket.on('connectionAccepted', (_session: unknown, value: unknown) => {
             if (this.socket !== socket) return;
-            this._publicId = publicId;
+            try {
+                this._publicId = validateOverleafId(value, 'public client ID');
+            } catch {
+                this.failConnection(socket, new Error('Overleaf returned an invalid public client ID.'));
+            }
         });
 
         if (mode === 'query') {
@@ -295,11 +479,16 @@ export class SocketIOAPI {
                 const response = res as Record<string, unknown>;
                 const publicId = response.publicId;
                 const project = response.project;
-                if (typeof publicId !== 'string' || project === null || typeof project !== 'object') {
+                if (project === null || typeof project !== 'object') {
                     this.failConnection(socket, new Error('Overleaf returned incomplete project metadata.'));
                     return;
                 }
-                this._publicId = publicId;
+                try {
+                    this._publicId = validateOverleafId(publicId, 'public client ID');
+                } catch (error) {
+                    this.failConnection(socket, error as Error);
+                    return;
+                }
                 this.projectRecord = project as ProjectEntity;
                 this.projectRecordResolve?.(this.projectRecord);
             });
@@ -349,21 +538,27 @@ export class SocketIOAPI {
         }
 
         if (handlers.onFileChanged) {
-            socket.on('otUpdateApplied', (update: DocumentUpdate) => {
-                handlers.onFileChanged!(update);
+            socket.on('otUpdateApplied', (value: unknown) => {
+                const update = parseDocumentUpdate(value);
+                if (update) handlers.onFileChanged!(update);
             });
         }
 
         // Collaboration events
         if (handlers.onUserCursorUpdated) {
-            socket.on('clientTracking.clientUpdated', (user: UserCursorUpdate) => {
-                handlers.onUserCursorUpdated!(user);
+            socket.on('clientTracking.clientUpdated', (value: unknown) => {
+                const user = parseUserCursorUpdate(value);
+                if (user) handlers.onUserCursorUpdated!(user);
             });
         }
 
         if (handlers.onUserDisconnected) {
-            socket.on('clientTracking.clientDisconnected', (clientId: string) => {
-                handlers.onUserDisconnected!(clientId);
+            socket.on('clientTracking.clientDisconnected', (value: unknown) => {
+                try {
+                    handlers.onUserDisconnected!(validateOverleafId(value, 'client ID'));
+                } catch {
+                    // Ignore malformed presence events.
+                }
             });
         }
 
@@ -462,11 +657,16 @@ export class SocketIOAPI {
      * Join a document for editing
      */
     async joinDoc(docId: string): Promise<{ lines: string[]; version: number }> {
-        const [docLinesAscii, version] = await this.emit('joinDoc', docId, {
+        const safeDocId = validateOverleafId(docId, 'document ID');
+        const response = await this.emit('joinDoc', safeDocId, {
             encodeRanges: true,
-        }) as [string[], number];
+        });
+        const lines = decodeSocketDocumentLines(response[0]);
+        const version = safePosition(response[1]);
+        if (version === undefined) {
+            throw new Error('Overleaf returned an invalid document version.');
+        }
 
-        const lines = docLinesAscii.map(line => Buffer.from(line, 'ascii').toString('utf-8'));
         return { lines, version };
     }
 
@@ -474,47 +674,53 @@ export class SocketIOAPI {
      * Leave a document
      */
     async leaveDoc(docId: string): Promise<void> {
-        await this.emit('leaveDoc', docId);
+        await this.emit('leaveDoc', validateOverleafId(docId, 'document ID'));
     }
 
     /**
      * Apply OT update to a document
      */
     async applyOtUpdate(docId: string, update: DocumentUpdate): Promise<void> {
-        await this.emit('applyOtUpdate', docId, update);
+        const safeDocId = validateOverleafId(docId, 'document ID');
+        const safeUpdate = parseDocumentUpdate(update);
+        if (!safeUpdate || safeUpdate.doc !== safeDocId) {
+            throw new Error('Refusing to send an invalid document update.');
+        }
+        await this.emit('applyOtUpdate', safeDocId, safeUpdate);
     }
 
     /**
      * Get connected users
      */
     async getConnectedUsers(): Promise<OnlineUser[]> {
-        const [users] = await this.emit('clientTracking.getConnectedUsers') as [Array<{
-            client_id: string;
-            user_id: string;
-            first_name: string;
-            last_name?: string;
-            email: string;
-            cursorData?: { doc_id: string; row: number; column: number };
-            last_updated_at: string;
-        }>];
+        const [value] = await this.emit('clientTracking.getConnectedUsers');
+        if (!Array.isArray(value) || value.length > MAX_CONNECTED_USER_RESPONSE_ITEMS) {
+            throw new Error('Overleaf returned an invalid connected-user list.');
+        }
 
-        return users.map(u => ({
-            clientId: u.client_id,
-            userId: u.user_id,
-            name: [u.first_name, u.last_name].filter(Boolean).join(' '),
-            email: u.email,
-            docId: u.cursorData?.doc_id || '',
-            row: u.cursorData?.row || 0,
-            column: u.cursorData?.column || 0,
-            lastUpdated: Number(u.last_updated_at),
-        }));
+        const users: OnlineUser[] = [];
+        for (const item of value) {
+            const user = parseOnlineUser(item);
+            if (user) users.push(user);
+            if (users.length >= MAX_CONNECTED_USERS) break;
+        }
+        return users;
     }
 
     /**
      * Update cursor position
      */
     async updatePosition(docId: string, row: number, column: number): Promise<void> {
-        await this.emit('clientTracking.updatePosition', { row, column, doc_id: docId });
+        const safeRow = safePosition(row);
+        const safeColumn = safePosition(column);
+        if (safeRow === undefined || safeColumn === undefined) {
+            throw new Error('Refusing to send an invalid cursor position.');
+        }
+        await this.emit('clientTracking.updatePosition', {
+            row: safeRow,
+            column: safeColumn,
+            doc_id: validateOverleafId(docId, 'document ID'),
+        });
     }
 
     /**

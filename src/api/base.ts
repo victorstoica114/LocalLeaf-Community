@@ -10,6 +10,7 @@ import type { RequestInit, Response } from 'node-fetch';
 import { Identity } from '../utils/credentialManager';
 import { validateServerUrl } from '../utils/serverUrl';
 import { validateProjectEntityName } from '../utils/pathSafety';
+import { validateRemoteDocumentLines } from '../utils/remoteValidation';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024;
@@ -897,10 +898,12 @@ export class BaseAPI {
 
         if (res.status === 200) {
             const data = asJsonObject(await res.json());
-            if (!Array.isArray(data?.lines) || data.lines.some((line: unknown) => typeof line !== 'string')) {
+            try {
+                const lines = validateRemoteDocumentLines(data?.lines);
+                return { type: 'success', lines };
+            } catch {
                 return { type: 'error', message: 'Overleaf returned invalid document content.' };
             }
-            return { type: 'success', lines: data.lines as string[] };
         }
 
         return this.responseError(res);

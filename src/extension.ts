@@ -19,6 +19,12 @@ import { LinkOperationGate, shouldConfirmProjectLink } from './utils/linkSafety'
 import { validateServerUrl, ValidatedServerUrl } from './utils/serverUrl';
 import { assertSafeWorkspacePath, normalizeProjectPath } from './utils/pathSafety';
 import { removeStandaloneLatexComments } from './utils/latexComments';
+import {
+    approveSyncTarget,
+    isSyncTargetApproved,
+    revokeSyncTarget,
+    SyncAuthorizationTarget,
+} from './utils/syncAuthorization';
 
 /**
  * Auth state type
@@ -43,8 +49,10 @@ let settingsWatcher: vscode.Disposable | undefined;
 let syncStatusSubscription: vscode.Disposable | undefined;
 let workspaceChangeGeneration = 0;
 let activeSyncKey: string | undefined;
+let extensionContext: vscode.ExtensionContext;
 const linkOperationGate = new LinkOperationGate();
 const panelConfirmation = Object.freeze({ source: 'localleaf-panel' });
+const SYNC_AUTHORIZATION_STATE_KEY = 'localleaf.approvedSyncTargets.v1';
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -54,6 +62,78 @@ function getSyncKey(settings: SettingsManager): string | undefined {
     const project = settings.getSettings();
     if (!project) return undefined;
     return `${settings.getWorkspaceFolder().toString()}|${project.serverUrl}|${project.projectId}`;
+}
+
+function getSyncAuthorizationTarget(settings: SettingsManager): SyncAuthorizationTarget | undefined {
+    const project = settings.getSettings();
+    if (!project) return undefined;
+    return {
+        workspaceUri: settings.getWorkspaceFolder().toString(),
+        serverUrl: project.serverUrl,
+        projectId: project.projectId,
+    };
+}
+
+function hasSyncAuthorization(context: vscode.ExtensionContext, settings: SettingsManager): boolean {
+    const target = getSyncAuthorizationTarget(settings);
+    return Boolean(target && isSyncTargetApproved(
+        context.workspaceState.get<unknown>(SYNC_AUTHORIZATION_STATE_KEY),
+        target,
+    ));
+}
+
+async function grantSyncAuthorization(
+    context: vscode.ExtensionContext,
+    settings: SettingsManager,
+): Promise<void> {
+    const target = getSyncAuthorizationTarget(settings);
+    if (!target) throw new Error('Cannot authorize synchronization without valid project settings.');
+    await context.workspaceState.update(
+        SYNC_AUTHORIZATION_STATE_KEY,
+        approveSyncTarget(context.workspaceState.get<unknown>(SYNC_AUTHORIZATION_STATE_KEY), target),
+    );
+}
+
+async function revokeSyncAuthorization(
+    context: vscode.ExtensionContext,
+    settings: SettingsManager,
+): Promise<void> {
+    const workspaceUri = settings.getWorkspaceFolder().toString();
+    await context.workspaceState.update(
+        SYNC_AUTHORIZATION_STATE_KEY,
+        revokeSyncTarget(context.workspaceState.get<unknown>(SYNC_AUTHORIZATION_STATE_KEY), workspaceUri),
+    );
+}
+
+async function ensureSyncAuthorization(
+    context: vscode.ExtensionContext,
+    settings: SettingsManager,
+): Promise<boolean> {
+    if (hasSyncAuthorization(context, settings)) return true;
+    const project = settings.getSettings();
+    if (!project) return false;
+
+    const approval = await vscode.window.showWarningMessage(
+        `Allow LocalLeaf to synchronize this folder with "${project.projectName}"?`,
+        {
+            modal: true,
+            detail: [
+                `Folder: ${settings.getWorkspaceFolder().fsPath}`,
+                `Server: ${project.serverUrl}`,
+                '',
+                'Remote changes can replace local project files, and saved local changes can be uploaded to Overleaf.',
+                'Approval is stored only for this exact folder, server, and project.',
+            ].join('\n'),
+        },
+        'Allow Sync',
+    );
+    if (approval !== 'Allow Sync') {
+        updateStatusBar('disconnected', 'Sync approval required');
+        log(`Synchronization not authorized for ${settings.getWorkspaceFolder().fsPath}`);
+        return false;
+    }
+    await grantSyncAuthorization(context, settings);
+    return true;
 }
 
 function disposeCurrentSyncSession(): void {
@@ -142,6 +222,8 @@ async function handleWorkspaceFoldersChanged(context: vscode.ExtensionContext): 
  */
 export async function activate(context: vscode.ExtensionContext) {
     try {
+
+    extensionContext = context;
 
     // Initialize output channel
     outputChannel = vscode.window.createOutputChannel(EXTENSION_NAME);
@@ -283,6 +365,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         void vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
         return;
     }
+    if (!(await ensureSyncAuthorization(context, settings))) return;
 
     // Create API
     const api = new BaseAPI(projectSettings.serverUrl);
@@ -939,6 +1022,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?
         // Create settings
         const settings = SettingsManager.createDefaultSettings(serverUrl, project.id, project.name);
         await settingsManager.save(settings);
+        await grantSyncAuthorization(context, settingsManager);
 
         // Create default .leafignore
         const ignoreParser = new IgnoreParser(workspaceFolder);
@@ -986,6 +1070,7 @@ async function cmdUnlinkFolder(confirmation?: object) {
     disposeCurrentSyncSession();
 
     // Delete settings
+    await revokeSyncAuthorization(extensionContext, settingsManager);
     await settingsManager.delete();
 
     mainWebviewProvider.setOnlineUsers([]);
@@ -1002,6 +1087,12 @@ async function cmdUnlinkFolder(confirmation?: object) {
  */
 async function cmdSyncNow() {
     if (!syncEngine) {
+        const manager = SettingsManager.getCurrentInstance();
+        if (manager && await manager.isLinked()) {
+            if (!manager.getSettings()) await manager.load();
+            await initializeSync(extensionContext, manager);
+            return;
+        }
         void vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
         return;
     }
@@ -1015,7 +1106,7 @@ async function cmdSyncNow() {
  */
 async function cmdPullFromOverleaf() {
     if (!syncEngine) {
-        void vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
+        await cmdSyncNow();
         return;
     }
 
@@ -1376,55 +1467,8 @@ async function cmdReconnect() {
         void vscode.window.showWarningMessage('LocalLeaf: No linked project');
         return;
     }
-
-    disposeCurrentSyncSession();
-    const projectSettings = settingsManager.getSettings() ?? await settingsManager.load();
-    if (!projectSettings) return;
-
-    const credential = await credentialManager.getCredential(projectSettings.serverUrl);
-    if (!credential) {
-        updateStatusBar('disconnected', 'Not logged in');
-        void vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
-        return;
-    }
-
-    const api = new BaseAPI(projectSettings.serverUrl);
-    api.setIdentity(credential.identity);
-
-    const engine = new SyncEngine(api, settingsManager, log);
-    syncEngine = engine;
-    activeSyncKey = getSyncKey(settingsManager);
-
-    listenForSyncStatus(engine);
-
-    try {
-        updateStatusBar('connecting', 'Reconnecting...');
-        await engine.connect();
-        if (syncEngine !== engine) return;
-
-        const socket = engine.getSocket();
-        if (socket) {
-            const tracker = new CursorTracker(socket, settingsManager);
-            cursorTracker = tracker;
-            await tracker.initialize();
-            if (syncEngine !== engine) {
-                tracker.dispose();
-                return;
-            }
-        }
-
-        startStatusUpdates();
-        log('Reconnected to Overleaf');
-
-        await engine.pullAll();
-        await engine.joinAllDocsForWatching();
-        void vscode.window.showInformationMessage(`LocalLeaf: Reconnected to "${projectSettings.projectName}"`);
-    } catch (error) {
-        if (syncEngine !== engine) return;
-        log(`Failed to reconnect: ${error}`);
-        disposeCurrentSyncSession();
-        void vscode.window.showErrorMessage(`LocalLeaf: Failed to reconnect - ${error}`);
-    }
+    if (!settingsManager.getSettings()) await settingsManager.load();
+    await initializeSync(extensionContext, settingsManager);
 }
 
 /**

@@ -2,6 +2,16 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { removeStandaloneLatexComments } from '../utils/latexComments';
+import {
+    approveSyncTarget,
+    createSyncTargetFingerprint,
+    isSyncTargetApproved,
+    revokeSyncTarget,
+} from '../utils/syncAuthorization';
+import {
+    MAX_REMOTE_DOCUMENT_LINES,
+    validateRemoteDocumentLines,
+} from '../utils/remoteValidation';
 
 const Module = require('module') as {
     _load: (request: string, parent: unknown, isMain: boolean) => unknown;
@@ -228,18 +238,20 @@ function resetMockWorkspace(
 const mockWorkspaceFs = {
     async readFile(uri: MockUri | string): Promise<Uint8Array> {
         const entry = mockFileEntries.get(mockUriKey(uri));
-        if (!entry || entry.type !== 1) throw new MockFileSystemError('File not found');
+        if (!entry || entry.type !== 1) throw new MockFileSystemError('File not found', 'FileNotFound');
         return new TextEncoder().encode(entry.content ?? '');
     },
     async stat(uri: MockUri | string): Promise<{ type: number }> {
         const entry = mockFileEntries.get(mockUriKey(uri));
-        if (!entry) throw new MockFileSystemError('File not found');
+        if (!entry) throw new MockFileSystemError('File not found', 'FileNotFound');
         return { type: entry.type };
     },
     async readDirectory(uri: MockUri | string): Promise<Array<[string, number]>> {
         const directoryPath = mockUriKey(uri);
         const directory = mockFileEntries.get(directoryPath);
-        if (!directory || directory.type !== 2) throw new MockFileSystemError('Directory not found');
+        if (!directory || directory.type !== 2) {
+            throw new MockFileSystemError('Directory not found', 'FileNotFound');
+        }
         const children: Array<[string, number]> = [];
         for (const [entryPath, entry] of mockFileEntries) {
             if (entryPath !== directoryPath && path.win32.dirname(entryPath) === directoryPath) {
@@ -262,7 +274,9 @@ class MockEventEmitter {
 }
 
 class MockFileSystemError extends Error {
-    code?: string;
+    constructor(message: string, readonly code?: string) {
+        super(message);
+    }
 }
 
 Module._load = function (request: string, parent: unknown, isMain: boolean): unknown {
@@ -332,6 +346,30 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
 };
 
 async function run(): Promise<void> {
+    const syncAuthorizationTarget = {
+        workspaceUri: 'file:///trusted-workspace',
+        serverUrl: 'https://overleaf.example',
+        projectId: 'project-a',
+    };
+    const approvedTargets = approveSyncTarget(undefined, syncAuthorizationTarget);
+    assert.equal(isSyncTargetApproved(approvedTargets, syncAuthorizationTarget), true);
+    assert.equal(isSyncTargetApproved(approvedTargets, {
+        ...syncAuthorizationTarget,
+        projectId: 'project-b',
+    }), false, 'changing the project must invalidate prior synchronization consent');
+    assert.equal(isSyncTargetApproved(approvedTargets, {
+        ...syncAuthorizationTarget,
+        serverUrl: 'https://different-overleaf.example',
+    }), false, 'changing the server must invalidate prior synchronization consent');
+    assert.equal(isSyncTargetApproved(approvedTargets, {
+        ...syncAuthorizationTarget,
+        workspaceUri: 'file:///other-workspace',
+    }), false, 'synchronization consent must remain scoped to one workspace');
+    assert.match(createSyncTargetFingerprint(syncAuthorizationTarget), /^[0-9a-f]{64}$/);
+    assert.deepStrictEqual(revokeSyncTarget(approvedTargets, syncAuthorizationTarget.workspaceUri), []);
+    assert.equal(isSyncTargetApproved([{ workspaceUri: 1, fingerprint: 'unsafe' }], syncAuthorizationTarget), false,
+        'corrupt workspace authorization state must fail closed');
+
     const latexCleanup = removeStandaloneLatexComments([
         '% remove this\r\n',
         'Text % keep inline\r\n',
@@ -375,8 +413,12 @@ async function run(): Promise<void> {
             registerHandlers(handlers: {
                 onConnected?: (publicId: string) => void;
                 onFileRenamed?: (entityId: string, newName: string) => void;
+                onFileChanged?: (update: unknown) => void;
+                onUserCursorUpdated?: (update: unknown) => void;
             }): void;
             joinProject(): Promise<unknown>;
+            joinDoc(docId: string): Promise<{ lines: string[]; version: number }>;
+            getConnectedUsers(): Promise<unknown[]>;
             disconnect(): void;
         };
     };
@@ -394,6 +436,7 @@ async function run(): Promise<void> {
             ): Promise<unknown>;
             addDoc(projectId: string, folderId: string, filename: string): Promise<unknown>;
             getFile(projectId: string, fileId: string): Promise<unknown>;
+            getDocContent(projectId: string, docId: string): Promise<unknown>;
         };
     };
     const { SyncEngine } = require(path.join('..', 'sync', 'syncEngine')) as {
@@ -446,6 +489,8 @@ async function run(): Promise<void> {
     const negotiatedQueries: Array<string | undefined> = [];
     const negotiatedSockets: FakeSocket[] = [];
     let renamedEvent: [string, string] | undefined;
+    let documentUpdateCount = 0;
+    let cursorUpdateCount = 0;
     const negotiationApi = {
         initSocket: (_identity: unknown, query?: string) => {
             negotiatedQueries.push(query);
@@ -476,6 +521,8 @@ async function run(): Promise<void> {
     );
     negotiatedClient.registerHandlers({
         onFileRenamed: (entityId, newName) => { renamedEvent = [entityId, newName]; },
+        onFileChanged: () => { documentUpdateCount++; },
+        onUserCursorUpdated: () => { cursorUpdateCount++; },
     });
     assert.deepStrictEqual(await negotiatedClient.joinProject(), queryProject);
     assert.equal(negotiatedQueries.length, 2);
@@ -484,7 +531,77 @@ async function run(): Promise<void> {
     negotiatedSockets[1].trigger('reciveEntityRename', 'doc-id', 'renamed.tex');
     assert.deepStrictEqual(renamedEvent, ['doc-id', 'renamed.tex'],
         'event handlers must survive Socket.IO protocol negotiation');
+    negotiatedSockets[1].trigger('otUpdateApplied', { doc: 'doc-id', v: 1, op: [{ p: 0, i: 'x' }] });
+    negotiatedSockets[1].trigger('otUpdateApplied', { doc: 'doc-id', v: 1, op: [null] });
+    assert.equal(documentUpdateCount, 1, 'malformed OT events must be discarded at the socket boundary');
+    negotiatedSockets[1].trigger('clientTracking.clientUpdated', {
+        id: 'client-id',
+        user_id: 'user-id',
+        name: 'Collaborator',
+        email: 'collaborator@example.com',
+        doc_id: 'doc-id',
+        row: 1,
+        column: 2,
+    });
+    negotiatedSockets[1].trigger('clientTracking.clientUpdated', null);
+    assert.equal(cursorUpdateCount, 1, 'malformed presence events must be discarded at the socket boundary');
     negotiatedClient.disconnect();
+
+    let joinDocResponse: unknown[] = [['server text'], 4];
+    let connectedUsersResponse: unknown = [{
+        client_id: 'client-id',
+        user_id: 'user-id',
+        first_name: 'Safe',
+        last_name: 'User',
+        email: 'safe@example.com',
+        cursorData: { doc_id: 'doc-id', row: 3, column: 5 },
+        last_updated_at: '1234',
+    }, null];
+    const boundarySocket = new FakeSocket((event, args) => {
+        const callback = args.at(-1) as (...callbackArgs: unknown[]) => void;
+        if (event === 'joinDoc') callback(null, ...joinDocResponse);
+        if (event === 'clientTracking.getConnectedUsers') callback(null, connectedUsersResponse);
+    });
+    const boundaryClient = new SocketIOAPI({
+        initSocket: () => boundarySocket,
+    }, { cookies: 'cookie', csrfToken: 'csrf' }, 'project');
+    assert.deepStrictEqual(
+        await boundaryClient.joinDoc('doc-id'),
+        { lines: ['server text'], version: 4 },
+    );
+    joinDocResponse = [['valid line', 123], 4];
+    await assert.rejects(
+        () => boundaryClient.joinDoc('doc-id'),
+        /invalid Socket\.IO document content/,
+        'non-string document lines must be rejected before decoding',
+    );
+    joinDocResponse = [['server text'], -1];
+    await assert.rejects(
+        () => boundaryClient.joinDoc('doc-id'),
+        /invalid document version/,
+    );
+    assert.deepStrictEqual(await boundaryClient.getConnectedUsers(), [{
+        clientId: 'client-id',
+        userId: 'user-id',
+        name: 'Safe User',
+        email: 'safe@example.com',
+        docId: 'doc-id',
+        row: 3,
+        column: 5,
+        lastUpdated: 1234,
+    }], 'malformed connected-user records must be ignored');
+    connectedUsersResponse = {};
+    await assert.rejects(
+        () => boundaryClient.getConnectedUsers(),
+        /invalid connected-user list/,
+    );
+    boundaryClient.disconnect();
+
+    assert.throws(
+        () => validateRemoteDocumentLines(new Array(MAX_REMOTE_DOCUMENT_LINES + 1).fill('')),
+        /oversized document content/,
+        'document line counts must be bounded even when every line is empty',
+    );
 
     const api = new BaseAPI('https://overleaf.example/');
     api.setIdentity({ cookies: 'cookie', csrfToken: 'csrf' });
@@ -527,6 +644,28 @@ async function run(): Promise<void> {
     await assert.rejects(
         () => (api as any).deleteEntity('project', '../../logout', 'entity'),
         /entity type/,
+    );
+
+    fetchResponse = {
+        ok: true,
+        status: 200,
+        json: async () => ({ lines: ['safe', 'document'] }),
+        text: async () => '',
+    };
+    assert.deepStrictEqual(
+        await api.getDocContent('project', 'doc-id'),
+        { type: 'success', lines: ['safe', 'document'] },
+    );
+    fetchResponse = {
+        ok: true,
+        status: 200,
+        json: async () => ({ lines: ['safe', 123] }),
+        text: async () => '',
+    };
+    assert.deepStrictEqual(
+        await api.getDocContent('project', 'doc-id'),
+        { type: 'error', message: 'Overleaf returned invalid document content.' },
+        'HTTP document responses must use the same validation as Socket.IO',
     );
 
     const rangeHeaders: Array<string | undefined> = [];
@@ -1005,6 +1144,84 @@ async function run(): Promise<void> {
         'typing that occurs while the conflict prompt is open must never be overwritten');
     assert.equal(mockFileWrites.length, 0);
 
+    const createDirtyFullPull = (
+        resolveConflict: (document: MockTextDocument) => Promise<'useRemote' | 'useLocal' | 'skip'>,
+    ) => {
+        const workspaceUri = mockFileUri('D:\\dirty-pull-workspace');
+        const uri = mockFileUri('D:\\dirty-pull-workspace\\chapter.tex');
+        resetMockWorkspace([workspaceUri], [
+            ['D:\\dirty-pull-workspace', { type: 2 }],
+            ['D:\\dirty-pull-workspace\\chapter.tex', { type: 1, content: 'server' }],
+        ]);
+        const document = createMockTextDocument(uri, 'local edit');
+        mockTextDocuments = [document];
+        const entry = { id: 'doc', type: 'doc', name: 'chapter.tex', path: '/chapter.tex' };
+
+        const engine = Object.create(SyncEngine.prototype) as any;
+        engine.disposed = false;
+        engine.project = { name: 'Test project', rootFolder: [] };
+        engine.socket = {
+            joinDoc: async () => ({ lines: ['server!'], version: 2 }),
+            leaveDoc: async () => undefined,
+        };
+        engine.fileTree = new Map([[entry.id, entry]]);
+        engine.fileTreeByPath = new Map([[entry.path, entry]]);
+        engine.baseContent = new Map([[entry.path, new TextEncoder().encode('server')]]);
+        engine.fileCache = new Map();
+        engine.settings = {
+            getFilePath: () => uri,
+            getSettings: () => ({ projectId: 'project' }),
+            getWorkspaceFolder: () => workspaceUri,
+            updateLastSynced: async () => undefined,
+        };
+        engine.shouldSync = () => true;
+        engine.assertNoSymbolicLinks = async () => undefined;
+        engine.askConflictResolution = async () => resolveConflict(document);
+        engine.setStatus = () => undefined;
+        engine.logFn = () => undefined;
+
+        return { engine, document };
+    };
+
+    const acceptedDirtyPull = createDirtyFullPull(async () => 'useRemote');
+    await acceptedDirtyPull.engine.pullAll();
+    assert.equal(acceptedDirtyPull.document.getText(), 'server!');
+    assert.equal(mockAppliedWorkspaceEdits.length, 1,
+        'a full pull must apply accepted remote text to a dirty editor through one workspace edit');
+    assert.equal(mockFileWrites.length, 0,
+        'a full pull must not write behind a dirty editor through the filesystem');
+
+    const keptDirtyPull = createDirtyFullPull(async () => 'useLocal');
+    let fullPullPushedContent: string | undefined;
+    keptDirtyPull.engine.pushDocumentChanges = async (
+        _docId: string,
+        _path: string,
+        content: Uint8Array,
+    ) => {
+        fullPullPushedContent = new TextDecoder().decode(content);
+        return true;
+    };
+    await keptDirtyPull.engine.pullAll();
+    assert.equal(fullPullPushedContent, 'local edit',
+        'Keep Local during a full pull must use the unsaved editor buffer');
+    assert.equal(mockAppliedWorkspaceEdits.length, 0);
+    assert.equal(mockFileWrites.length, 0);
+
+    const changedDuringFullPullPrompt = createDirtyFullPull(async document => {
+        document.applyText('newer typing');
+        return 'useRemote';
+    });
+    await changedDuringFullPullPrompt.engine.pullAll();
+    assert.equal(changedDuringFullPullPrompt.document.getText(), 'newer typing');
+    assert.equal(mockAppliedWorkspaceEdits.length, 0,
+        'a full pull must preserve typing performed while its conflict prompt is open');
+    assert.equal(mockFileWrites.length, 0);
+    assert.equal(
+        new TextDecoder().decode(changedDuringFullPullPrompt.engine.baseContent.get('/chapter.tex')),
+        'server!',
+        'the remote base must advance when a full pull preserves newer editor text',
+    );
+
     const protectedPaths = Object.create(SyncEngine.prototype) as any;
     protectedPaths.ignoreParser = { shouldIgnore: () => false };
     assert.equal(protectedPaths.shouldSync('/.git/config'), false);
@@ -1323,6 +1540,20 @@ async function run(): Promise<void> {
         'cookie refresh must use the same URL and HTTP safety policy as login');
     assert.match(extensionSource, /handleWorkspaceFoldersChanged[\s\S]*disposeCurrentSyncSession\(\)[\s\S]*initializeSync/,
         'workspace-folder changes must replace the active synchronization session');
+    const initializeSyncStart = extensionSource.indexOf('async function initializeSync');
+    const initializeSyncEnd = extensionSource.indexOf('/**\n * Update status bar', initializeSyncStart);
+    const initializeSyncSource = extensionSource.slice(initializeSyncStart, initializeSyncEnd);
+    assert.ok(
+        initializeSyncSource.indexOf('await ensureSyncAuthorization')
+            < initializeSyncSource.indexOf('new BaseAPI'),
+        'an existing .localleaf file must require explicit target approval before any sync API is created',
+    );
+    assert.match(extensionSource, /settingsManager\.save\(settings\)[\s\S]*grantSyncAuthorization/,
+        'an explicit project-link workflow must record synchronization consent');
+    assert.match(extensionSource, /revokeSyncAuthorization[\s\S]*settingsManager\.delete\(\)/,
+        'unlinking must revoke the folder-specific synchronization consent');
+    assert.equal(extensionSource.match(/new SyncEngine/g)?.length, 1,
+        'all connection and reconnection paths must pass through the authorized initializer');
 
     const projectsSource = fs.readFileSync(
         path.join(__dirname, '..', '..', 'src', 'views', 'projectsWebviewProvider.ts'),
