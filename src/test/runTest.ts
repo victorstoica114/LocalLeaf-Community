@@ -605,6 +605,8 @@ async function run(): Promise<void> {
             getIdentity(): { cookies: string; csrfToken: string } | undefined;
             dispose(): void;
             passportLogin(email: string, password: string): Promise<unknown>;
+            getProjects(): Promise<unknown>;
+            getProjectDetails(projectId: string): Promise<unknown>;
             uploadFile(
                 projectId: string,
                 folderId: string,
@@ -812,6 +814,33 @@ async function run(): Promise<void> {
         await api.passportLogin('safe@example.com', 'x'.repeat(65_537)),
         { type: 'error', message: 'The Overleaf login password is invalid.' },
     );
+    await assert.rejects(
+        () => api.getDocContent('project\r\nInjected: true', 'doc-id'),
+        /Invalid Overleaf project ID/,
+        'opaque route IDs must reject HTTP control characters before request construction',
+    );
+    fetchResponse = {
+        ok: true,
+        status: 200,
+        json: async () => ({ projects: new Array(100_001).fill(null) }),
+        text: async () => '',
+    };
+    assert.deepStrictEqual(
+        await api.getProjects(),
+        { type: 'error', message: 'Overleaf returned an invalid project list.' },
+        'project-list cardinality must be bounded before iteration',
+    );
+    fetchResponse = {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        text: async () => '<meta name="ol-project_id" content="different-project">',
+    };
+    assert.deepStrictEqual(
+        await api.getProjectDetails('expected-project'),
+        { type: 'error', message: 'Overleaf returned metadata for a different project.' },
+        'HTTP fallback metadata must not switch the requested project identity',
+    );
     fetchResponse = {
         ok: true,
         status: 200,
@@ -833,6 +862,21 @@ async function run(): Promise<void> {
         _type: 'file',
         name: 'figure.pdf',
     });
+    fetchResponse = {
+        ok: true,
+        status: 200,
+        json: async () => ({ entity_id: 'binary-id\r\nInjected: true' }),
+        text: async () => '',
+    };
+    const invalidUploadIdentity = await api.uploadFile(
+        'project',
+        'folder',
+        'figure.pdf',
+        Uint8Array.from([1, 2, 3]),
+    ) as { type: string; file?: unknown };
+    assert.equal(invalidUploadIdentity.type, 'success');
+    assert.equal(invalidUploadIdentity.file, undefined,
+        'malformed uploaded entity IDs must be discarded at the HTTP boundary');
     assert.deepStrictEqual(
         await api.uploadFile(
             'project',

@@ -23,6 +23,7 @@ const MAX_AUTH_HEADER_CHARACTERS = 65_536;
 const MAX_LOGIN_EMAIL_CHARACTERS = 4096;
 const MAX_LOGIN_PASSWORD_CHARACTERS = 65_536;
 const MAX_LOGIN_MESSAGE_CHARACTERS = 4096;
+const MAX_PROJECT_LIST_ITEMS = 100_000;
 
 type JsonObject = Record<string, unknown>;
 
@@ -30,10 +31,6 @@ function asJsonObject(value: unknown): JsonObject | undefined {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
         ? value as JsonObject
         : undefined;
-}
-
-function nonEmptyString(value: unknown): string | undefined {
-    return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 function boundedMessage(value: unknown): string | undefined {
@@ -70,10 +67,28 @@ function validatedIdentity(value: unknown, allowEmptyCookies: boolean = false): 
 }
 
 function routeSegment(value: string, label: string): string {
-    if (typeof value !== 'string' || value.length === 0 || value.length > 1024 || value.includes('\0')) {
-        throw new Error(`Invalid Overleaf ${label}.`);
+    return encodeURIComponent(validateOverleafId(value, label));
+}
+
+function firstValidOverleafId(label: string, ...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (value === undefined || value === null) continue;
+        try {
+            return validateOverleafId(value, label);
+        } catch {
+            // Some Overleaf versions expose the same ID under a different key.
+        }
     }
-    return encodeURIComponent(value);
+    return undefined;
+}
+
+function boundedMetadata(value: unknown, maximumLength: number): string | undefined {
+    return typeof value === 'string'
+        && value.length > 0
+        && value.length <= maximumLength
+        && !/[\r\n\0]/.test(value)
+        ? value
+        : undefined;
 }
 
 function entityRouteSegment(entityType: string): string {
@@ -613,29 +628,26 @@ export class BaseAPI {
 
         if (res.status === 200) {
             const data = asJsonObject(await res.json());
-            if (!Array.isArray(data?.projects)) {
+            if (
+                !Array.isArray(data?.projects)
+                || data.projects.length > MAX_PROJECT_LIST_ITEMS
+            ) {
                 return { type: 'error', message: 'Overleaf returned an invalid project list.' };
             }
             const projects: ProjectInfo[] = data.projects.flatMap((value: unknown) => {
                 const p = asJsonObject(value);
-                if (
-                    !p
-                    || typeof p._id !== 'string'
-                    || p._id.length === 0
-                    || p._id.length > 1024
-                    || typeof p.name !== 'string'
-                    || p.name.length === 0
-                    || p.name.length > 4096
-                ) return [];
+                const id = firstValidOverleafId('project ID', p?._id);
+                const name = boundedMetadata(p?.name, 4096);
+                if (!p || !id || !name) return [];
                 const accessLevel: ProjectInfo['accessLevel'] = p.accessLevel === 'owner'
                     || p.accessLevel === 'collaborator'
                     || p.accessLevel === 'readOnly'
                     ? p.accessLevel
                     : 'readOnly';
                 return [{
-                    id: p._id,
-                    name: p.name,
-                    lastUpdated: typeof p.lastUpdated === 'string' ? p.lastUpdated : undefined,
+                    id,
+                    name,
+                    lastUpdated: boundedMetadata(p.lastUpdated, 128),
                     accessLevel,
                     archived: Boolean(p.archived),
                     trashed: Boolean(p.trashed),
@@ -722,9 +734,12 @@ export class BaseAPI {
             const rawEntity = asJsonObject(uploadObject?.file)
                 || asJsonObject(uploadObject?.entity)
                 || uploadObject;
-            const entityId = nonEmptyString(rawEntity?._id)
-                || nonEmptyString(rawEntity?.id)
-                || nonEmptyString(uploadObject?.entity_id);
+            const entityId = firstValidOverleafId(
+                'uploaded entity ID',
+                rawEntity?._id,
+                rawEntity?.id,
+                uploadObject?.entity_id,
+            );
             const file: FileEntity | undefined = entityId
                 ? {
                     _id: entityId,
@@ -748,6 +763,7 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
+        validateOverleafId(parentFolderId, 'parent folder ID');
         validateProjectEntityName(filename);
         const res = await this.fetchRoute(`project/${routeSegment(projectId, 'project ID')}/doc`, {
             method: 'POST',
@@ -769,7 +785,7 @@ export class BaseAPI {
             try {
                 const data = asJsonObject(await res.json());
                 const rawDoc = asJsonObject(data?.doc) || data;
-                const docId = nonEmptyString(rawDoc?._id) || nonEmptyString(rawDoc?.id);
+                const docId = firstValidOverleafId('document ID', rawDoc?._id, rawDoc?.id);
                 if (docId) {
                     doc = {
                         _id: docId,
@@ -795,6 +811,7 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
+        validateOverleafId(parentFolderId, 'parent folder ID');
         validateProjectEntityName(folderName);
         const res = await this.fetchRoute(`project/${routeSegment(projectId, 'project ID')}/folder`, {
             method: 'POST',
@@ -814,7 +831,7 @@ export class BaseAPI {
         if (res.ok) {
             // Parse response to get folder entity with _id
             const data = asJsonObject(await res.json());
-            const folderId = nonEmptyString(data?._id) || nonEmptyString(data?.id);
+            const folderId = firstValidOverleafId('folder ID', data?._id, data?.id);
             const folder: FileEntity | undefined = folderId
                 ? {
                     _id: folderId,
@@ -886,6 +903,7 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
+        validateOverleafId(newParentFolderId, 'parent folder ID');
         const res = await this.fetchRoute(
             `project/${routeSegment(projectId, 'project ID')}/${entityRouteSegment(entityType)}/${routeSegment(entityId, 'entity ID')}/move`, {
             method: 'POST',
@@ -917,8 +935,10 @@ export class BaseAPI {
             return { type: 'error', message: 'Not authenticated' };
         }
 
+        const requestedProjectId = validateOverleafId(projectId, 'project ID');
+
         // Get project page which contains metadata in HTML
-        const res = await this.fetchRoute(`project/${routeSegment(projectId, 'project ID')}`, {
+        const res = await this.fetchRoute(`project/${routeSegment(requestedProjectId, 'project ID')}`, {
             method: 'GET',
             headers: {
                 'Connection': 'keep-alive',
@@ -948,13 +968,35 @@ export class BaseAPI {
             };
 
             const rootFolder = extractJsonMeta('ol-rootFolder');
+            const responseProjectId = extractMeta('ol-project_id');
+            let validatedProjectId: string;
+            try {
+                validatedProjectId = responseProjectId === undefined
+                    ? requestedProjectId
+                    : validateOverleafId(responseProjectId, 'project ID');
+            } catch {
+                return { type: 'error', message: 'Overleaf returned invalid project metadata.' };
+            }
+            if (validatedProjectId !== requestedProjectId) {
+                return { type: 'error', message: 'Overleaf returned metadata for a different project.' };
+            }
+
+            const rawRootDocId = extractMeta('ol-rootDoc_id');
+            const rootDocId = rawRootDocId
+                ? firstValidOverleafId('root document ID', rawRootDocId)
+                : undefined;
+            const rawUserId = extractMeta('ol-user_id');
+            const userId = rawUserId ? firstValidOverleafId('user ID', rawUserId) : undefined;
+            if ((rawRootDocId && !rootDocId) || (rawUserId && !userId)) {
+                return { type: 'error', message: 'Overleaf returned invalid project metadata.' };
+            }
             const projectData: ProjectDetails = {
-                projectId: extractMeta('ol-project_id') || projectId,
-                projectName: extractMeta('ol-projectName'),
-                rootDocId: extractMeta('ol-rootDoc_id'),
-                userId: extractMeta('ol-user_id'),
-                userEmail: extractMeta('ol-usersEmail'),
-                compiler: extractMeta('ol-compiler'),
+                projectId: validatedProjectId,
+                projectName: boundedMetadata(extractMeta('ol-projectName'), 4096),
+                rootDocId,
+                userId,
+                userEmail: boundedMetadata(extractMeta('ol-usersEmail'), MAX_LOGIN_EMAIL_CHARACTERS),
+                compiler: boundedMetadata(extractMeta('ol-compiler'), 255),
                 rootFolder: Array.isArray(rootFolder) ? rootFolder as FolderEntity[] : undefined,
             };
 
