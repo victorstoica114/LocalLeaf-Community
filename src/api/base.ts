@@ -10,11 +10,19 @@ import type { RequestInit, Response } from 'node-fetch';
 import { Identity } from '../utils/credentialManager';
 import { validateServerUrl } from '../utils/serverUrl';
 import { validateProjectEntityName } from '../utils/pathSafety';
-import { MAX_REMOTE_FILE_BYTES, validateRemoteDocumentLines } from '../utils/remoteValidation';
+import {
+    MAX_REMOTE_FILE_BYTES,
+    validateOverleafId,
+    validateRemoteDocumentLines,
+} from '../utils/remoteValidation';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MAX_PARTIAL_DOWNLOADS = 10_000;
+const MAX_AUTH_HEADER_CHARACTERS = 65_536;
+const MAX_LOGIN_EMAIL_CHARACTERS = 4096;
+const MAX_LOGIN_PASSWORD_CHARACTERS = 65_536;
+const MAX_LOGIN_MESSAGE_CHARACTERS = 4096;
 
 type JsonObject = Record<string, unknown>;
 
@@ -26,6 +34,39 @@ function asJsonObject(value: unknown): JsonObject | undefined {
 
 function nonEmptyString(value: unknown): string | undefined {
     return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function boundedMessage(value: unknown): string | undefined {
+    return typeof value === 'string' && value.length > 0
+        ? value.slice(0, MAX_LOGIN_MESSAGE_CHARACTERS)
+        : undefined;
+}
+
+function validateAuthHeader(
+    value: unknown,
+    label: string,
+    allowEmpty: boolean = false,
+): string {
+    if (
+        typeof value !== 'string'
+        || (!allowEmpty && value.length === 0)
+        || value.length > MAX_AUTH_HEADER_CHARACTERS
+        || /[\r\n\0]/.test(value)
+    ) {
+        throw new Error(`Invalid Overleaf ${label}.`);
+    }
+    return value;
+}
+
+function validatedIdentity(value: unknown, allowEmptyCookies: boolean = false): Identity {
+    if (!value || typeof value !== 'object') {
+        throw new Error('Invalid Overleaf identity.');
+    }
+    const candidate = value as Partial<Identity>;
+    return {
+        csrfToken: validateAuthHeader(candidate.csrfToken, 'CSRF token'),
+        cookies: validateAuthHeader(candidate.cookies, 'cookie header', allowEmptyCookies),
+    };
 }
 
 function routeSegment(value: string, label: string): string {
@@ -208,7 +249,11 @@ export class BaseAPI {
 
     private getResponseCookies(response: Response): string {
         const setCookieHeaders = response.headers.raw()['set-cookie'] || [];
-        return mergeCookieHeaders(...setCookieHeaders.map(header => header.split(';', 1)[0]));
+        return validateAuthHeader(
+            mergeCookieHeaders(...setCookieHeaders.map(header => header.split(';', 1)[0])),
+            'cookie header',
+            true,
+        );
     }
 
     /** Abort all active requests and remove the in-memory identity. */
@@ -235,7 +280,7 @@ export class BaseAPI {
         if (!match) {
             throw new Error('Failed to get CSRF token.');
         }
-        const csrfToken = match[1];
+        const csrfToken = validateAuthHeader(match[1], 'CSRF token');
         const cookies = this.getResponseCookies(res);
         return { csrfToken, cookies };
     }
@@ -258,10 +303,25 @@ export class BaseAPI {
         const csrfTokenMatch = body.match(/<meta\s+name="ol-csrfToken"\s+content="([^"]*)"/);
 
         if (userIDMatch && csrfTokenMatch) {
+            let userId: string;
+            let csrfToken: string;
+            try {
+                userId = validateOverleafId(userIDMatch[1], 'user ID');
+                csrfToken = validateAuthHeader(csrfTokenMatch[1], 'CSRF token');
+            } catch {
+                return undefined;
+            }
+            const userEmail = userEmailMatch?.[1];
+            if (
+                userEmail !== undefined
+                && (userEmail.length > MAX_LOGIN_EMAIL_CHARACTERS || /[\r\n\0]/.test(userEmail))
+            ) {
+                return undefined;
+            }
             return {
-                userId: userIDMatch[1],
-                userEmail: userEmailMatch ? userEmailMatch[1] : '',
-                csrfToken: csrfTokenMatch[1],
+                userId,
+                userEmail: userEmail ?? '',
+                csrfToken,
             };
         }
         return undefined;
@@ -271,19 +331,20 @@ export class BaseAPI {
      * Update cookies with socket.io session
      */
     async updateCookies(identity: Identity): Promise<Identity> {
+        const currentIdentity = validatedIdentity(identity);
         const res = await this.fetchRoute('socket.io/socket.io.js', {
             method: 'GET',
             headers: {
                 'Connection': 'keep-alive',
-                'Cookie': identity.cookies,
+                'Cookie': currentIdentity.cookies,
             }
         });
         const cookies = this.getResponseCookies(res);
-        if (cookies) {
-            identity.cookies = mergeCookieHeaders(identity.cookies, cookies);
-        }
         this.discardResponseBody(res);
-        return identity;
+        return validatedIdentity({
+            ...currentIdentity,
+            cookies: mergeCookieHeaders(currentIdentity.cookies, cookies),
+        });
     }
 
     /**
@@ -318,6 +379,22 @@ export class BaseAPI {
      * Login with email and password (not available for www.overleaf.com due to SSO/captcha)
      */
     async passportLogin(email: string, password: string): Promise<ResponseSchema> {
+        if (
+            typeof email !== 'string'
+            || email.length === 0
+            || email.length > MAX_LOGIN_EMAIL_CHARACTERS
+            || /[\r\n\0]/.test(email)
+        ) {
+            return { type: 'error', message: 'The Overleaf login email is invalid.' };
+        }
+        if (
+            typeof password !== 'string'
+            || password.length === 0
+            || password.length > MAX_LOGIN_PASSWORD_CHARACTERS
+        ) {
+            return { type: 'error', message: 'The Overleaf login password is invalid.' };
+        }
+
         const identity = await this.getCsrfToken();
         const res = await this.fetchRoute('login', {
             method: 'POST',
@@ -334,21 +411,24 @@ export class BaseAPI {
 
         if (res.status === 302) {
             const text = await res.text();
-            const redirect = text.match(/Found. Redirecting to (.*)/)?.[1];
+            const redirect = boundedMessage(text.match(/Found. Redirecting to (.*)/)?.[1]);
             if (redirect === '/project') {
                 const newCookies = mergeCookieHeaders(identity.cookies, this.getResponseCookies(res));
                 if (!newCookies) return { type: 'error', message: 'Login returned no session cookie.' };
                 return this.cookiesLogin(newCookies);
             }
-            return { type: 'error', message: `Redirecting to ${redirect}` };
+            return {
+                type: 'error',
+                message: redirect ? `Redirecting to ${redirect}` : 'Login returned an invalid redirect.',
+            };
         } else if (res.status === 200) {
             const json = asJsonObject(await res.json());
             const message = asJsonObject(json?.message);
-            return { type: 'error', message: nonEmptyString(message?.message) || 'Login failed' };
+            return { type: 'error', message: boundedMessage(message?.message) || 'Login failed' };
         } else if (res.status === 401) {
             const json = asJsonObject(await res.json());
             const message = asJsonObject(json?.message);
-            return { type: 'error', message: nonEmptyString(message?.text) || 'Unauthorized' };
+            return { type: 'error', message: boundedMessage(message?.text) || 'Unauthorized' };
         }
         return this.responseError(res);
     }
@@ -357,7 +437,7 @@ export class BaseAPI {
      * Set identity for authenticated requests
      */
     setIdentity(identity: Identity): this {
-        this.identity = identity;
+        this.identity = validatedIdentity(identity);
         return this;
     }
 
@@ -365,7 +445,7 @@ export class BaseAPI {
      * Get current identity
      */
     getIdentity(): Identity | undefined {
-        return this.identity;
+        return this.identity ? { ...this.identity } : undefined;
     }
 
     /**
@@ -373,6 +453,7 @@ export class BaseAPI {
      * Reference: Overleaf-Workshop base.ts _initSocketV0
      */
     initSocket(identity: Identity, query?: string): SocketIOClient.Socket {
+        const safeIdentity = validatedIdentity(identity);
         const socketUrl = new URL(this.url).origin + (query ?? '');
 
         const io: SocketIOClientStatic = require('socket.io-client');
@@ -385,7 +466,7 @@ export class BaseAPI {
             'force new connection': true,
             extraHeaders: {
                 'Origin': new URL(this.url).origin,
-                'Cookie': identity.cookies,
+                'Cookie': safeIdentity.cookies,
             },
         };
         const socket = io.connect(socketUrl, options);

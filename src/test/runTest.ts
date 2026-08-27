@@ -602,7 +602,9 @@ async function run(): Promise<void> {
     const { BaseAPI } = require(path.join('..', 'api', 'base')) as {
         BaseAPI: new (url: string) => {
             setIdentity(identity: unknown): void;
+            getIdentity(): { cookies: string; csrfToken: string } | undefined;
             dispose(): void;
+            passportLogin(email: string, password: string): Promise<unknown>;
             uploadFile(
                 projectId: string,
                 folderId: string,
@@ -792,7 +794,24 @@ async function run(): Promise<void> {
     );
 
     const api = new BaseAPI('https://overleaf.example/');
-    api.setIdentity({ cookies: 'cookie', csrfToken: 'csrf' });
+    assert.throws(
+        () => api.setIdentity({ cookies: 'cookie\r\nInjected: true', csrfToken: 'csrf' }),
+        /Invalid Overleaf cookie header/,
+        'programmatically supplied identities must not inject HTTP headers',
+    );
+    const sourceIdentity = { cookies: 'cookie', csrfToken: 'csrf' };
+    api.setIdentity(sourceIdentity);
+    sourceIdentity.cookies = 'mutated';
+    assert.equal(api.getIdentity()?.cookies, 'cookie',
+        'the API must retain a defensive copy of authentication secrets');
+    assert.deepStrictEqual(
+        await api.passportLogin('x'.repeat(4097), 'password'),
+        { type: 'error', message: 'The Overleaf login email is invalid.' },
+    );
+    assert.deepStrictEqual(
+        await api.passportLogin('safe@example.com', 'x'.repeat(65_537)),
+        { type: 'error', message: 'The Overleaf login password is invalid.' },
+    );
     fetchResponse = {
         ok: true,
         status: 200,
