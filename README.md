@@ -71,19 +71,20 @@ Contributions are welcome, whether they are code, documentation, bug reports, or
 | `LocalLeaf: Set Main Document` | Selects the primary `.tex` document |
 | `LocalLeaf: Configure Settings` | Opens the extension settings |
 | `LocalLeaf: Jump to Collaborator` | Opens a collaborator's current document and position |
+| `LocalLeaf: Remove Standalone LaTeX Comments` | Previews and removes full-line comments with confirmation and Undo support |
 
 ## Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `localleaf.defaultServer` | `https://www.overleaf.com` | Overleaf or self-hosted server URL |
-| `localleaf.autoSync` | `true` | Synchronize automatically when local files change |
+| `localleaf.autoSync` | `true` | Upload local filesystem changes automatically; remote collaboration remains connected when disabled |
 
 ## The people behind the project
 
 LocalLeaf was started by **Teddy van Jerry (Wuqiong Zhao)**, who designed and built the original extension and maintained its first releases. **Xingyu Chen (Asixa / RFDT)** later contributed a substantial 34-commit proposal for a broader interface, synchronization workflow, local compilation, PDF tooling, and Source Control integration in PR #3. **Victor Stoica** integrated and hardened parts of that work, fixed synchronization and security issues, and now maintains this continuation.
 
-The full story, including links and a more precise account of the work, is in [ATTRIBUTION.md](ATTRIBUTION.md). The original commit history is preserved, and Asixa's original PR history is kept in the `archive/asixa-pr-3` branch and connected to the default branch for authorship visibility.
+The full story is in [ATTRIBUTION.md](ATTRIBUTION.md), and the commit-by-commit review is in [docs/CONTRIBUTOR_INTEGRATION.md](docs/CONTRIBUTOR_INTEGRATION.md). The original commit history is preserved, and Asixa's original PR history is kept in the `archive/asixa-pr-3` branch and connected to the default branch for authorship visibility.
 
 ## Related projects
 

@@ -8,11 +8,18 @@ All notable changes to LocalLeaf Community will be documented in this file.
 
 - Connected Asixa's preserved PR #3 history to the default branch, documented both original author names, Xingyu Chen and RFDT, and added a mailmap entry that groups them under Xingyu Chen
 - Excluded this development checkout's LocalLeaf link metadata from Git and VSIX packages
+- Added a public contributor-integration audit covering every upstream pull request and all 34 commits in Asixa's PR #3
+- Reimplemented the safe parts of Asixa's comment-removal and editor-recovery work with explicit confirmation, bounded input, and undoable VS Code edits
 
 ### Fixed
 
 - Added automatic negotiation between legacy and query-based Overleaf Socket.IO project joins, restoring real-time synchronization with current self-hosted Community Edition servers
 - Preserved synchronization event handlers when switching Socket.IO protocols and surfaced the real-time connection cause when HTTP fallback is also unavailable
+- Preserved dirty editor buffers during remote content, rename, move, delete, and full-pull operations
+- Kept live document subscriptions active after manual pulls and surfaced document-watch failures instead of silently reporting success
+- Added per-workspace synchronization authorization and strengthened remote path, entity, OT, collaborator, webview-message, and account-cookie validation
+- Bounded pending remote events, OT payload memory, remote project trees, and recursive local project scans
+- Made `localleaf.autoSync` and the linked-project `autoSync` flag actually disable watcher-triggered local uploads
 
 ## [0.2.1] - 2026-08-23
 

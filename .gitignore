@@ -25,9 +25,6 @@ Thumbs.db
 *.log
 npm-debug.log*
 
-# Claude Code
-CLAUDE.local.md
-
 # Local integration planning
 LOCAL_GUI_INTEGRATION_CHECKLIST.md
 local-pr3-artifacts/

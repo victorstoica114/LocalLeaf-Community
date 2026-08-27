@@ -16,6 +16,8 @@ The preserved proposal contains 34 commits: 24 authored as **RFDT** and 10 autho
 
 Parts of that proposal became the starting point for the interface used here. The integration was selective and received additional security and reliability work, but the original direction and code deserve clear credit. The original commit series is preserved in the `archive/asixa-pr-3` branch, and its ancestry is connected to the default branch so the original authorship remains visible to Git and GitHub.
 
+The disposition of every public pull request and every PR #3 commit is recorded in [docs/CONTRIBUTOR_INTEGRATION.md](docs/CONTRIBUTOR_INTEGRATION.md), including the security reasons for the feature groups that are not shipped.
+
 ## Victor Stoica
 
 Victor contributed fixes for file creation and binary synchronization, integrated and refined the new interface, addressed review and security findings, improved Windows path handling, and added compatibility fixes for self-hosted Overleaf servers. He maintains the community repository and the releases produced from it.
