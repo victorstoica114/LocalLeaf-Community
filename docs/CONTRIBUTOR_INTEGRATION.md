@@ -14,8 +14,9 @@ the disposition of each public upstream pull request. The audit was refreshed on
 
 The Community repository itself had no public pull requests at the time of this
 audit. PR commit IDs are not necessarily ancestors of `main`, because the
-Community history was imported and later connected to the preserved PR #3
-history; the table describes functional integration, not just SHA ancestry.
+Community history represents the accepted work through equivalent authored
+commits while the original SHA series is preserved separately; the table
+describes functional integration, not just SHA ancestry.
 
 ## PR #3 commit-by-commit review
 
@@ -110,6 +111,5 @@ synchronization.
 The original PR #3 head (`1520b9d`) remains available in
 `archive/asixa-pr-3`. Its 24 commits authored as RFDT and 10 commits authored as
 Xingyu Chen remain intact. `.mailmap`, equivalent authored commits on `main`,
-README, and
-[ATTRIBUTION.md](../ATTRIBUTION.md) make that work visible without presenting
-deferred code as shipped functionality.
+README, and [ATTRIBUTION.md](../ATTRIBUTION.md) make that work visible without
+presenting deferred code as shipped functionality.
