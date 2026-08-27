@@ -1240,6 +1240,7 @@ async function run(): Promise<void> {
         };
         engine.fileTree = new Map([[entry.id, entry]]);
         engine.fileTreeByPath = new Map([[entry.path, entry]]);
+        engine.joinedDocs = new Set();
         engine.baseContent = new Map([[entry.path, new TextEncoder().encode('server')]]);
         engine.fileCache = new Map();
         engine.settings = {
@@ -1378,6 +1379,68 @@ async function run(): Promise<void> {
     await reuploadEngine.uploadLocalFile('/draft.tex');
     assert.equal(reuploadedContent, 'unsaved text',
         're-uploading a dirty text file must use its editor buffer rather than stale disk content');
+
+    const remoteEntry = { id: 'remote-doc', type: 'doc', name: 'remote.tex', path: '/remote.tex' };
+    const remoteDownload = Object.create(SyncEngine.prototype) as any;
+    remoteDownload.settings = { getSettings: () => ({ projectId: 'project' }) };
+    remoteDownload.joinedDocs = new Set([remoteEntry.id]);
+    let socketLeaves = 0;
+    remoteDownload.socket = {
+        joinDoc: async () => ({ lines: ['live content'], version: 3 }),
+        leaveDoc: async () => { socketLeaves++; },
+    };
+    remoteDownload.api = {
+        getDocContent: async () => ({ type: 'error', message: 'HTTP should not be used' }),
+    };
+    assert.equal(
+        new TextDecoder().decode(await remoteDownload.getRemoteEntryContent(remoteEntry)),
+        'live content',
+    );
+    assert.equal(socketLeaves, 0,
+        'a manual pull must not leave a document that was already joined for live updates');
+
+    remoteDownload.joinedDocs.clear();
+    assert.equal(
+        new TextDecoder().decode(await remoteDownload.getRemoteEntryContent(remoteEntry)),
+        'live content',
+    );
+    assert.equal(socketLeaves, 1, 'a temporary Socket.IO read must release its document join');
+
+    let httpFallbacks = 0;
+    remoteDownload.socket.joinDoc = async () => { throw new Error('join unavailable'); };
+    remoteDownload.api.getDocContent = async () => {
+        httpFallbacks++;
+        return { type: 'success', lines: ['HTTP fallback'] };
+    };
+    assert.equal(
+        new TextDecoder().decode(await remoteDownload.getRemoteEntryContent(remoteEntry)),
+        'HTTP fallback',
+        'a failed Socket.IO document read must genuinely fall back to HTTP',
+    );
+    assert.equal(httpFallbacks, 1);
+    assert.equal(socketLeaves, 2, 'a failed temporary join must still attempt cleanup');
+
+    remoteDownload.api.getDocContent = async () => ({ type: 'error', message: 'HTTP unavailable' });
+    await assert.rejects(
+        () => remoteDownload.getRemoteEntryContent(remoteEntry),
+        /failed via Socket\.IO.*and HTTP/,
+        'a pull must fail visibly when neither transport can download a document',
+    );
+
+    const watchFailure = Object.create(SyncEngine.prototype) as any;
+    watchFailure.socket = { joinDoc: async () => { throw new Error('watch unavailable'); } };
+    watchFailure.fileTree = new Map([[remoteEntry.id, remoteEntry]]);
+    watchFailure.joinedDocs = new Set();
+    watchFailure.shouldSync = () => true;
+    watchFailure.log = () => undefined;
+    let watchFailureStatus: string | undefined;
+    watchFailure.setStatus = (status: string) => { watchFailureStatus = status; };
+    await assert.rejects(
+        () => watchFailure.joinAllDocsForWatching(),
+        /Unable to watch 1 document/,
+        'a live-watch failure must not be silently reported as a successful sync',
+    );
+    assert.equal(watchFailureStatus, 'error');
 
     const protectedPaths = Object.create(SyncEngine.prototype) as any;
     protectedPaths.ignoreParser = { shouldIgnore: () => false };
@@ -1711,6 +1774,13 @@ async function run(): Promise<void> {
         'unlinking must revoke the folder-specific synchronization consent');
     assert.equal(extensionSource.match(/new SyncEngine/g)?.length, 1,
         'all connection and reconnection paths must pass through the authorized initializer');
+    const pullCommandStart = extensionSource.indexOf('async function cmdPullFromOverleaf');
+    const pullCommandEnd = extensionSource.indexOf('/**\n * Push to Overleaf', pullCommandStart);
+    assert.match(
+        extensionSource.slice(pullCommandStart, pullCommandEnd),
+        /pullAll\(\)[\s\S]*joinAllDocsForWatching\(\)/,
+        'a manual pull must restore live document subscriptions before it reports success',
+    );
 
     const projectsSource = fs.readFileSync(
         path.join(__dirname, '..', '..', 'src', 'views', 'projectsWebviewProvider.ts'),

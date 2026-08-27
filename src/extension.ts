@@ -1117,6 +1117,7 @@ async function cmdPullFromOverleaf() {
             cancellable: false,
         }, async () => {
             await syncEngine!.pullAll();
+            await syncEngine!.joinAllDocsForWatching();
         });
         void vscode.window.showInformationMessage('LocalLeaf: Pull complete');
     } catch (error) {

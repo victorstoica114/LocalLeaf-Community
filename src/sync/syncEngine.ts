@@ -819,6 +819,56 @@ export class SyncEngine {
         }
     }
 
+    private async getRemoteEntryContent(entry: FileTreeEntry): Promise<Uint8Array> {
+        if (entry.type === 'folder') {
+            throw new Error(`Cannot download folder content: ${entry.path}`);
+        }
+
+        const projectSettings = this.settings.getSettings()!;
+        if (entry.type === 'file') {
+            const result = await this.api.getFile(projectSettings.projectId, entry.id);
+            ensureApiSuccess(result, `Download ${entry.path}`);
+            if (!result.content) throw new Error(`Download ${entry.path}: Overleaf returned no content`);
+            return result.content;
+        }
+
+        let socketError: unknown;
+        if (this.socket) {
+            const wasJoined = this.joinedDocs.has(entry.id);
+            let attemptedJoin = false;
+            try {
+                attemptedJoin = true;
+                const { lines } = await this.socket.joinDoc(entry.id);
+                return new TextEncoder().encode(lines.join('\n'));
+            } catch (error) {
+                socketError = error;
+                debugLog(`Socket document download failed for ${entry.path}; trying HTTP:`, error);
+            } finally {
+                // A pull must not unsubscribe a document that was already being
+                // watched for live OT updates. Temporary joins are released.
+                if (!wasJoined && attemptedJoin) {
+                    try {
+                        await this.socket.leaveDoc(entry.id);
+                    } catch (error) {
+                        debugLog(`Unable to release temporary document join for ${entry.path}:`, error);
+                    }
+                }
+            }
+        }
+
+        const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
+        if (result.type !== 'success' || !result.lines) {
+            const httpError = result.message || 'Overleaf returned no content';
+            throw new Error(
+                socketError
+                    ? `Download ${entry.path} failed via Socket.IO (${errorMessage(socketError)}) `
+                        + `and HTTP (${httpError})`
+                    : `Download ${entry.path}: ${httpError}`
+            );
+        }
+        return new TextEncoder().encode(result.lines.join('\n'));
+    }
+
     private async materializeRemoteEntry(entry: FileTreeEntry): Promise<'downloaded' | 'skipped'> {
         if (!this.shouldSync(entry.path)) return 'skipped';
         const localUri = this.settings.getFilePath(entry.path);
@@ -831,19 +881,7 @@ export class SyncEngine {
             return 'downloaded';
         }
 
-        const projectSettings = this.settings.getSettings()!;
-        let content: Uint8Array;
-        if (entry.type === 'doc') {
-            const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
-            ensureApiSuccess(result, `Download ${entry.path}`);
-            if (!result.lines) throw new Error(`Download ${entry.path}: Overleaf returned no content`);
-            content = new TextEncoder().encode(result.lines.join('\n'));
-        } else {
-            const result = await this.api.getFile(projectSettings.projectId, entry.id);
-            ensureApiSuccess(result, `Download ${entry.path}`);
-            if (!result.content) throw new Error(`Download ${entry.path}: Overleaf returned no content`);
-            content = result.content;
-        }
+        const content = await this.getRemoteEntryContent(entry);
 
         const resolution = await this.askNewRemoteFileResolution(entry.path, content);
         this.throwIfDisposed();
@@ -1927,6 +1965,7 @@ export class SyncEngine {
         if (!this.socket) return;
 
         let joinedCount = 0;
+        const failures: Array<{ path: string; error: unknown }> = [];
         for (const [id, entry] of this.fileTree) {
             if (entry.type === 'doc' && !this.joinedDocs.has(id)) {
                 if (!this.shouldSync(entry.path)) continue;
@@ -1934,13 +1973,20 @@ export class SyncEngine {
                     await this.socket.joinDoc(id);
                     this.joinedDocs.add(id);
                     joinedCount++;
-                } catch {
-                    // Ignore join errors for individual docs
+                } catch (error) {
+                    failures.push({ path: entry.path, error });
                 }
             }
         }
         if (joinedCount > 0) {
             this.log(`Watching ${joinedCount} documents for remote changes`);
+        }
+        if (failures.length > 0) {
+            const preview = failures.slice(0, 3).map(failure => failure.path).join(', ');
+            const message = `Unable to watch ${failures.length} document(s) for live updates: ${preview}`;
+            this.log(message);
+            this.setStatus('error', message);
+            throw new Error(message);
         }
     }
 
@@ -2388,8 +2434,6 @@ export class SyncEngine {
         this.applyToAll = false;
 
         this.setStatus('pulling', 'Downloading all files...');
-        const projectSettings = this.settings.getSettings()!;
-
         let downloadedCount = 0;
         let skippedCount = 0;
         let conflictCount = 0;
@@ -2417,47 +2461,8 @@ export class SyncEngine {
                     return;
                 }
 
-                // Get remote content - docs use joinDoc via socket, files use HTTP
-                let remoteContent: Uint8Array;
-
-                if (entry.type === 'doc') {
-                    // For docs, try socket first, fall back to HTTP
-                    if (this.socket) {
-                        try {
-                            const { lines } = await this.socket.joinDoc(entry.id);
-                            const content = lines.join('\n');
-                            remoteContent = new TextEncoder().encode(content);
-                            await this.socket.leaveDoc(entry.id);
-                            debugLog('pullAll: Got doc via socket', entry.path,
-                                'lines:', lines.length,
-                                'contentLen:', content.length);
-                        } catch (err) {
-                            debugLog('pullAll: Failed to joinDoc', entry.path, err);
-                            return;
-                        }
-                    } else {
-                        // HTTP fallback for docs
-                        const result = await this.api.getDocContent(projectSettings.projectId, entry.id);
-                        if (result.type !== 'success' || !result.lines) {
-                            debugLog('pullAll: Failed to get doc via HTTP', entry.path);
-                            return;
-                        }
-                        const content = result.lines.join('\n');
-                        remoteContent = new TextEncoder().encode(content);
-                        debugLog('pullAll: Got doc via HTTP', entry.path,
-                            'lines:', result.lines.length,
-                            'contentLen:', content.length);
-                    }
-                } else {
-                    // For binary files, use HTTP API
-                    const result = await this.api.getFile(projectSettings.projectId, entry.id);
-                    if (result.type !== 'success' || !result.content) {
-                        debugLog('pullAll: Failed to get file', entry.path);
-                        return;
-                    }
-                    remoteContent = result.content;
-                    debugLog('pullAll: Got file via HTTP', entry.path, 'size:', result.content.length);
-                }
+                const remoteContent = await this.getRemoteEntryContent(entry);
+                debugLog('pullAll: Downloaded remote content', entry.path, remoteContent.length, 'bytes');
 
                 const localUri = this.settings.getFilePath(entry.path);
                 await this.assertNoSymbolicLinks(localUri);
