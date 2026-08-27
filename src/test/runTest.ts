@@ -1188,6 +1188,34 @@ async function run(): Promise<void> {
     assert.ok(folderRebase.fileCache.has('/renamed/assets/image.png'));
     assert.equal(folderRebase.fileTreeByPath.has('/old/child.tex'), false);
 
+    const collidingTransition = Object.create(SyncEngine.prototype) as any;
+    const movingFolder = { id: 'moving-folder', type: 'folder', path: '/moving/' };
+    const movingChild = { id: 'moving-child', type: 'doc', path: '/moving/child.tex' };
+    const occupiedChild = { id: 'occupied-child', type: 'doc', path: '/renamed/child.tex' };
+    collidingTransition.fileTree = new Map([
+        [movingFolder.id, movingFolder],
+        [movingChild.id, movingChild],
+        [occupiedChild.id, occupiedChild],
+    ]);
+    collidingTransition.fileTreeByPath = new Map([
+        [movingFolder.path, movingFolder],
+        [movingChild.path, movingChild],
+        [occupiedChild.path, occupiedChild],
+    ]);
+    assert.throws(
+        () => collidingTransition.assertRemotePathTransitionAvailable('/moving/', '/renamed/'),
+        /already belongs to another entity/,
+        'remote folder changes must validate every descendant destination',
+    );
+    assert.throws(
+        () => collidingTransition.assertRemotePathTransitionAvailable('/moving/', '/moving/nested/'),
+        /own subtree/,
+        'a remote event must not move a folder below itself',
+    );
+    assert.doesNotThrow(
+        () => collidingTransition.assertRemotePathTransitionAvailable('/moving/', '/available/'),
+    );
+
     const subtreeRemoval = Object.create(SyncEngine.prototype) as any;
     const subtreeFolder = { id: 'folder', type: 'folder', name: 'folder', path: '/folder/' };
     const subtreeChild = { id: 'child', type: 'doc', name: 'child.tex', path: '/folder/child.tex' };

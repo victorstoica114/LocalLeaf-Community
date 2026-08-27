@@ -821,7 +821,30 @@ export class SyncEngine {
         for (const update of updates) map.set(update.newPath, update.value);
     }
 
+    private assertRemotePathTransitionAvailable(oldPath: string, newPath: string): void {
+        if (oldPath === newPath) return;
+        const isFolder = oldPath.endsWith('/');
+        if (isFolder && newPath.startsWith(oldPath)) {
+            throw new Error(`Refusing to move ${oldPath} into its own subtree: ${newPath}`);
+        }
+
+        const movingEntries = [...this.fileTree.values()].filter(entry =>
+            entry.path === oldPath || (isFolder && entry.path.startsWith(oldPath))
+        );
+        const movingIds = new Set(movingEntries.map(entry => entry.id));
+        for (const entry of movingEntries) {
+            const destination = newPath + entry.path.slice(oldPath.length);
+            const collision = this.fileTreeByPath.get(destination);
+            if (collision && !movingIds.has(collision.id)) {
+                throw new Error(
+                    `Refusing remote path change because ${destination} already belongs to another entity.`
+                );
+            }
+        }
+    }
+
     private rebaseFileTree(oldPath: string, newPath: string): void {
+        this.assertRemotePathTransitionAvailable(oldPath, newPath);
         const updates = [...this.fileTree.values()]
             .filter(entry => entry.path === oldPath || (oldPath.endsWith('/') && entry.path.startsWith(oldPath)))
             .map(entry => ({ entry, oldPath: entry.path, newPath: newPath + entry.path.slice(oldPath.length) }));
@@ -1644,6 +1667,7 @@ export class SyncEngine {
             pathWithoutTrailingSlash.lastIndexOf('/') + 1,
         );
         const newPath = joinProjectPath(parentPath, newName, entry.type === 'folder');
+        this.assertRemotePathTransitionAvailable(oldPath, newPath);
         const syncedBefore = this.shouldSync(oldPath);
         const syncedAfter = this.shouldSync(newPath);
 
@@ -1782,6 +1806,7 @@ export class SyncEngine {
 
         const oldPath = entry.path;
         const newPath = joinProjectPath(newParent.path, entry.name, entry.type === 'folder');
+        this.assertRemotePathTransitionAvailable(oldPath, newPath);
         const syncedBefore = this.shouldSync(oldPath);
         const syncedAfter = this.shouldSync(newPath);
 
