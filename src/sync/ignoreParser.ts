@@ -168,16 +168,16 @@ export class IgnoreParser {
      * Save patterns to .leafignore file
      */
     async save(patterns: string[]): Promise<void> {
-        this.patterns = validateIgnorePatterns(patterns);
-        this.resolveVariables();
-
-        const content = this.patterns.join('\n') + '\n';
+        const validatedPatterns = validateIgnorePatterns(patterns);
+        const content = validatedPatterns.join('\n') + '\n';
         const ignoreFilePath = this.getIgnoreFilePath();
         await assertSafeWorkspacePath(this.workspaceFolder, ignoreFilePath);
         await vscode.workspace.fs.writeFile(
             ignoreFilePath,
             new TextEncoder().encode(content)
         );
+        this.patterns = validatedPatterns;
+        this.resolveVariables();
     }
 
     /**
@@ -244,8 +244,7 @@ $MAIN_PDF
      */
     async addPattern(pattern: string): Promise<void> {
         if (!this.patterns.includes(pattern)) {
-            this.patterns.push(pattern);
-            await this.save(this.patterns);
+            await this.save([...this.patterns, pattern]);
         }
     }
 
@@ -255,8 +254,7 @@ $MAIN_PDF
     async removePattern(pattern: string): Promise<void> {
         const index = this.patterns.indexOf(pattern);
         if (index !== -1) {
-            this.patterns.splice(index, 1);
-            await this.save(this.patterns);
+            await this.save(this.patterns.filter((_, candidateIndex) => candidateIndex !== index));
         }
     }
 }
@@ -268,7 +266,7 @@ export function createIgnoreWatcher(
     workspaceFolder: vscode.Uri,
     onIgnoreChanged: () => void
 ): vscode.FileSystemWatcher {
-    const pattern = new vscode.RelativePattern(workspaceFolder.path, IGNORE_FILE);
+    const pattern = new vscode.RelativePattern(workspaceFolder, IGNORE_FILE);
     const watcher = vscode.workspace.createFileSystemWatcher(pattern);
 
     watcher.onDidChange(onIgnoreChanged);

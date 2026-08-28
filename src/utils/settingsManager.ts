@@ -436,7 +436,7 @@ export function createSettingsWatcher(
     onSettingsChanged: () => void
 ): vscode.FileSystemWatcher {
     const pattern = new vscode.RelativePattern(
-        workspaceFolder.path,
+        workspaceFolder,
         `${CONFIG_DIR}/${SETTINGS_FILE}`
     );
     const watcher = vscode.workspace.createFileSystemWatcher(pattern);

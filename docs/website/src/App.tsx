@@ -1,6 +1,7 @@
 import './index.css'
 
 const RELEASES_URL = 'https://github.com/victorstoica114/LocalLeaf-Community/releases'
+const MARKETPLACE_URL = 'https://marketplace.visualstudio.com/items?itemName=victorstoica114.localleaf-community'
 const GITHUB_URL = 'https://github.com/victorstoica114/LocalLeaf-Community'
 const DOCS_URL = 'https://github.com/victorstoica114/LocalLeaf-Community#readme'
 const ATTRIBUTION_URL = 'https://github.com/victorstoica114/LocalLeaf-Community/blob/main/ATTRIBUTION.md'
@@ -69,12 +70,12 @@ function Hero() {
 
       <div className="flex flex-col sm:flex-row gap-4 animate-pixel-fade animate-delay-3">
         <a
-          href={RELEASES_URL}
+          href={MARKETPLACE_URL}
           target="_blank"
           rel="noopener noreferrer"
           className="mc-btn mc-btn-green text-center"
         >
-          Community Releases
+          Install from Marketplace
         </a>
         <a
           href={DOCS_URL}
@@ -165,11 +166,11 @@ function Steps() {
   const steps = [
     {
       number: 1,
-      title: 'Download a Release',
+      title: 'Install the Extension',
       description: <>
-        Download the latest VSIX from <a href={RELEASES_URL} target="_blank" rel="noopener noreferrer" className="text-green-600 hover:text-green-500 underline">GitHub Releases</a>.
+        Install from the <a href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer" className="text-green-600 hover:text-green-500 underline">Visual Studio Marketplace</a>, or use <a href={RELEASES_URL} target="_blank" rel="noopener noreferrer" className="text-green-600 hover:text-green-500 underline">GitHub Releases</a> for a manual or offline install.
       </>,
-      code: 'VS Code → Extensions: Install from VSIX...',
+      code: 'VS Code → Extensions → LocalLeaf Community',
     },
     {
       number: 2,
@@ -231,6 +232,9 @@ function Footer() {
     <footer className="bg-gray-900 text-white py-12 px-4">
       <div style={{ maxWidth: '896px', marginLeft: 'auto', marginRight: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
         <div className="flex flex-wrap justify-center gap-4 mb-8">
+          <a href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer" className="mc-btn mc-btn-green">
+            Marketplace
+          </a>
           <a href={RELEASES_URL} target="_blank" rel="noopener noreferrer" className="mc-btn mc-btn-green">
             Releases
           </a>

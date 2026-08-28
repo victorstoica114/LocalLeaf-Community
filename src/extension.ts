@@ -518,15 +518,17 @@ function createCredentialTooltip(
 async function updateLoginStatus() {
     // Only show login status if folder is linked
     const settingsManager = SettingsManager.getCurrentInstance();
-    const isLinked = settingsManager && await settingsManager.isLinked();
-
-    if (!isLinked) {
+    if (!settingsManager || !(await settingsManager.isLinked())) {
         loginStatusItem.hide();
         return;
     }
 
-    const serverUrl = credentialManager.getDefaultServer();
-    const credential = await credentialManager.getCredential(serverUrl);
+    const settings = settingsManager.getSettings() ?? await settingsManager.load();
+    if (!settings) {
+        loginStatusItem.hide();
+        return;
+    }
+    const credential = await credentialManager.getCredential(settings.serverUrl);
 
     if (credential && authState === 'valid') {
         // Logged in with valid session

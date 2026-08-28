@@ -81,6 +81,7 @@ export class CursorTracker {
     private docIdToPath: Map<string, string> = new Map();
     private pendingLocalPosition?: { docId: string; row: number; column: number };
     private publishingLocalPosition = false;
+    private initialized = false;
     private disposed = false;
 
     constructor(
@@ -137,17 +138,22 @@ export class CursorTracker {
      * Initialize with connected users
      */
     async initialize(): Promise<void> {
-        if (this.disposed) return;
+        if (this.disposed || this.initialized) return;
         try {
             const users = await this.socket.getConnectedUsers();
+            if (this.disposed || this.initialized) return;
             for (const user of users) {
                 if (user.clientId !== this._publicId) {
                     this.addOrUpdateUser(user);
                 }
             }
         } catch (error) {
-            console.error('[LocalLeaf] Failed to get connected users:', error);
+            if (!this.disposed) {
+                console.error('[LocalLeaf] Failed to get connected users:', error);
+            }
         }
+
+        if (this.disposed || this.initialized) return;
 
         // Listen for selection changes to update our position
         this.disposables.push(
@@ -158,13 +164,14 @@ export class CursorTracker {
             }),
             vscode.window.onDidChangeVisibleTextEditors(() => this.refreshDecorations())
         );
+        this.initialized = true;
     }
 
     /**
      * Handle cursor update from another user
      */
     private handleCursorUpdate(update: UserCursorUpdate): void {
-        if (update.id === this._publicId) return;
+        if (this.disposed || update.id === this._publicId) return;
 
         const user: OnlineUser = {
             clientId: update.id,
@@ -184,6 +191,7 @@ export class CursorTracker {
      * Add or update a user's cursor
      */
     private addOrUpdateUser(user: OnlineUser): void {
+        if (this.disposed) return;
         if (
             typeof user.clientId !== 'string'
             || user.clientId.length === 0
@@ -329,6 +337,7 @@ export class CursorTracker {
      * Handle user disconnection
      */
     private handleUserDisconnected(clientId: string): void {
+        if (this.disposed) return;
         const user = this.users.get(clientId);
         if (user) {
             // Clear decoration
@@ -413,6 +422,7 @@ export class CursorTracker {
      * Update doc ID to path mapping
      */
     updateDocMapping(docId: string, path: string): void {
+        if (this.disposed) return;
         this.docIdToPath.set(docId, path);
     }
 

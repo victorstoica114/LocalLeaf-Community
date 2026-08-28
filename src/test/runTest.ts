@@ -390,6 +390,7 @@ let mockFileDeletes: Array<{ uri: MockUri | string; recursive: boolean }> = [];
 let mockFileRenames: Array<{ oldUri: MockUri | string; newUri: MockUri | string }> = [];
 let mockApplyEditResult = true;
 let mockAutomaticSyncSetting = true;
+let mockWindowListenerRegistrations = 0;
 
 function mockFileUri(fsPath: string): MockUri {
     const normalizedFsPath = path.win32.normalize(fsPath);
@@ -532,6 +533,18 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             window: {
                 showWarningMessage: async () => undefined,
                 showInformationMessage: async () => undefined,
+                onDidChangeTextEditorSelection: (
+                    _listener: (...args: unknown[]) => void,
+                ) => {
+                    mockWindowListenerRegistrations++;
+                    return { dispose: () => undefined };
+                },
+                onDidChangeVisibleTextEditors: (
+                    _listener: (...args: unknown[]) => void,
+                ) => {
+                    mockWindowListenerRegistrations++;
+                    return { dispose: () => undefined };
+                },
             },
             commands: {
                 executeCommand: (...args: unknown[]) => executeCommandImpl(...args),
@@ -751,6 +764,31 @@ async function run(): Promise<void> {
     cursorQueue.dispose();
     assert.equal(disposedCursorDecoration, 1);
     assert.equal(cursorQueue.docIdToPath.size, 0);
+
+    let finishDisposedCursorInitialization: ((users: unknown[]) => void) | undefined;
+    const disposedCursorInitialization = Object.create(CursorTracker.prototype) as any;
+    disposedCursorInitialization.socket = {
+        getConnectedUsers: () => new Promise<unknown[]>(resolve => {
+            finishDisposedCursorInitialization = resolve;
+        }),
+    };
+    disposedCursorInitialization.users = new Map();
+    disposedCursorInitialization.userIdToColor = new Map();
+    disposedCursorInitialization.docIdToPath = new Map();
+    disposedCursorInitialization.disposables = [];
+    disposedCursorInitialization.initialized = false;
+    disposedCursorInitialization.disposed = false;
+    const listenerRegistrationsBeforeDispose = mockWindowListenerRegistrations;
+    const pendingCursorInitialization = disposedCursorInitialization.initialize();
+    disposedCursorInitialization.dispose();
+    finishDisposedCursorInitialization!([]);
+    await pendingCursorInitialization;
+    assert.equal(
+        mockWindowListenerRegistrations,
+        listenerRegistrationsBeforeDispose,
+        'a cursor tracker disposed during initialization must not register editor listeners afterwards',
+    );
+    assert.deepStrictEqual(disposedCursorInitialization.disposables, []);
 
     const legacyProject = {
         _id: 'legacy-project',
@@ -1207,6 +1245,57 @@ async function run(): Promise<void> {
         true,
         'different invalid UTF-8 byte sequences must not collide in the synchronization cache',
     );
+
+    const transactionalTree = Object.create(SyncEngine.prototype) as any;
+    const retainedTreeEntry = {
+        id: 'retained-doc',
+        type: 'doc',
+        name: 'retained.tex',
+        path: '/retained.tex',
+        parentId: 'retained-root',
+    };
+    transactionalTree.fileTree = new Map([[retainedTreeEntry.id, retainedTreeEntry]]);
+    transactionalTree.fileTreeByPath = new Map([[retainedTreeEntry.path, retainedTreeEntry]]);
+    const retainedProject = {
+        _id: 'retained-project',
+        name: 'Retained project',
+        rootFolder: [],
+        owner: { _id: 'owner', email: 'owner@example.com', first_name: 'Owner' },
+        members: [],
+    };
+    transactionalTree.project = retainedProject;
+    transactionalTree.settings = {
+        getSettings: () => ({ projectId: 'retained-project' }),
+    };
+    transactionalTree.api = {
+        getProjectDetails: async () => ({
+            type: 'success',
+            projectData: {
+                projectId: 'retained-project',
+                rootFolder: [{
+                    _id: 'replacement-root',
+                    name: 'rootFolder',
+                    docs: [
+                        { _id: 'replacement-a', name: 'duplicate.tex' },
+                        { _id: 'replacement-b', name: 'duplicate.tex' },
+                    ],
+                    fileRefs: [],
+                    folders: [],
+                }],
+            },
+        }),
+    };
+    await assert.rejects(
+        () => transactionalTree.refreshProjectFileTree(),
+        /duplicate entity path/,
+        'malformed refresh metadata must be rejected',
+    );
+    assert.strictEqual(transactionalTree.project, retainedProject,
+        'a failed refresh must preserve the last valid project metadata');
+    assert.deepStrictEqual([...transactionalTree.fileTree.entries()], [[retainedTreeEntry.id, retainedTreeEntry]],
+        'a failed refresh must preserve the last valid entity tree');
+    assert.deepStrictEqual([...transactionalTree.fileTreeByPath.entries()], [[retainedTreeEntry.path, retainedTreeEntry]],
+        'a failed refresh must preserve the last valid path index');
     const binaryBaseline = Uint8Array.from([1, 2, 3, 4]);
     propagation.recordSynchronizedContent(
         { type: 'file', path: '/binary.dat' },
@@ -2641,6 +2730,22 @@ async function run(): Promise<void> {
         /createCredentialTooltip[\s\S]*appendText\(`Email: \$\{credential\.userEmail\}`\)[\s\S]*appendText\(`Server: \$\{credential\.serverUrl\}`\)/,
         'server-provided account fields must be appended as text instead of interpreted as Markdown',
     );
+    const loginStatusStart = extensionSource.indexOf('async function updateLoginStatus');
+    const loginStatusEnd = extensionSource.indexOf(
+        'async function showSessionExpiredNotification',
+        loginStatusStart,
+    );
+    const loginStatusSource = extensionSource.slice(loginStatusStart, loginStatusEnd);
+    assert.match(
+        loginStatusSource,
+        /credentialManager\.getCredential\(settings\.serverUrl\)/,
+        'the account status must use the linked project server',
+    );
+    assert.doesNotMatch(
+        loginStatusSource,
+        /credentialManager\.getDefaultServer\(\)/,
+        'the account status must not fall back to a different global server while a project is linked',
+    );
     assert.doesNotMatch(
         extensionSource,
         /new vscode\.MarkdownString\([^)]*credential\.(?:userEmail|serverUrl)/,
@@ -3053,6 +3158,25 @@ async function run(): Promise<void> {
         ['thesis\\[1\\].tex', 'thesis\\[1\\].pdf', '*.aux'],
         'main-document names must be treated as literal ignore paths, not glob syntax',
     );
+
+    resetMockWorkspace([workspaceRoot], [
+        ['D:\\workspace', { type: 2 }],
+        ['D:\\workspace\\.leafignore', { type: 1 | 64, content: '*.aux' }],
+    ]);
+    const transactionalIgnoreParser = Object.create(IgnoreParser.prototype) as any;
+    transactionalIgnoreParser.workspaceFolder = workspaceRoot;
+    transactionalIgnoreParser.patterns = ['*.aux'];
+    transactionalIgnoreParser.settings = {};
+    transactionalIgnoreParser.resolveVariables();
+    await assert.rejects(
+        () => transactionalIgnoreParser.addPattern('*.log'),
+        /symbolic link/,
+        'unsafe ignore-file writes must fail closed',
+    );
+    assert.deepStrictEqual(transactionalIgnoreParser.getPatterns(), ['*.aux'],
+        'a failed ignore-file write must not mutate the active patterns');
+    assert.deepStrictEqual(transactionalIgnoreParser.getResolvedPatterns(), ['*.aux'],
+        'a failed ignore-file write must not mutate the resolved matcher state');
 
     const manifest = JSON.parse(fs.readFileSync(
         path.join(__dirname, '..', '..', 'package.json'),

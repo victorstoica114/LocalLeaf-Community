@@ -322,8 +322,9 @@ export class SyncEngine {
             });
 
             // Join project via socket.io
-            this.project = await this.socket.joinProject();
-            this.buildFileTree(this.project);
+            const socketProject = await this.socket.joinProject();
+            this.buildFileTree(socketProject);
+            this.project = socketProject;
             this.setStatus('idle', 'Connected (real-time)');
         } catch (error) {
             debugLog('Socket.io failed, using HTTP fallback:', error);
@@ -350,7 +351,7 @@ export class SyncEngine {
 
                 // Build file tree from rootFolder if available
                 if (projectData.rootFolder && projectData.rootFolder.length > 0) {
-                    this.project = {
+                    const httpProject: ProjectEntity = {
                         _id: projectData.projectId,
                         name: projectData.projectName || 'Unknown',
                         rootDoc_id: projectData.rootDocId,
@@ -359,7 +360,8 @@ export class SyncEngine {
                         owner: { _id: projectData.userId || '', email: projectData.userEmail || '', first_name: 'Unknown' },
                         members: [],
                     };
-                    this.buildFileTree(this.project);
+                    this.buildFileTree(httpProject);
+                    this.project = httpProject;
                 } else {
                     throw new Error(
                         'HTTP synchronization is unavailable because the server returned no folder identity metadata.'
@@ -405,8 +407,10 @@ export class SyncEngine {
         debugLog('buildFileTree: Building tree for project', project.name);
         debugLog('buildFileTree: rootFolder count:', project.rootFolder?.length || 0);
 
-        this.fileTree.clear();
-        this.fileTreeByPath.clear();
+        // Build into temporary maps so malformed remote metadata cannot erase a
+        // valid live tree before the replacement has been fully validated.
+        const nextFileTree = new Map<string, FileTreeEntry>();
+        const nextFileTreeByPath = new Map<string, FileTreeEntry>();
 
         let entityCount = 0;
         const addEntry = (entry: FileTreeEntry) => {
@@ -414,14 +418,14 @@ export class SyncEngine {
             if (entityCount > 100_000) {
                 throw new Error('Overleaf project contains too many entities.');
             }
-            if (this.fileTree.has(entry.id)) {
+            if (nextFileTree.has(entry.id)) {
                 throw new Error(`Overleaf returned duplicate entity ID: ${entry.id}`);
             }
-            if (this.fileTreeByPath.has(entry.path)) {
+            if (nextFileTreeByPath.has(entry.path)) {
                 throw new Error(`Overleaf returned duplicate entity path: ${entry.path}`);
             }
-            this.fileTree.set(entry.id, entry);
-            this.fileTreeByPath.set(entry.path, entry);
+            nextFileTree.set(entry.id, entry);
+            nextFileTreeByPath.set(entry.path, entry);
         };
         const childEntities = (value: unknown, label: string): FileEntity[] => {
             if (value === undefined) return [];
@@ -507,6 +511,13 @@ export class SyncEngine {
         } else {
             throw new Error('Overleaf returned no valid root folder.');
         }
+
+        // Preserve the Map objects returned by getFileTree while replacing
+        // their contents in one synchronous commit.
+        this.fileTree.clear();
+        this.fileTreeByPath.clear();
+        for (const [id, entry] of nextFileTree) this.fileTree.set(id, entry);
+        for (const [path, entry] of nextFileTreeByPath) this.fileTreeByPath.set(path, entry);
 
         debugLog('buildFileTree: Total entries:', this.fileTree.size);
     }
@@ -1424,14 +1435,15 @@ export class SyncEngine {
             throw new Error('Refresh project file tree: Overleaf returned no folder tree');
         }
 
-        this.project = {
+        const refreshedProject = {
             ...(this.project || {}),
             _id: result.projectData.projectId || projectSettings.projectId,
             name: result.projectData.projectName || this.project?.name || 'Unknown',
             rootDoc_id: result.projectData.rootDocId || this.project?.rootDoc_id,
             rootFolder: result.projectData.rootFolder,
         } as ProjectEntity;
-        this.buildFileTree(this.project);
+        this.buildFileTree(refreshedProject);
+        this.project = refreshedProject;
     }
 
     private trackUploadedEntity(
