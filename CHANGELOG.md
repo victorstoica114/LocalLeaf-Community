@@ -4,6 +4,22 @@ All notable changes to LocalLeaf Community will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-28
+
+### Changed
+
+- Made the Visual Studio Marketplace the primary installation path on the project website while retaining GitHub Releases for manual and offline installs
+- Used workspace-folder URIs for settings and ignore-file watchers so they remain correct across Windows and non-file workspace schemes
+
+### Fixed
+
+- Used the linked project's server when resolving the account shown in the status bar
+- Preserved the last valid project metadata and file tree when Overleaf returns malformed refresh data
+- Prevented cursor-tracking listeners from being registered after their synchronization session has already been disposed
+- Kept active `.leafignore` patterns unchanged when validating or writing an updated ignore file fails
+
+[0.2.3]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.2...v0.2.3
+
 ## [0.2.2] - 2026-08-27
 
 ### Changed
