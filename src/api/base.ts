@@ -15,6 +15,7 @@ import {
     validateOverleafId,
     validateRemoteDocumentLines,
 } from '../utils/remoteValidation';
+import { httpErrorMessage } from '../utils/errorMessages';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024;
@@ -111,8 +112,293 @@ function mergeCookieHeaders(...headers: Array<string | undefined>): string {
     return [...cookies.values()].join('; ');
 }
 
+type HtmlAttributes = ReadonlyMap<string, string>;
+
+/**
+ * Visit HTML start tags without relying on a permissive `.*` regular expression.
+ * This is deliberately a small tokenizer rather than a full DOM parser: Overleaf's
+ * authentication metadata only needs tag and attribute names/values.
+ */
+function visitHtmlStartTags(
+    html: string,
+    visitor: (tagName: string, attributes: HtmlAttributes) => boolean | void,
+): void {
+    let cursor = 0;
+
+    while (cursor < html.length) {
+        const tagStart = html.indexOf('<', cursor);
+        if (tagStart < 0) return;
+
+        if (html.startsWith('<!--', tagStart)) {
+            const commentEnd = html.indexOf('-->', tagStart + 4);
+            if (commentEnd < 0) return;
+            cursor = commentEnd + 3;
+            continue;
+        }
+
+        let nameStart = tagStart + 1;
+        if (
+            nameStart >= html.length
+            || html[nameStart] === '/'
+            || html[nameStart] === '!'
+            || html[nameStart] === '?'
+        ) {
+            cursor = tagStart + 1;
+            continue;
+        }
+
+        let nameEnd = nameStart;
+        while (nameEnd < html.length && isHtmlNameCharacter(html.charCodeAt(nameEnd))) {
+            nameEnd++;
+        }
+        if (nameEnd === nameStart) {
+            cursor = tagStart + 1;
+            continue;
+        }
+
+        const tagEnd = findHtmlTagEnd(html, nameEnd);
+        if (tagEnd < 0) return;
+        const tagName = html.slice(nameStart, nameEnd).toLowerCase();
+        if (visitor(tagName, parseHtmlAttributes(html, nameEnd, tagEnd)) === true) return;
+
+        // These elements contain raw text, where a string such as "<meta ...>"
+        // must not be treated as an actual element.
+        if (tagName === 'script' || tagName === 'style' || tagName === 'textarea' || tagName === 'title') {
+            const closingStart = indexOfAsciiCaseInsensitive(html, `</${tagName}`, tagEnd + 1);
+            if (closingStart < 0) return;
+            const closingEnd = html.indexOf('>', closingStart + tagName.length + 2);
+            if (closingEnd < 0) return;
+            cursor = closingEnd + 1;
+        } else {
+            cursor = tagEnd + 1;
+        }
+    }
+}
+
+function indexOfAsciiCaseInsensitive(source: string, needle: string, from: number): number {
+    for (let start = source.indexOf('<', from); start >= 0; start = source.indexOf('<', start + 1)) {
+        if (start + needle.length > source.length) return -1;
+        let matched = true;
+        for (let offset = 0; offset < needle.length; offset++) {
+            const sourceCode = source.charCodeAt(start + offset);
+            const normalizedSourceCode = sourceCode >= 0x41 && sourceCode <= 0x5a
+                ? sourceCode + 0x20
+                : sourceCode;
+            if (normalizedSourceCode !== needle.charCodeAt(offset)) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            const nextCode = source.charCodeAt(start + needle.length);
+            if (!Number.isNaN(nextCode) && isHtmlNameCharacter(nextCode)) continue;
+            return start;
+        }
+    }
+    return -1;
+}
+
+function isHtmlNameCharacter(code: number): boolean {
+    return (code >= 0x30 && code <= 0x39)
+        || (code >= 0x41 && code <= 0x5a)
+        || (code >= 0x61 && code <= 0x7a)
+        || code === 0x2d
+        || code === 0x3a
+        || code === 0x5f;
+}
+
+function isHtmlWhitespace(code: number): boolean {
+    return code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d || code === 0x20;
+}
+
+function findHtmlTagEnd(html: string, start: number): number {
+    let quote = 0;
+    for (let cursor = start; cursor < html.length; cursor++) {
+        const code = html.charCodeAt(cursor);
+        if (quote !== 0) {
+            if (code === quote) quote = 0;
+        } else if (code === 0x22 || code === 0x27) {
+            quote = code;
+        } else if (code === 0x3e) {
+            return cursor;
+        }
+    }
+    return -1;
+}
+
+function parseHtmlAttributes(html: string, start: number, end: number): HtmlAttributes {
+    const attributes = new Map<string, string>();
+    let cursor = start;
+
+    while (cursor < end) {
+        while (cursor < end && (isHtmlWhitespace(html.charCodeAt(cursor)) || html[cursor] === '/')) cursor++;
+        if (cursor >= end) break;
+
+        const nameStart = cursor;
+        while (
+            cursor < end
+            && !isHtmlWhitespace(html.charCodeAt(cursor))
+            && html[cursor] !== '='
+            && html[cursor] !== '/'
+        ) {
+            cursor++;
+        }
+        if (cursor === nameStart) {
+            cursor++;
+            continue;
+        }
+
+        const name = html.slice(nameStart, cursor).toLowerCase();
+        while (cursor < end && isHtmlWhitespace(html.charCodeAt(cursor))) cursor++;
+
+        let value = '';
+        if (cursor < end && html[cursor] === '=') {
+            cursor++;
+            while (cursor < end && isHtmlWhitespace(html.charCodeAt(cursor))) cursor++;
+            const quote = html.charCodeAt(cursor);
+            if (quote === 0x22 || quote === 0x27) {
+                cursor++;
+                const valueStart = cursor;
+                while (cursor < end && html.charCodeAt(cursor) !== quote) cursor++;
+                value = html.slice(valueStart, cursor);
+                if (cursor < end) cursor++;
+            } else {
+                const valueStart = cursor;
+                while (
+                    cursor < end
+                    && !isHtmlWhitespace(html.charCodeAt(cursor))
+                    && !(html[cursor] === '/' && cursor + 1 === end)
+                ) {
+                    cursor++;
+                }
+                value = html.slice(valueStart, cursor);
+            }
+        }
+
+        // Browsers use the first duplicate attribute. Matching that behaviour
+        // also prevents an ambiguous later attribute from changing auth data.
+        if (!attributes.has(name)) attributes.set(name, decodeHtmlAttributeValue(value));
+    }
+
+    return attributes;
+}
+
+function decodeHtmlAttributeValue(value: string): string {
+    return value.replace(
+        /&(?:#(\d{1,7})|#x([0-9a-f]{1,6})|(amp|apos|gt|lt|quot));/gi,
+        (entity, decimal: string | undefined, hexadecimal: string | undefined, named: string | undefined) => {
+            const codePoint = decimal
+                ? Number.parseInt(decimal, 10)
+                : hexadecimal
+                    ? Number.parseInt(hexadecimal, 16)
+                    : undefined;
+            if (codePoint !== undefined) {
+                if (
+                    codePoint <= 0x1f
+                    || codePoint === 0x7f
+                    || codePoint > 0x10ffff
+                    || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+                ) {
+                    return entity;
+                }
+                return String.fromCodePoint(codePoint);
+            }
+            switch (named?.toLowerCase()) {
+                case 'amp': return '&';
+                case 'apos': return "'";
+                case 'gt': return '>';
+                case 'lt': return '<';
+                case 'quot': return '"';
+                default: return entity;
+            }
+        },
+    );
+}
+
+function findNamedElementAttributes(
+    html: string,
+    tagName: string,
+    selectorValue: string,
+): HtmlAttributes | undefined {
+    let result: HtmlAttributes | undefined;
+    const normalizedTagName = tagName.toLowerCase();
+    const normalizedSelector = selectorValue.toLowerCase();
+    visitHtmlStartTags(html, (candidateTag, attributes) => {
+        if (
+            candidateTag === normalizedTagName
+            && attributes.get('name')?.toLowerCase() === normalizedSelector
+        ) {
+            result = attributes;
+            return true;
+        }
+        return false;
+    });
+    return result;
+}
+
+function findNamedElementValue(
+    html: string,
+    tagName: string,
+    selectorValue: string,
+    valueAttribute: string,
+): string | undefined {
+    return findNamedElementAttributes(html, tagName, selectorValue)?.get(valueAttribute.toLowerCase());
+}
+
+function looksLikeLoginPage(html: string): boolean {
+    let loginForm = false;
+    let passwordInput = false;
+    visitHtmlStartTags(html, (tagName, attributes) => {
+        if (tagName === 'form') {
+            const action = attributes.get('action')?.toLowerCase();
+            if (action && (action === 'login' || action.includes('/login'))) loginForm = true;
+        } else if (tagName === 'input' && attributes.get('type')?.toLowerCase() === 'password') {
+            passwordInput = true;
+        }
+        return loginForm || passwordInput;
+    });
+    return loginForm || passwordInput;
+}
+
+function isRedirectStatus(status: number): boolean {
+    return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+export interface OverleafProjectAuthMetadata {
+    userId: string;
+    userEmail: string;
+    csrfToken: string;
+}
+
+/** Read authenticated Overleaf project metadata from real HTML elements only. */
+export function readOverleafProjectAuthMetadata(html: string): OverleafProjectAuthMetadata | undefined {
+    const userId = findNamedElementValue(html, 'meta', 'ol-user_id', 'content');
+    const userEmail = findNamedElementValue(html, 'meta', 'ol-usersEmail', 'content');
+    const csrfToken = findNamedElementValue(html, 'meta', 'ol-csrfToken', 'content');
+    if (!userId || !csrfToken) return undefined;
+    try {
+        validateOverleafId(userId, 'user ID');
+        validateAuthHeader(csrfToken, 'CSRF token');
+        if (userEmail !== undefined && (
+            userEmail.length > MAX_LOGIN_EMAIL_CHARACTERS || /[\r\n\0]/.test(userEmail)
+        )) return undefined;
+        return { userId, userEmail: userEmail || '', csrfToken };
+    } catch {
+        return undefined;
+    }
+}
+
+type UserIdentityLookup =
+    | { kind: 'success'; metadata: OverleafProjectAuthMetadata }
+    | { kind: 'invalid-session' }
+    | { kind: 'error'; response: ResponseSchema };
+
 class ApiHttpError extends Error {
-    constructor(message: string, readonly status?: number) {
+    constructor(
+        message: string,
+        readonly status?: number,
+        readonly authError?: AuthErrorType,
+    ) {
         super(message);
     }
 }
@@ -164,6 +450,7 @@ export type AuthErrorType = 'session_expired' | 'invalid_credentials';
 
 export interface ResponseSchema {
     type: 'success' | 'error';
+    httpStatus?: number;
     message?: string;
     authError?: AuthErrorType;
     userInfo?: { userId: string; userEmail: string };
@@ -239,27 +526,47 @@ export class BaseAPI {
     }
 
     private async responseError(response: Response): Promise<ResponseSchema> {
+        const location = isRedirectStatus(response.status)
+            ? response.headers.get('location')
+            : null;
+        if (location && this.isLoginRedirect(location)) {
+            this.discardResponseBody(response);
+            return {
+                type: 'error',
+                message: 'Session expired',
+                authError: 'session_expired',
+            };
+        }
+
         let detail = '';
         try {
             detail = await response.text();
         } catch {
             detail = response.statusText;
         }
-        if (detail.length > 4096) {
-            detail = `${detail.slice(0, 4096)}…`;
-        }
-        const authError = response.status === 401 || response.status === 403
+        const authError = response.status === 401
             ? 'session_expired' as const
             : undefined;
         return {
             type: 'error',
-            message: authError ? 'Session expired' : `${response.status}: ${detail || response.statusText}`,
+            httpStatus: response.status,
+            message: authError ? 'Session expired' : httpErrorMessage(
+                response.status, detail, response.headers.get('content-type') || '',
+            ),
             authError,
         };
     }
 
     private discardResponseBody(response: Response): void {
         response.body?.resume();
+    }
+
+    private isPotentialHtmlDownload(response: Response, content: Buffer): boolean {
+        const contentType = response.headers.get('content-type')?.toLowerCase() || '';
+        const prefix = content.subarray(0, 4096).toString('utf8');
+        return contentType.includes('text/html')
+            || contentType.includes('application/xhtml+xml')
+            || /^\s*(?:<!doctype\s+html|<html|<form)\b/i.test(prefix);
     }
 
     private getResponseCookies(response: Response): string {
@@ -290,12 +597,16 @@ export class BaseAPI {
         const res = await this.fetchRoute('login', {
             method: 'GET',
         });
+        if (!res.ok) {
+            const failure = await this.responseError(res);
+            throw new Error(failure.message || 'Failed to load the Overleaf login page.');
+        }
         const body = await res.text();
-        const match = body.match(/<input.*name="_csrf".*value="([^"]*)"/);
-        if (!match) {
+        const csrfToken = findNamedElementValue(body, 'input', '_csrf', 'value');
+        if (!csrfToken) {
             throw new Error('Failed to get CSRF token.');
         }
-        const csrfToken = validateAuthHeader(match[1], 'CSRF token');
+        validateAuthHeader(csrfToken, 'CSRF token');
         const cookies = this.getResponseCookies(res);
         return { csrfToken, cookies };
     }
@@ -303,43 +614,106 @@ export class BaseAPI {
     /**
      * Get user ID from project page (validates cookies)
      */
-    private async getUserId(cookies: string): Promise<{ userId: string; userEmail: string; csrfToken: string } | undefined> {
-        const res = await this.fetchRoute('project', {
+    private async getUserId(cookies: string): Promise<UserIdentityLookup> {
+        const requestOptions: RequestInit = {
             method: 'GET',
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': cookies,
             }
-        });
+        };
+        let route: 'project' | 'project/' = 'project';
+        let res = await this.fetchRoute(route, requestOptions);
+
+        if (isRedirectStatus(res.status)) {
+            const location = res.headers.get('location');
+            if (location && this.isLoginRedirect(location)) {
+                this.discardResponseBody(res);
+                return { kind: 'invalid-session' };
+            }
+
+            const canonicalRoute = location
+                ? this.getCanonicalProjectRedirectRoute(location, route)
+                : undefined;
+            if (canonicalRoute) {
+                this.discardResponseBody(res);
+                route = canonicalRoute;
+                res = await this.fetchRoute(route, requestOptions);
+            }
+        }
+
+        if (res.status === 401) {
+            await this.responseError(res);
+            return { kind: 'invalid-session' };
+        }
+        if (isRedirectStatus(res.status)) {
+            const location = res.headers.get('location');
+            if (location && this.isLoginRedirect(location)) {
+                this.discardResponseBody(res);
+                return { kind: 'invalid-session' };
+            }
+            return { kind: 'error', response: await this.responseError(res) };
+        }
+        if (!res.ok) {
+            return { kind: 'error', response: await this.responseError(res) };
+        }
 
         const body = await res.text();
-        const userIDMatch = body.match(/<meta\s+name="ol-user_id"\s+content="([^"]*)"/);
-        const userEmailMatch = body.match(/<meta\s+name="ol-usersEmail"\s+content="([^"]*)"/);
-        const csrfTokenMatch = body.match(/<meta\s+name="ol-csrfToken"\s+content="([^"]*)"/);
+        const metadata = readOverleafProjectAuthMetadata(body);
+        if (metadata) return { kind: 'success', metadata };
+        if (looksLikeLoginPage(body)) {
+            return { kind: 'invalid-session' };
+        }
+        return {
+            kind: 'error',
+            response: {
+                type: 'error',
+                message: 'Overleaf returned a project page without authentication metadata.',
+            },
+        };
+    }
 
-        if (userIDMatch && csrfTokenMatch) {
-            let userId: string;
-            let csrfToken: string;
-            try {
-                userId = validateOverleafId(userIDMatch[1], 'user ID');
-                csrfToken = validateAuthHeader(csrfTokenMatch[1], 'CSRF token');
-            } catch {
-                return undefined;
-            }
-            const userEmail = userEmailMatch?.[1];
+    /**
+     * Accept only trailing-slash canonicalization for the configured project
+     * route. Returning a local route prevents redirects from sending cookies to
+     * another origin or outside a configured self-hosted base path.
+     */
+    private getCanonicalProjectRedirectRoute(
+        location: string,
+        currentRoute: 'project' | 'project/',
+    ): 'project' | 'project/' | undefined {
+        try {
+            const destination = new URL(location, this.url);
+            const server = new URL(this.url);
             if (
-                userEmail !== undefined
-                && (userEmail.length > MAX_LOGIN_EMAIL_CHARACTERS || /[\r\n\0]/.test(userEmail))
+                destination.origin !== server.origin
+                || destination.username
+                || destination.password
+                || destination.search
+                || destination.hash
             ) {
                 return undefined;
             }
-            return {
-                userId,
-                userEmail: userEmail ?? '',
-                csrfToken,
-            };
+
+            const canonicalRoute = currentRoute === 'project' ? 'project/' : 'project';
+            const canonicalPath = new URL(canonicalRoute, this.url).pathname;
+            return destination.pathname === canonicalPath ? canonicalRoute : undefined;
+        } catch {
+            return undefined;
         }
-        return undefined;
+    }
+
+    private isLoginRedirect(location: string): boolean {
+        try {
+            const destination = new URL(location, this.url);
+            const server = new URL(this.url);
+            if (destination.origin !== server.origin) return false;
+            const destinationPath = destination.pathname.replace(/\/+$/, '').toLowerCase();
+            const configuredLoginPath = new URL('login', this.url).pathname.replace(/\/+$/, '').toLowerCase();
+            return destinationPath === configuredLoginPath || destinationPath.endsWith('/login');
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -374,9 +748,9 @@ export class BaseAPI {
         ) {
             return { type: 'error', message: 'The Overleaf cookie header is invalid.' };
         }
-        const res = await this.getUserId(cookies);
-        if (res) {
-            const { userId, userEmail, csrfToken } = res;
+        const validation = await this.getUserId(cookies);
+        if (validation.kind === 'success') {
+            const { userId, userEmail, csrfToken } = validation.metadata;
             const identity = await this.updateCookies({ cookies, csrfToken });
             return {
                 type: 'success',
@@ -384,6 +758,7 @@ export class BaseAPI {
                 identity,
             };
         }
+        if (validation.kind === 'error') return validation.response;
         return {
             type: 'error',
             message: 'Failed to validate cookies. Please check that you copied the correct cookies.',
@@ -561,16 +936,44 @@ export class BaseAPI {
                     this.discardResponseBody(res);
                     throw new ApiHttpError('The Overleaf server stopped a partial download unexpectedly.');
                 }
-                return await res.buffer();
+                const body = await res.buffer();
+                if (this.isPotentialHtmlDownload(res, body)) {
+                    // HTML may be a legitimate project file, a rewritten login
+                    // response, or a WAF/policy page. Verify the account before
+                    // classifying it, and never save an ambiguous login page as
+                    // binary project content.
+                    const validation = await this.getUserId(this.identity.cookies);
+                    if (validation.kind === 'invalid-session') {
+                        throw new ApiHttpError('Session expired', res.status, 'session_expired');
+                    }
+                    if (validation.kind === 'error') {
+                        throw new ApiHttpError(
+                            `Could not verify the account after an HTML file response: ${validation.response.message || 'unknown Overleaf response'}`,
+                            res.status,
+                        );
+                    }
+                    const sample = body.subarray(0, 4 * 1024 * 1024).toString('utf8');
+                    if (looksLikeLoginPage(sample)) {
+                        throw new ApiHttpError(
+                            'Overleaf returned a login page for a file even though the account endpoint remained available.',
+                            res.status,
+                        );
+                    }
+                }
+                return body;
             }
 
-            if (res.status === 401 || res.status === 403) {
+            if (res.status === 401) {
                 this.discardResponseBody(res);
                 throw new ApiHttpError('Session expired', res.status);
             }
             if (res.status !== 206) {
                 const failure = await this.responseError(res);
-                throw new ApiHttpError(failure.message || 'File download failed', res.status);
+                throw new ApiHttpError(
+                    failure.message || 'File download failed',
+                    res.status,
+                    failure.authError,
+                );
             }
 
             const contentRange = res.headers.get('content-range');
@@ -626,12 +1029,44 @@ export class BaseAPI {
             },
         });
 
+        if (isRedirectStatus(res.status)) {
+            const location = res.headers.get('location');
+            if (location && this.isLoginRedirect(location)) {
+                this.discardResponseBody(res);
+                return {
+                    type: 'error',
+                    message: 'Session expired',
+                    authError: 'session_expired',
+                };
+            }
+        }
+
+        if (res.status === 401) {
+            this.discardResponseBody(res);
+            return {
+                type: 'error',
+                message: 'Session expired',
+                authError: 'session_expired',
+            };
+        }
+
         if (res.status === 200) {
-            const data = asJsonObject(await res.json());
-            if (
-                !Array.isArray(data?.projects)
-                || data.projects.length > MAX_PROJECT_LIST_ITEMS
-            ) {
+            const body = await res.text();
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(body) as unknown;
+            } catch {
+                if (looksLikeLoginPage(body)) {
+                    return {
+                        type: 'error',
+                        message: 'Session expired',
+                        authError: 'session_expired',
+                    };
+                }
+                return { type: 'error', message: 'Overleaf returned an invalid project list.' };
+            }
+            const data = asJsonObject(parsed);
+            if (!Array.isArray(data?.projects) || data.projects.length > MAX_PROJECT_LIST_ITEMS) {
                 return { type: 'error', message: 'Overleaf returned an invalid project list.' };
             }
             const projects: ProjectInfo[] = data.projects.flatMap((value: unknown) => {
@@ -672,7 +1107,9 @@ export class BaseAPI {
             return {
                 type: 'error',
                 message: error instanceof Error ? error.message : String(error),
-                authError: status === 401 || status === 403 ? 'session_expired' : undefined,
+                authError: error instanceof ApiHttpError && error.authError
+                    ? error.authError
+                    : status === 401 ? 'session_expired' : undefined,
             };
         }
     }
@@ -700,7 +1137,7 @@ export class BaseAPI {
         const mimeTypes = require('mime-types');
 
         validateProjectEntityName(filename);
-        const fileStream = stream.Readable.from(fileContent);
+        const fileStream = stream.Readable.from([Buffer.from(fileContent)]);
         const formData = new FormData();
         const mimeType = mimeTypes.lookup(filename);
 
@@ -948,26 +1385,36 @@ export class BaseAPI {
 
         if (res.status === 200) {
             const body = await res.text();
-
             // Extract project data from meta tags
             const extractMeta = (name: string): string | undefined => {
-                const match = body.match(new RegExp(`<meta\\s+name="${name}"\\s+content="([^"]*)"`));
-                return match ? match[1] : undefined;
+                return findNamedElementValue(body, 'meta', name, 'content');
             };
 
             const extractJsonMeta = (name: string): unknown => {
-                const match = body.match(new RegExp(`<meta\\s+name="${name}"\\s+data-type="json"\\s+content="([^"]*)"`));
-                if (match) {
-                    try {
-                        return JSON.parse(match[1].replace(/&quot;/g, '"')) as unknown;
-                    } catch {
-                        return undefined;
-                    }
+                const attributes = findNamedElementAttributes(body, 'meta', name);
+                const content = attributes?.get('content');
+                if (attributes?.get('data-type')?.toLowerCase() !== 'json' || content === undefined) {
+                    return undefined;
                 }
-                return undefined;
+                try {
+                    return JSON.parse(content) as unknown;
+                } catch {
+                    return undefined;
+                }
             };
 
             const rootFolder = extractJsonMeta('ol-rootFolder');
+            const pageProjectId = extractMeta('ol-project_id');
+            const pageUserId = extractMeta('ol-user_id');
+            const hasAuthenticatedProjectMetadata = Boolean(pageProjectId || pageUserId || Array.isArray(rootFolder));
+            if (!hasAuthenticatedProjectMetadata && looksLikeLoginPage(body)) {
+                return {
+                    type: 'error',
+                    message: 'Session expired',
+                    authError: 'session_expired',
+                };
+            }
+
             const responseProjectId = extractMeta('ol-project_id');
             let validatedProjectId: string;
             try {
@@ -1024,7 +1471,21 @@ export class BaseAPI {
             });
 
         if (res.status === 200) {
-            const data = asJsonObject(await res.json());
+            const body = await res.text();
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(body) as unknown;
+            } catch {
+                if (looksLikeLoginPage(body)) {
+                    return {
+                        type: 'error',
+                        message: 'Session expired',
+                        authError: 'session_expired',
+                    };
+                }
+                return { type: 'error', message: 'Overleaf returned invalid document content.' };
+            }
+            const data = asJsonObject(parsed);
             try {
                 const lines = validateRemoteDocumentLines(data?.lines);
                 return { type: 'success', lines };
@@ -1045,12 +1506,16 @@ export class BaseAPI {
         }
 
         const result = await this.getUserId(this.identity.cookies);
-        if (result) {
+        if (result.kind === 'success') {
             return {
                 type: 'success',
-                userInfo: { userId: result.userId, userEmail: result.userEmail },
+                userInfo: {
+                    userId: result.metadata.userId,
+                    userEmail: result.metadata.userEmail,
+                },
             };
         }
+        if (result.kind === 'error') return result.response;
         return {
             type: 'error',
             message: 'Session expired or cookie invalid',

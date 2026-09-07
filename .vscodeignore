@@ -17,6 +17,7 @@ images/*.svg
 !images/icon.svg
 images/status-bar.png
 .gitignore
+.gitattributes
 .vscodeignore
 .eslintrc*
 esbuild.js
@@ -27,6 +28,7 @@ package-lock.json
 *.vsix
 LOCAL_GUI_INTEGRATION_CHECKLIST.md
 local-pr3-artifacts/**
+test/**
 out/test/**
 out/test/runTest.js
 *.log

@@ -8,6 +8,8 @@ import {
     WorkspaceFolderKind,
 } from '../utils/settingsManager';
 import { createNonce } from './webviewUtils';
+import { conciseErrorMessage } from '../utils/errorMessages';
+import { validateServerUrl } from '../utils/serverUrl';
 
 type ProjectsViewStatus =
     | 'no-folder'
@@ -16,7 +18,8 @@ type ProjectsViewStatus =
     | 'not-logged-in'
     | 'loading'
     | 'ready'
-    | 'error';
+    | 'error'
+    | 'connection-error';
 
 interface LocalProjectSummary {
     uri: string;
@@ -32,6 +35,7 @@ interface ProjectsViewState {
     workspaceKind?: Exclude<WorkspaceFolderKind, 'linked' | 'unsupported'>;
     message?: string;
     openingProjectId?: string;
+    serverUrl?: string;
 }
 
 type ProjectsWebviewMessage =
@@ -39,8 +43,11 @@ type ProjectsWebviewMessage =
     | { type: 'refresh' }
     | { type: 'login' }
     | { type: 'openFolder' }
+    | { type: 'openServer' }
     | { type: 'openLocalProject'; uri: string }
     | { type: 'openProject'; projectId: string };
+
+export type ProjectsAuthenticationState = 'valid' | 'expired';
 
 /**
  * Project browser adapted from the UI in PR #3. The webview only renders
@@ -58,6 +65,10 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     constructor(
         private readonly extensionUri: vscode.Uri,
         private readonly credentialManager: CredentialManager,
+        private readonly onAuthenticationState?: (
+            serverUrl: string,
+            state: ProjectsAuthenticationState,
+        ) => void | Promise<void>,
     ) {}
 
     resolveWebviewView(
@@ -73,7 +84,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.onDidReceiveMessage((message: unknown) => {
             void this.handleMessage(message).catch(error => {
                 console.error('[LocalLeaf] Projects view action failed:', error);
-                void vscode.window.showErrorMessage(`LocalLeaf: ${error instanceof Error ? error.message : String(error)}`);
+                void vscode.window.showErrorMessage(`LocalLeaf: ${conciseErrorMessage(error)}`);
             });
         });
         webviewView.webview.html = this.getHtml(webviewView.webview);
@@ -133,8 +144,8 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         }
 
         const workspaceKind = inspection.kind;
-        this.updateState({ status: 'loading', projects: [], localProjects: [], workspaceKind });
         const serverUrl = this.credentialManager.getDefaultServer();
+        this.updateState({ status: 'loading', projects: [], localProjects: [], workspaceKind, serverUrl });
         const credential = await this.credentialManager.getCredential(serverUrl);
         if (version !== this.refreshVersion) return;
 
@@ -162,16 +173,32 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
             if (result.type !== 'success' || !result.projects) {
                 this.projects = [];
+                if (result.authError) {
+                    await this.onAuthenticationState?.(credential.serverUrl, 'expired');
+                    if (version !== this.refreshVersion) return;
+                    this.updateState({
+                        status: 'not-logged-in',
+                        projects: [],
+                        localProjects: [],
+                        workspaceKind,
+                        message: 'Your stored Overleaf session has expired. Re-authenticate to browse projects.',
+                    });
+                    return;
+                }
                 this.updateState({
-                    status: 'error',
+                    status: result.httpStatus === 408 || (result.httpStatus ?? 0) >= 500
+                        ? 'connection-error' : 'error',
                     projects: [],
                     localProjects: [],
                     workspaceKind,
-                    message: result.message || 'Could not load Overleaf projects.',
+                    serverUrl: credential.serverUrl,
+                    message: conciseErrorMessage(result.message, 'Could not load Overleaf projects.'),
                 });
                 return;
             }
 
+            await this.onAuthenticationState?.(credential.serverUrl, 'valid');
+            if (version !== this.refreshVersion) return;
             this.projects = result.projects.filter(project => !project.archived && !project.trashed);
             this.updateState({
                 status: 'ready',
@@ -183,11 +210,12 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             if (version !== this.refreshVersion) return;
             this.projects = [];
             this.updateState({
-                status: 'error',
+                status: 'connection-error',
                 projects: [],
                 localProjects: [],
                 workspaceKind,
-                message: error instanceof Error ? error.message : String(error),
+                serverUrl: credential.serverUrl,
+                message: conciseErrorMessage(error, 'Could not load Overleaf projects.'),
             });
         }
     }
@@ -213,6 +241,11 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             case 'login':
                 await vscode.commands.executeCommand(COMMANDS.SHOW_ACCOUNT_PANEL);
                 break;
+            case 'openServer': {
+                const server = validateServerUrl(this.state.serverUrl || this.credentialManager.getDefaultServer());
+                await vscode.env.openExternal(vscode.Uri.parse(`${server.url}/project`));
+                break;
+            }
             case 'openFolder':
                 await vscode.commands.executeCommand('vscode.openFolder');
                 break;
@@ -270,7 +303,9 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             outline: 1px solid var(--vscode-focusBorder);
             outline-offset: 2px;
         }
-        .shell { min-height: 100%; padding: 12px; }
+        .shell { padding: 12px; }
+        .menu-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--vscode-panel-border); }
+        .menu-bar button { margin: 0; }
         .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; }
         .brand img { width: 24px; height: 24px; }
         .brand-copy { min-width: 0; }
@@ -314,10 +349,15 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         .project-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 2px; }
         .access { color: var(--vscode-descriptionForeground); font-size: 10px; text-transform: uppercase; }
         .state { min-height: 240px; display: grid; place-items: center; text-align: center; padding: 20px 8px; }
-        .state-card { max-width: 260px; }
+        .state-card { width: 100%; min-width: 0; max-width: 300px; }
         .state-icon { font-size: 30px; margin-bottom: 10px; }
         .state-title { font-weight: 650; margin-bottom: 5px; }
-        .state-copy { color: var(--vscode-descriptionForeground); line-height: 1.45; }
+        .state-copy { color: var(--vscode-descriptionForeground); line-height: 1.45; overflow-wrap: anywhere; }
+        .state-server { margin: 8px 0 0; font-size: 11px; }
+        .state-actions { display: grid; gap: 7px; margin-top: 12px; }
+        .state-actions button { margin: 0; width: 100%; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+        .state-actions .secondary-action { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+        .state-actions .secondary-action:hover { background: var(--vscode-button-secondaryHoverBackground); }
         .primary { margin-top: 12px; padding: 7px 11px; border: 0; border-radius: 5px; cursor: pointer; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
         .primary:hover { background: var(--vscode-button-hoverBackground); }
         .secondary { margin-top: 7px; color: var(--vscode-descriptionForeground); }
@@ -327,12 +367,14 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     </style>
 </head>
 <body>
+    <nav class="menu-bar" aria-label="LocalLeaf menu"><span>LocalLeaf</span><button id="openMenu" type="button" class="primary" aria-label="Open LocalLeaf connection settings">Menu</button></nav>
     <main id="root" class="shell">
         <section class="state" role="status" aria-live="polite"><div class="state-card"><div class="spinner" aria-hidden="true"></div><div class="state-title">Loading LocalLeaf…</div></div></section>
     </main>
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
         const root = document.getElementById('root');
+        document.getElementById('openMenu').addEventListener('click', () => vscode.postMessage({ type: 'login' }));
         const persisted = vscode.getState() || {};
         let state = null;
         let filterText = typeof persisted.filterText === 'string' ? persisted.filterText : '';
@@ -352,15 +394,31 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             return button;
         }
 
-        function renderState(icon, title, copy, action) {
+        function recoveryActions(action) {
+            const actions = element('div', 'state-actions');
+            if (action) actions.append(actionButton(action.label, action.message));
+            [
+                ['Connection Settings', { type: 'login' }],
+            ].forEach(([label, message]) => {
+                const button = actionButton(label, message);
+                button.className += ' secondary-action';
+                actions.append(button);
+            });
+            return actions;
+        }
+
+        function renderState(icon, title, copy, action, showRecovery = false) {
             const wrapper = element('section', 'state');
-            wrapper.setAttribute('role', state && (state.status === 'error' || state.status === 'incompatible-folder') ? 'alert' : 'status');
+            wrapper.setAttribute('role', state && (state.status === 'error' || state.status === 'connection-error' || state.status === 'incompatible-folder') ? 'alert' : 'status');
             wrapper.setAttribute('aria-live', 'polite');
             const card = element('div', 'state-card');
             const stateIcon = element('div', 'state-icon', icon);
             stateIcon.setAttribute('aria-hidden', 'true');
             card.append(stateIcon, element('div', 'state-title', title), element('div', 'state-copy', copy));
-            if (action) card.append(actionButton(action.label, action.message));
+            if (showRecovery) {
+                if (state.serverUrl) card.append(element('div', 'state-copy state-server', state.serverUrl));
+                card.append(recoveryActions(action));
+            } else if (action) card.append(actionButton(action.label, action.message));
             wrapper.append(card);
             root.replaceChildren(wrapper);
         }
@@ -541,11 +599,11 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             if (state.status === 'incompatible-folder') return renderState('⚠', 'Unsupported workspace', state.message || 'Open a local file-system folder to use LocalLeaf.', { label: 'Open Folder', message: { type: 'openFolder' } });
             if (state.status === 'local-projects') return renderLocalProjects();
             if (state.status === 'not-logged-in') {
-                const context = state.workspaceKind === 'empty'
+                const context = state.message || (state.workspaceKind === 'empty'
                     ? 'This empty folder is ready to link. Sign in to browse your projects.'
                     : state.workspaceKind === 'invalid-config'
                         ? 'The existing LocalLeaf settings are invalid. Sign in and choose a project to replace them.'
-                        : 'Connect your account to browse projects. A confirmation will be required before linking this non-empty folder.';
+                        : 'Connect your account to browse projects. A confirmation will be required before linking this non-empty folder.');
                 return renderState('◉', 'Sign in to Overleaf', context, { label: 'Open Account', message: { type: 'login' } });
             }
             if (state.status === 'loading') {
@@ -555,11 +613,12 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                 const card = element('div', 'state-card');
                 const spinner = element('div', 'spinner');
                 spinner.setAttribute('aria-hidden', 'true');
-                card.append(spinner, element('div', 'state-title', 'Loading projects…'));
+                card.append(spinner, element('div', 'state-title', 'Loading projects…'), recoveryActions());
                 wrapper.append(card);
                 return root.replaceChildren(wrapper);
             }
-            if (state.status === 'error') return renderState('⚠', 'Projects unavailable', state.message || 'Could not load projects.', { label: 'Try Again', message: { type: 'refresh' } });
+            if (state.status === 'connection-error') return renderState('!', 'Cannot connect to server', 'Check your connection or open Connection Settings to choose another server.', { label: 'Try Again', message: { type: 'refresh' } }, true);
+            if (state.status === 'error') return renderState('⚠', 'Projects unavailable', state.message || 'Could not load projects.', { label: 'Try Again', message: { type: 'refresh' } }, true);
             renderProjects();
         }
 

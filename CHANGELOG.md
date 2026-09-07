@@ -2,7 +2,32 @@
 
 All notable changes to LocalLeaf Community will be documented in this file.
 
-## [Unreleased]
+## [0.2.4] - 2026-09-07
+
+### Added
+
+- Added isolated browser-assisted login with browser selection, cancellation, session verification, and re-authentication in the Account panel
+
+### Changed
+
+- Keep stored sessions unverified until a successful authenticated request, and preserve existing credentials when login is cancelled or fails
+- Keep the sidebar responsive while initial synchronization waits for a user decision
+
+### Fixed
+
+- Track document versions so queued or duplicate edits cannot be applied twice after a pull
+- Detect concurrent local and remote document edits before automatic uploads, and preserve changes made while a conflict prompt is open
+- Preserve local-only, ignored and unsaved files when a remote folder is removed or moved out of synchronization; ask before deleting modified copies
+- Keep document subscriptions active across manual pulls and refresh the project tree for HTTP synchronization
+- Retry identical saved content after a failed upload instead of suppressing it as an echo
+- Upload plain Uint8Array, sliced arrays and empty binary files without multipart stream errors
+- Wait for document updates to be applied before marking uploads complete, including edits transformed by the server
+- Show a concise connection error for unavailable project servers and keep the LocalLeaf menu accessible
+- Allow selecting another browsing server from Connection Settings without deleting the previous session or changing existing project links
+- Keep server drafts and newly loaded projects intact when an older request finishes in the background
+- Replace HTML error pages with readable messages and route login redirects to re-authentication
+
+[0.2.4]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.3...v0.2.4
 
 ## [0.2.3] - 2026-08-28
 

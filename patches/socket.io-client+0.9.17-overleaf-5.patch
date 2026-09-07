@@ -127,6 +127,15 @@ diff --git a/node_modules/socket.io-client/lib/events.js b/node_modules/socket.i
 diff --git a/node_modules/socket.io-client/lib/io.js b/node_modules/socket.io-client/lib/io.js
 --- a/node_modules/socket.io-client/lib/io.js
 +++ b/node_modules/socket.io-client/lib/io.js
+@@ -116,7 +116,7 @@
+      * @api public
+      */
+ 
+-    io.transports = ['websocket', 'xhr-polling'];
++    io.transports = [];
+ 
+     /**
+      * Expose all transports
 @@ -126,9 +126,8 @@
  
      io.Transport.XHR = require('./transports/xhr').XHR;
@@ -233,3 +242,29 @@ diff --git a/node_modules/socket.io-client/lib/transports/xhr.js b/node_modules/
 +  , 'undefined' != typeof io ? io : require('../io')
    , this
  );
+diff --git a/node_modules/socket.io-client/lib/util.js b/node_modules/socket.io-client/lib/util.js
+index 754f89d..1b819ff 100644
+--- a/node_modules/socket.io-client/lib/util.js
++++ b/node_modules/socket.io-client/lib/util.js
+@@ -350,8 +350,10 @@
+    * @api public
+    */
+ 
+-  util.ua.webkit = 'undefined' != typeof navigator
+-    && /webkit/i.test(navigator.userAgent);
++  // LocalLeaf runs this legacy client in VS Code's Node extension host. Recent
++  // VS Code releases guard the Node global `navigator`, so browser UA probing
++  // can throw before a socket is created. Neither flag applies in Node.
++  util.ua.webkit = false;
+ 
+    /**
+    * Detect iPad/iPhone/iPod.
+@@ -359,7 +361,6 @@
+    * @api public
+    */
+ 
+-  util.ua.iDevice = 'undefined' != typeof navigator
+-      && /iPad|iPhone|iPod/i.test(navigator.userAgent);
++  util.ua.iDevice = false;
+ 
+ })('undefined' != typeof io ? io : module.exports, this);

@@ -167,6 +167,50 @@ async function verifyWebSocketCompatibility(): Promise<void> {
     });
 }
 
+function verifyBundledSocketClientCompatibility(): void {
+    const esbuild = require('esbuild') as {
+        buildSync(options: Record<string, unknown>): void;
+    };
+    const projectRoot = path.join(__dirname, '..', '..');
+    const smokeBundlePath = path.join(__dirname, 'socketClientBundleSmoke.js');
+    esbuild.buildSync({
+        entryPoints: [path.join(projectRoot, 'node_modules', 'socket.io-client', 'lib', 'io.js')],
+        bundle: true,
+        format: 'cjs',
+        platform: 'node',
+        target: 'node18',
+        outfile: smokeBundlePath,
+        logLevel: 'silent',
+    });
+
+    const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    assert.ok(!navigatorDescriptor || navigatorDescriptor.configurable);
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        get: () => {
+            throw new Error('PendingMigrationError: navigator is guarded by VS Code');
+        },
+    });
+    try {
+        delete require.cache[require.resolve(smokeBundlePath)];
+        const socketClient = require(smokeBundlePath) as {
+            connect?: unknown;
+            transports?: string[];
+            version?: string;
+        };
+        assert.equal(typeof socketClient.connect, 'function');
+        assert.equal(socketClient.version, '0.9.17-overleaf-5');
+        assert.deepStrictEqual(socketClient.transports, ['websocket', 'xhr-polling']);
+    } finally {
+        delete require.cache[require.resolve(smokeBundlePath)];
+        if (navigatorDescriptor) {
+            Object.defineProperty(globalThis, 'navigator', navigatorDescriptor);
+        } else {
+            delete (globalThis as { navigator?: unknown }).navigator;
+        }
+    }
+}
+
 let fetchResponse: {
     ok: boolean;
     status: number;
@@ -317,6 +361,7 @@ async function verifyHardenedXmlHttpRequest(): Promise<void> {
         await new Promise<void>(resolve => server.close(() => resolve()));
     }
 }
+let openExternalImpl = async (_uri: { toString(): string }): Promise<boolean> => true;
 
 interface MockUri {
     scheme: string;
@@ -514,7 +559,10 @@ Module._load = function (request: string, parent: unknown, isMain: boolean): unk
             EventEmitter: MockEventEmitter,
             FileSystemError: MockFileSystemError,
             FileType: { File: 1, Directory: 2, SymbolicLink: 64 },
+            ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+            env: { openExternal: (uri: { toString(): string }) => openExternalImpl(uri) },
             Uri: {
+                parse: (value: string) => ({ toString: () => value }),
                 joinPath: (
                     base: MockUri | string,
                     ...segments: string[]
@@ -700,15 +748,73 @@ async function run(): Promise<void> {
         };
     };
     useSocketIoMock = true;
+    const { isAutomaticSyncEnabled } = require(path.join('..', 'utils', 'settingsManager')) as {
+        isAutomaticSyncEnabled(settings: {
+            getSettings(): { autoSync: boolean } | undefined;
+            getWorkspaceFolder(): unknown;
+        }): boolean;
+    };
+    const automaticSettings = (projectAutoSync: boolean) => ({
+        getSettings: () => ({ autoSync: projectAutoSync }),
+        getWorkspaceFolder: () => mockFileUri('D:\\workspace'),
+    });
+    mockAutomaticSyncSetting = true;
+    assert.equal(isAutomaticSyncEnabled(automaticSettings(true)), true);
+    assert.equal(isAutomaticSyncEnabled(automaticSettings(false)), false,
+        'the project setting must disable background synchronization');
+    mockAutomaticSyncSetting = false;
+    assert.equal(isAutomaticSyncEnabled(automaticSettings(true)), false,
+        'the VS Code setting must disable background synchronization');
+    mockAutomaticSyncSetting = true;
+
+    const { isSyncInitializationSnapshotCurrent } = require(
+        path.join('..', 'utils', 'syncInitialization')
+    ) as {
+        isSyncInitializationSnapshotCurrent(snapshot: {
+            deactivating: boolean;
+            currentGeneration: number;
+            expectedGeneration: number;
+            currentSyncKey?: string;
+            activeSyncKey?: string;
+            expectedSyncKey: string;
+        }): boolean;
+    };
+    const currentInitialization = {
+        deactivating: false,
+        currentGeneration: 4,
+        expectedGeneration: 4,
+        currentSyncKey: 'workspace|server|project-a',
+        activeSyncKey: 'workspace|server|project-a',
+        expectedSyncKey: 'workspace|server|project-a',
+    };
+    assert.equal(isSyncInitializationSnapshotCurrent(currentInitialization), true);
+    assert.equal(isSyncInitializationSnapshotCurrent({
+        ...currentInitialization,
+        currentGeneration: 5,
+    }), false, 'a newer initialization must invalidate an older async continuation');
+    assert.equal(isSyncInitializationSnapshotCurrent({
+        ...currentInitialization,
+        currentSyncKey: 'workspace|server|project-b',
+    }), false, 'changing project settings must invalidate an in-flight initialization');
+    assert.equal(isSyncInitializationSnapshotCurrent({
+        ...currentInitialization,
+        activeSyncKey: undefined,
+    }), false, 'a session key claimed or cleared elsewhere must invalidate an in-flight initialization');
+    assert.equal(isSyncInitializationSnapshotCurrent({
+        ...currentInitialization,
+        deactivating: true,
+    }), false, 'deactivation must invalidate every async initialization');
 
     const { BaseAPI } = require(path.join('..', 'api', 'base')) as {
         BaseAPI: new (url: string) => {
             setIdentity(identity: unknown): void;
             getIdentity(): { cookies: string; csrfToken: string } | undefined;
             dispose(): void;
-            passportLogin(email: string, password: string): Promise<unknown>;
+            cookiesLogin(cookies: string): Promise<unknown>;
             getProjects(): Promise<unknown>;
             getProjectDetails(projectId: string): Promise<unknown>;
+            passportLogin(email: string, password: string): Promise<unknown>;
+            verifyCredentials(): Promise<unknown>;
             uploadFile(
                 projectId: string,
                 folderId: string,
@@ -1045,7 +1151,7 @@ async function run(): Promise<void> {
         ok: true,
         status: 200,
         json: async () => ({ projects: new Array(100_001).fill(null) }),
-        text: async () => '',
+        text: async () => JSON.stringify({ projects: new Array(100_001).fill(null) }),
     };
     assert.deepStrictEqual(
         await api.getProjects(),
@@ -1139,7 +1245,7 @@ async function run(): Promise<void> {
         ok: true,
         status: 200,
         json: async () => ({ lines: ['safe', 'document'] }),
-        text: async () => '',
+        text: async () => JSON.stringify({ lines: ['safe', 'document'] }),
     };
     assert.deepStrictEqual(
         await api.getDocContent('project', 'doc-id'),
@@ -1149,7 +1255,7 @@ async function run(): Promise<void> {
         ok: true,
         status: 200,
         json: async () => ({ lines: ['safe', 123] }),
-        text: async () => '',
+        text: async () => JSON.stringify({ lines: ['safe', 123] }),
     };
     assert.deepStrictEqual(
         await api.getDocContent('project', 'doc-id'),
@@ -1205,12 +1311,687 @@ async function run(): Promise<void> {
         content?: Uint8Array;
     };
     assert.equal(deniedDownload.type, 'error');
-    assert.equal(deniedDownload.authError, 'session_expired');
+    assert.equal(deniedDownload.authError, undefined,
+        'a project-level 403 may be a permission denial and must not erase a valid session');
     assert.equal(deniedDownload.content, undefined, 'HTTP errors must never become empty successful files');
+
+    fetchImplementation = async () => ({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+        json: async () => ({}),
+        text: async () => 'Unauthorized',
+        buffer: async () => Buffer.alloc(0),
+        headers: { get: () => null },
+    });
+    const unauthorizedDownload = await api.getFile('project', 'expired-file') as {
+        type: string;
+        authError?: string;
+    };
+    assert.equal(unauthorizedDownload.type, 'error');
+    assert.equal(unauthorizedDownload.authError, 'session_expired');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => [
+            '<p>İstanbul</p>',
+            '<script>const fake = "<meta name=\'ol-user_id\' content=\'script-user\'>";</script>',
+            '<!-- <meta name="ol-csrfToken" content="comment-token"> -->',
+            '<META data-note=ignored CONTENT=\'user&#45;id\' NAME=\'OL-USER_ID\'>',
+            '<meta CONTENT="person&#64;example.test" name="OL-USERSEMAIL">',
+            '<MeTa content=\'csrf&gt;token\' data-note=\'value > still quoted\' NAME=\'ol-csrftoken\'>',
+        ].join(''),
+        headers: { get: () => null, raw: () => ({}) },
+    });
+    const flexibleMetadata = await api.verifyCredentials() as {
+        type: string;
+        userInfo?: { userId: string; userEmail: string };
+    };
+    assert.equal(flexibleMetadata.type, 'success');
+    assert.deepStrictEqual(flexibleMetadata.userInfo, {
+        userId: 'user-id',
+        userEmail: 'person@example.test',
+    }, 'authentication metadata must allow reordered, mixed-case, and single-quoted attributes');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => [
+            '<META CONTENT=\'server-project\' NAME=\'OL-PROJECT_ID\'>',
+            '<meta content="Main document" name="ol-projectName">',
+            '<meta CONTENT=\'root-doc\' NAME=\'ol-rootDoc_id\'>',
+            '<META CONTENT=\'[{&quot;_id&quot;:&quot;root-folder&quot;}]\' DATA-TYPE=\'JSON\' NAME=\'OL-ROOTFOLDER\'>',
+        ].join(''),
+        headers: { get: () => null, raw: () => ({}) },
+    });
+    const projectMetadata = await api.getProjectDetails('server-project') as {
+        type: string;
+        projectData?: {
+            projectId: string;
+            projectName?: string;
+            rootDocId?: string;
+            rootFolder?: Array<{ _id?: string }>;
+        };
+    };
+    assert.equal(projectMetadata.type, 'success');
+    assert.deepStrictEqual(projectMetadata.projectData, {
+        projectId: 'server-project',
+        projectName: 'Main document',
+        rootDocId: 'root-doc',
+        userId: undefined,
+        userEmail: undefined,
+        compiler: undefined,
+        rootFolder: [{ _id: 'root-folder' }],
+    }, 'HTTP project fallback metadata must use the same order-independent parser');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => [
+            '<meta name="ol-project_id" content="project-with-sharing-ui">',
+            '<meta name="ol-user_id" content="user-id">',
+            '<meta name="ol-rootFolder" data-type="json" content="[]">',
+            '<form action="/login"><input type="password"></form>',
+        ].join(''),
+        headers: { get: () => 'text/html', raw: () => ({}) },
+    });
+    const projectWithPasswordUi = await api.getProjectDetails('project-with-sharing-ui') as {
+        type: string;
+        authError?: string;
+        projectData?: { projectId: string };
+    };
+    assert.equal(projectWithPasswordUi.type, 'success',
+        'authenticated project metadata must win over unrelated password UI on the page');
+    assert.equal(projectWithPasswordUi.authError, undefined);
+    assert.equal(projectWithPasswordUi.projectData?.projectId, 'project-with-sharing-ui');
+
+    fetchImplementation = async () => ({
+        ok: false,
+        status: 302,
+        statusText: 'Found',
+        json: async () => ({}),
+        text: async () => '',
+        buffer: async () => Buffer.alloc(0),
+        headers: {
+            get: name => name.toLowerCase() === 'location' ? '/login?redir=/project' : null,
+            raw: () => ({}),
+        },
+    });
+    const redirectedFile = await api.getFile('project', 'file') as { authError?: string };
+    const redirectedProject = await api.getProjectDetails('project') as { authError?: string };
+    const redirectedDocument = await api.getDocContent('project', 'doc') as { authError?: string };
+    assert.equal(redirectedFile.authError, 'session_expired',
+        'file-download redirects to login must expire the session');
+    assert.equal(redirectedProject.authError, 'session_expired',
+        'project-detail redirects to login must expire the session');
+    assert.equal(redirectedDocument.authError, 'session_expired',
+        'document redirects to login must expire the session');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => '<form action="/login"><input type="password"></form>',
+        headers: { get: () => 'text/html', raw: () => ({}) },
+    });
+    const projectLoginPage = await api.getProjectDetails('project') as { authError?: string };
+    const documentLoginPage = await api.getDocContent('project', 'doc') as { authError?: string };
+    assert.equal(projectLoginPage.authError, 'session_expired');
+    assert.equal(documentLoginPage.authError, 'session_expired');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ lines: ['unused'] }),
+        text: async () => JSON.stringify({ lines: ['first', 'second'] }),
+        headers: { get: () => 'application/json', raw: () => ({}) },
+    });
+    const validHttpDocument = await api.getDocContent('project', 'doc') as {
+        type: string;
+        lines?: string[];
+    };
+    assert.equal(validHttpDocument.type, 'success');
+    assert.deepStrictEqual(validHttpDocument.lines, ['first', 'second']);
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => JSON.stringify({
+            lines: ['<form action="/login">', '<input type="password">', '</form>'],
+        }),
+        headers: { get: () => 'application/json', raw: () => ({}) },
+    });
+    const loginExampleDocument = await api.getDocContent('project', 'doc') as {
+        type: string;
+        authError?: string;
+        lines?: string[];
+    };
+    assert.equal(loginExampleDocument.type, 'success',
+        'valid document JSON containing login markup must not expire the session');
+    assert.equal(loginExampleDocument.authError, undefined);
+
+    let binaryLoginStep = 0;
+    fetchImplementation = async () => {
+        binaryLoginStep++;
+        const loginPage = '<html><form action="/login"><input type="password"></form></html>';
+        return {
+            ok: true,
+            status: 200,
+            statusText: 'OK',
+            json: async () => ({}),
+            text: async () => loginPage,
+            buffer: async () => Buffer.from(loginPage),
+            headers: {
+                get: name => name.toLowerCase() === 'content-type' ? 'text/html; charset=utf-8' : null,
+                raw: () => ({}),
+            },
+        };
+    };
+    const binaryLoginPage = await api.getFile('project', 'binary') as {
+        type: string;
+        authError?: string;
+        content?: Uint8Array;
+    };
+    assert.equal(binaryLoginPage.type, 'error');
+    assert.equal(binaryLoginPage.authError, 'session_expired',
+        'an HTTP 200 login page must never be accepted as remote binary content');
+    assert.equal(binaryLoginPage.content, undefined);
+    assert.equal(binaryLoginStep, 2, 'an ambiguous HTML download must be confirmed against the account endpoint');
+
+    let legitimateHtmlStep = 0;
+    fetchImplementation = async () => {
+        legitimateHtmlStep++;
+        const projectHtml = '<html><form action="/login"><input type="password"></form></html>';
+        const identityHtml = [
+            '<meta name="ol-user_id" content="user-id">',
+            '<meta name="ol-usersEmail" content="person@example.test">',
+            '<meta name="ol-csrfToken" content="csrf">',
+        ].join('');
+        return {
+            ok: true,
+            status: 200,
+            statusText: 'OK',
+            json: async () => ({}),
+            text: async () => legitimateHtmlStep === 1 ? projectHtml : identityHtml,
+            buffer: async () => Buffer.from(projectHtml),
+            headers: {
+                get: name => name.toLowerCase() === 'content-type' ? 'text/html' : null,
+                raw: () => ({}),
+            },
+        };
+    };
+    const ambiguousHtmlFile = await api.getFile('project', 'login-form.html') as {
+        type: string;
+        authError?: string;
+        content?: Uint8Array;
+    };
+    assert.equal(ambiguousHtmlFile.type, 'error');
+    assert.equal(ambiguousHtmlFile.authError, undefined,
+        'a login-like project file must be blocked as ambiguous without expiring a verified session');
+    assert.equal(ambiguousHtmlFile.content, undefined);
+
+    let passportStep = 0;
+    let passportRequest: { headers?: Record<string, string>; body?: string } | undefined;
+    fetchImplementation = async (_url, options) => {
+        passportStep++;
+        if (passportStep === 1) {
+            return {
+                ok: true,
+                status: 200,
+                statusText: 'OK',
+                json: async () => ({}),
+                text: async () => '<INPUT DATA-NOTE=\'value > remains quoted\' VALUE=\'csrf&amp;value\' NAME=\'_CSRF\'>',
+                headers: {
+                    get: () => null,
+                    raw: () => ({ 'set-cookie': ['session=login; Path=/; HttpOnly'] }),
+                },
+            };
+        }
+        passportRequest = options as { headers?: Record<string, string>; body?: string };
+        return {
+            ok: false,
+            status: 302,
+            statusText: 'Found',
+            json: async () => ({}),
+            text: async () => 'Found. Redirecting to /login-failed',
+            headers: { get: () => '/login-failed', raw: () => ({}) },
+        };
+    };
+    const passportResult = await api.passportLogin('person@example.test', 'password') as {
+        type: string;
+        message?: string;
+    };
+    assert.equal(passportResult.type, 'error');
+    assert.equal(passportStep, 2);
+    assert.equal(passportRequest?.headers?.['X-Csrf-Token'], 'csrf&value');
+    assert.equal(JSON.parse(passportRequest?.body || '{}')._csrf, 'csrf&value');
+
+    for (const transient of [
+        { status: 500, statusText: 'Internal Server Error', detail: 'Planned maintenance' },
+        { status: 502, statusText: 'Bad Gateway', detail: 'Reverse proxy unavailable' },
+    ]) {
+        fetchImplementation = async () => ({
+            ok: false,
+            status: transient.status,
+            statusText: transient.statusText,
+            json: async () => ({}),
+            text: async () => transient.detail,
+            headers: { get: () => null, raw: () => ({}) },
+        });
+        const result = await api.verifyCredentials() as {
+            type: string;
+            message?: string;
+            authError?: string;
+        };
+        assert.equal(result.type, 'error');
+        assert.equal(result.authError, undefined, `${transient.status} must not expire a valid local session`);
+        assert.match(result.message || '', new RegExp(`^${transient.status}:`));
+    }
+
+    const gatewayPage = '<!DOCTYPE html><html><body><img src="data:image/jpeg;base64,'
+        + 'A'.repeat(20000) + '"></body></html>';
+    for (const contentType of ['text/html', 'text/plain', '']) {
+        fetchImplementation = async () => ({
+            ok: false,
+            status: 502,
+            statusText: 'Bad Gateway',
+            text: async () => gatewayPage,
+            json: async () => ({}),
+            headers: { get: () => contentType, raw: () => ({}) },
+        });
+        for (const result of [await api.getProjects(), await api.verifyCredentials()]) {
+            const failure = result as { type: string; message: string; authError?: string };
+            assert.equal(failure.type, 'error');
+            assert.equal(failure.authError, undefined, 'a gateway failure must preserve the stored session');
+            assert.match(failure.message, /^502:.*temporarily unavailable/);
+            assert.ok(failure.message.length < 200, 'an HTML gateway page must become a short explanation');
+            assert.doesNotMatch(failure.message, /DOCTYPE|<html|base64|AAAA/);
+        }
+    }
+
+    fetchImplementation = async () => ({
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        json: async () => ({}),
+        text: async () => 'Blocked by server policy',
+        headers: { get: () => null, raw: () => ({}) },
+    });
+    const forbiddenVerification = await api.verifyCredentials() as { type: string; authError?: string };
+    const forbiddenProjects = await api.getProjects() as { type: string; authError?: string };
+    assert.equal(forbiddenVerification.authError, undefined,
+        'a policy/WAF 403 is not proof that the stored session expired');
+    assert.equal(forbiddenProjects.authError, undefined,
+        'a project-list 403 is not proof that the stored session expired');
+
+    fetchImplementation = async url => {
+        assert.equal(String(url), 'https://overleaf.example/user/projects');
+        return {
+            ok: false,
+            status: 302,
+            statusText: 'Found',
+            json: async () => ({}),
+            text: async () => '',
+            headers: {
+                get: name => name.toLowerCase() === 'location' ? '/login?redir=/project' : null,
+                raw: () => ({}),
+            },
+        };
+    };
+    const projectListLoginRedirect = await api.getProjects() as { type: string; authError?: string };
+    assert.equal(projectListLoginRedirect.type, 'error');
+    assert.equal(
+        projectListLoginRedirect.authError,
+        'session_expired',
+        'a project-list redirect to login must expire the session',
+    );
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => '<form action="/login"><input type="password"></form>',
+        headers: { get: () => 'text/html', raw: () => ({}) },
+    });
+    const projectListLoginPage = await api.getProjects() as { type: string; authError?: string };
+    assert.equal(projectListLoginPage.authError, 'session_expired',
+        'a project-list login page returned with HTTP 200 must expire the session');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => JSON.stringify({
+            projects: [{ _id: 'project-id', name: 'Project', accessLevel: 'owner' }],
+        }),
+        headers: { get: () => 'application/json', raw: () => ({}) },
+    });
+    const validProjectList = await api.getProjects() as { type: string; projects?: Array<{ id: string }> };
+    assert.equal(validProjectList.type, 'success');
+    assert.deepStrictEqual(validProjectList.projects, [{
+        id: 'project-id',
+        name: 'Project',
+        lastUpdated: undefined,
+        accessLevel: 'owner',
+        archived: false,
+        trashed: false,
+    }]);
+
+    let canonicalRedirectStep = 0;
+    const canonicalRedirectUrls: string[] = [];
+    fetchImplementation = async url => {
+        canonicalRedirectUrls.push(String(url));
+        canonicalRedirectStep++;
+        if (canonicalRedirectStep === 1) {
+            return {
+                ok: false,
+                status: 302,
+                statusText: 'Found',
+                json: async () => ({}),
+                text: async () => '',
+                headers: {
+                    get: name => name.toLowerCase() === 'location' ? '/project/' : null,
+                    raw: () => ({}),
+                },
+            };
+        }
+        return {
+            ok: true,
+            status: 200,
+            statusText: 'OK',
+            json: async () => ({}),
+            text: async () => [
+                '<meta name="ol-user_id" content="canonical-user">',
+                '<meta name="ol-usersEmail" content="canonical@example.test">',
+                '<meta name="ol-csrfToken" content="canonical-csrf">',
+            ].join(''),
+            headers: { get: () => null, raw: () => ({}) },
+        };
+    };
+    const canonicalRedirect = await api.verifyCredentials() as {
+        type: string;
+        authError?: string;
+        userInfo?: { userId: string; userEmail: string };
+    };
+    assert.equal(canonicalRedirect.type, 'success');
+    assert.deepStrictEqual(canonicalRedirect.userInfo, {
+        userId: 'canonical-user',
+        userEmail: 'canonical@example.test',
+    });
+    assert.deepStrictEqual(canonicalRedirectUrls, [
+        'https://overleaf.example/project',
+        'https://overleaf.example/project/',
+    ], 'credential verification may follow one same-origin trailing-slash redirect');
+
+    let canonicalThenLoginStep = 0;
+    fetchImplementation = async () => {
+        canonicalThenLoginStep++;
+        const location = canonicalThenLoginStep === 1
+            ? '/project/'
+            : '/login?redir=/project';
+        return {
+            ok: false,
+            status: 302,
+            statusText: 'Found',
+            json: async () => ({}),
+            text: async () => '',
+            headers: {
+                get: name => name.toLowerCase() === 'location' ? location : null,
+                raw: () => ({}),
+            },
+        };
+    };
+    const canonicalThenLogin = await api.verifyCredentials() as { type: string; authError?: string };
+    assert.equal(canonicalThenLogin.type, 'error');
+    assert.equal(canonicalThenLogin.authError, 'session_expired');
+    assert.equal(canonicalThenLoginStep, 2, 'verification must follow at most one canonical redirect');
+
+    let crossOriginRedirectRequests = 0;
+    fetchImplementation = async () => {
+        crossOriginRedirectRequests++;
+        return {
+            ok: false,
+            status: 302,
+            statusText: 'Found',
+            json: async () => ({}),
+            text: async () => '',
+            headers: {
+                get: name => name.toLowerCase() === 'location'
+                    ? 'https://attacker.example/project/'
+                    : null,
+                raw: () => ({}),
+            },
+        };
+    };
+    const crossOriginRedirect = await api.verifyCredentials() as { type: string; authError?: string };
+    assert.equal(crossOriginRedirect.type, 'error');
+    assert.equal(crossOriginRedirect.authError, undefined);
+    assert.equal(crossOriginRedirectRequests, 1, 'credential cookies must never follow a cross-origin redirect');
+
+    let canonicalLoopRequests = 0;
+    fetchImplementation = async () => {
+        canonicalLoopRequests++;
+        const location = canonicalLoopRequests === 1 ? '/project/' : '/project';
+        return {
+            ok: false,
+            status: 302,
+            statusText: 'Found',
+            json: async () => ({}),
+            text: async () => '',
+            headers: {
+                get: name => name.toLowerCase() === 'location' ? location : null,
+                raw: () => ({}),
+            },
+        };
+    };
+    const canonicalLoop = await api.verifyCredentials() as { type: string; authError?: string };
+    assert.equal(canonicalLoop.type, 'error');
+    assert.equal(canonicalLoop.authError, undefined);
+    assert.equal(canonicalLoopRequests, 2, 'canonical redirects must never form a request loop');
+
+    fetchImplementation = async () => ({
+        ok: false,
+        status: 302,
+        statusText: 'Found',
+        json: async () => ({}),
+        text: async () => '',
+        headers: {
+            get: name => name.toLowerCase() === 'location' ? '/login?redir=/project' : null,
+            raw: () => ({}),
+        },
+    });
+    const loginRedirect = await api.verifyCredentials() as { type: string; authError?: string };
+    assert.equal(loginRedirect.type, 'error');
+    assert.equal(loginRedirect.authError, 'session_expired');
+
+    fetchImplementation = async () => ({
+        ok: false,
+        status: 302,
+        statusText: 'Found',
+        json: async () => ({}),
+        text: async () => 'Maintenance',
+        headers: {
+            get: name => name.toLowerCase() === 'location' ? '/maintenance' : null,
+            raw: () => ({}),
+        },
+    });
+    const maintenanceRedirect = await api.verifyCredentials() as {
+        type: string;
+        authError?: string;
+    };
+    assert.equal(maintenanceRedirect.type, 'error');
+    assert.equal(maintenanceRedirect.authError, undefined, 'non-login redirects must remain transient errors');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => '<FORM ACTION=\'/LOGIN\'><INPUT TYPE=\'PASSWORD\' NAME=\'password\'></FORM>',
+        headers: { get: () => null, raw: () => ({}) },
+    });
+    const loginPage = await api.verifyCredentials() as { type: string; authError?: string };
+    assert.equal(loginPage.type, 'error');
+    assert.equal(loginPage.authError, 'session_expired');
+
+    fetchImplementation = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({}),
+        text: async () => '<html><h1>Maintenance in progress</h1></html>',
+        headers: { get: () => null, raw: () => ({}) },
+    });
+    const metadataMissing = await api.verifyCredentials() as {
+        type: string;
+        authError?: string;
+    };
+    assert.equal(metadataMissing.type, 'error');
+    assert.equal(metadataMissing.authError, undefined, 'a metadata-free 200 response is not proof of logout');
+
     fetchImplementation = async () => fetchResponse;
     api.dispose();
 
-    const propagation = Object.create(SyncEngine.prototype) as any;
+    function createTestSyncEngine(): any {
+        return Object.assign(Object.create(SyncEngine.prototype), {
+            documentSnapshots: new Map(), pendingLocalCreates: new Set(), joinedDocs: new Set(),
+            syncLock: new Set(), pendingWaits: new Map(), fileTree: new Map(), fileTreeByPath: new Map(),
+            baseContent: new Map(), fileCache: new Map(), remoteEventQueue: Promise.resolve(),
+        });
+    }
+    let pullLastSyncedUpdates = 0;
+    const pullStatuses: Array<{ status: string; authError: boolean }> = [];
+    const authenticationFailurePull = createTestSyncEngine() as any;
+    authenticationFailurePull.disposed = false;
+    authenticationFailurePull.syncLock = new Set();
+    authenticationFailurePull.pendingWaits = new Map();
+    authenticationFailurePull.project = { name: 'Authentication test' };
+    authenticationFailurePull.refreshProjectFileTree = async () => undefined;
+    authenticationFailurePull.fileTree = new Map([[
+        'document',
+        { id: 'document', type: 'doc', name: 'main.tex', path: '/main.tex' },
+    ]]);
+    authenticationFailurePull.fileTreeByPath = new Map();
+    authenticationFailurePull.baseContent = new Map();
+    authenticationFailurePull.fileCache = new Map();
+    authenticationFailurePull.settings = {
+        getSettings: () => ({ projectId: 'project' }),
+        updateLastSynced: async () => { pullLastSyncedUpdates++; },
+    };
+    authenticationFailurePull.shouldSync = () => true;
+    let authenticationJoinAttempts = 0;
+    authenticationFailurePull.socket = {
+        joinDoc: async () => {
+            authenticationJoinAttempts++;
+            await Promise.resolve();
+            throw new Error('Not authenticated');
+        },
+        leaveDoc: async () => undefined,
+    };
+    authenticationFailurePull.setStatus = (status: string, _message?: string, _file?: string, authError = false) => {
+        pullStatuses.push({ status, authError });
+    };
+    const firstAuthenticationPull = authenticationFailurePull.pullAll();
+    const secondAuthenticationPull = authenticationFailurePull.pullAll();
+    await Promise.all([
+        assert.rejects(firstAuthenticationPull, /Not authenticated/,
+            'a document authentication failure must abort the entire pull'),
+        assert.rejects(secondAuthenticationPull, /Not authenticated/,
+            'concurrent callers must observe the same failed pull'),
+    ]);
+    assert.equal(authenticationJoinAttempts, 1,
+        'concurrent pull requests must share one remote operation');
+    assert.equal(pullLastSyncedUpdates, 0,
+        'a failed document pull must never advance lastSynced');
+    assert.deepStrictEqual(pullStatuses[pullStatuses.length - 1], { status: 'error', authError: true },
+        'a pull authentication failure must visibly expire the session');
+
+    const nonAuthPullStatuses: Array<{ status: string; authError: boolean }> = [];
+    const nonAuthenticationFailurePull = createTestSyncEngine() as any;
+    nonAuthenticationFailurePull.disposed = false;
+    nonAuthenticationFailurePull.syncLock = new Set();
+    nonAuthenticationFailurePull.pendingWaits = new Map();
+    nonAuthenticationFailurePull.project = { name: 'Transient error test' };
+    nonAuthenticationFailurePull.fileTree = new Map([[
+        'document',
+        { id: 'document', type: 'doc', name: 'authentication-notes.tex', path: '/authentication-notes.tex' },
+    ]]);
+    nonAuthenticationFailurePull.fileTreeByPath = new Map();
+    nonAuthenticationFailurePull.baseContent = new Map();
+    nonAuthenticationFailurePull.fileCache = new Map();
+    nonAuthenticationFailurePull.refreshProjectFileTree = async () => undefined;
+    nonAuthenticationFailurePull.settings = {
+        getSettings: () => ({ projectId: 'project' }),
+        updateLastSynced: async () => undefined,
+    };
+    nonAuthenticationFailurePull.shouldSync = () => true;
+    nonAuthenticationFailurePull.socket = {
+        joinDoc: async () => { throw new Error('Temporary socket failure'); },
+        leaveDoc: async () => undefined,
+    };
+    nonAuthenticationFailurePull.api = {
+        getDocContent: async () => ({ type: 'error', message: '500: temporary server error' }),
+    };
+    nonAuthenticationFailurePull.setStatus = (
+        status: string,
+        _message?: string,
+        _file?: string,
+        authError = false,
+    ) => {
+        nonAuthPullStatuses.push({ status, authError });
+    };
+    await assert.rejects(
+        () => nonAuthenticationFailurePull.pullAll(),
+        /authentication-notes\.tex: 500/,
+    );
+    assert.deepStrictEqual(
+        nonAuthPullStatuses[nonAuthPullStatuses.length - 1],
+        { status: 'error', authError: false },
+        'authentication-like filenames and transient HTTP errors must not expire the session',
+    );
+
+    const watchStatuses: Array<{ status: string; authError: boolean }> = [];
+    const authenticationFailureWatcher = createTestSyncEngine() as any;
+    authenticationFailureWatcher.socket = {
+        joinDoc: async () => { throw new Error('Not authenticated'); },
+    };
+    authenticationFailureWatcher.fileTree = new Map([[
+        'document',
+        { id: 'document', type: 'doc', name: 'main.tex', path: '/main.tex' },
+    ]]);
+    authenticationFailureWatcher.joinedDocs = new Set();
+    authenticationFailureWatcher.syncLock = new Set();
+    authenticationFailureWatcher.pendingWaits = new Map();
+    authenticationFailureWatcher.shouldSync = () => true;
+    authenticationFailureWatcher.setStatus = (
+        status: string,
+        _message?: string,
+        _file?: string,
+        authError = false,
+    ) => {
+        watchStatuses.push({ status, authError });
+    };
+    await assert.rejects(
+        () => authenticationFailureWatcher.joinAllDocsForWatching(),
+        /Not authenticated/,
+        'authentication failure while starting document watches must not be ignored',
+    );
+    assert.deepStrictEqual(watchStatuses[watchStatuses.length - 1], { status: 'error', authError: true });
+
+    const propagation = createTestSyncEngine() as any;
     propagation.fileCache = new Map();
     propagation.baseContent = new Map();
     assert.equal(
@@ -1234,8 +2015,11 @@ async function run(): Promise<void> {
     assert.equal(
         propagation.shouldPropagate('/chapter.tex', Uint8Array.from([2])),
         true,
-        'different content inside the debounce window must not be discarded'
+        'unconfirmed content must remain eligible for retry'
     );
+    propagation.fileCache.set('/chapter.tex', require('crypto').createHash('sha256').update(Uint8Array.from([2])).digest('hex'));
+    assert.equal(propagation.shouldPropagate('/chapter.tex', Uint8Array.from([2])), false,
+        'only confirmed identical content is an echo');
     assert.equal(
         propagation.shouldPropagate('/binary.dat', Uint8Array.from([0xff])),
         true,
@@ -1246,7 +2030,7 @@ async function run(): Promise<void> {
         'different invalid UTF-8 byte sequences must not collide in the synchronization cache',
     );
 
-    const transactionalTree = Object.create(SyncEngine.prototype) as any;
+    const transactionalTree = createTestSyncEngine() as any;
     const retainedTreeEntry = {
         id: 'retained-doc',
         type: 'doc',
@@ -1311,7 +2095,7 @@ async function run(): Promise<void> {
     assert.strictEqual(propagation.baseContent.get('/chapter.tex'), documentBaseline,
         'OT documents must retain their exact server baseline');
 
-    const boundedBaselines = Object.create(SyncEngine.prototype) as any;
+    const boundedBaselines = createTestSyncEngine() as any;
     boundedBaselines.baseContent = new Map();
     boundedBaselines.baseHashes = new Map();
     boundedBaselines.fileCache = new Map();
@@ -1335,7 +2119,7 @@ async function run(): Promise<void> {
     assert.equal(typeof boundedBaselines.baseHashes.get('/evicted.tex'), 'string',
         'evicted content must retain its server hash for safe conflict detection');
 
-    const boundedSuppressions = Object.create(SyncEngine.prototype) as any;
+    const boundedSuppressions = createTestSyncEngine() as any;
     boundedSuppressions.suppressedRemoteDocumentUpdates = new Map();
     boundedSuppressions.suppressedDocumentUpdateCount = 0;
     boundedSuppressions.maxSuppressedDocumentUpdates = 2;
@@ -1360,7 +2144,7 @@ async function run(): Promise<void> {
     );
     assert.equal(boundedSuppressions.suppressedDocumentUpdateCount, 1);
 
-    const boundedDiffs = Object.create(SyncEngine.prototype) as any;
+    const boundedDiffs = createTestSyncEngine() as any;
     boundedDiffs.remoteDiffContents = new Map();
     boundedDiffs.remoteDiffCharacters = 0;
     boundedDiffs.maxRemoteDiffCharacters = 7;
@@ -1397,7 +2181,7 @@ async function run(): Promise<void> {
         'unchanged documents should not generate operations',
     );
 
-    const textCreation = Object.create(SyncEngine.prototype) as any;
+    const textCreation = createTestSyncEngine() as any;
     textCreation.api = {
         addDoc: async () => ({
             type: 'success',
@@ -1417,7 +2201,7 @@ async function run(): Promise<void> {
         content: Uint8Array
     ) => {
         pushedDocument = { id, path: filePath, content };
-        return true;
+        return { content, pushed: true };
     };
     const textContent = new TextEncoder().encode('Thesis content');
     await textCreation.createTextDocumentWithContent(
@@ -1437,7 +2221,7 @@ async function run(): Promise<void> {
     assert.deepStrictEqual(textCreation.baseContent.get('/new.tex'), textContent,
         'a new document must enter the synchronized baseline only after its content push succeeds');
 
-    const failedTextCreation = Object.create(SyncEngine.prototype) as any;
+    const failedTextCreation = createTestSyncEngine() as any;
     failedTextCreation.api = {
         addDoc: async () => ({ type: 'error', message: 'simulated create failure' }),
     };
@@ -1461,7 +2245,7 @@ async function run(): Promise<void> {
     assert.equal(failedTextCreation.pendingLocalCreates.size, 0,
         'pending-create markers must be released after failures');
 
-    const failedTextPush = Object.create(SyncEngine.prototype) as any;
+    const failedTextPush = createTestSyncEngine() as any;
     failedTextPush.api = {
         addDoc: async () => ({
             type: 'success',
@@ -1492,7 +2276,7 @@ async function run(): Promise<void> {
         'an empty remote document must not be marked as containing the failed local push');
     assert.equal(failedTextPush.pendingLocalCreates.size, 0);
 
-    const binaryReplacement = Object.create(SyncEngine.prototype) as any;
+    const binaryReplacement = createTestSyncEngine() as any;
     binaryReplacement.settings = {
         getSettings: () => ({ projectId: 'project' }),
     };
@@ -1557,7 +2341,7 @@ async function run(): Promise<void> {
     assert.doesNotMatch(replacementOperations[0], /[/?]/,
         'opaque remote IDs must be hashed before they are used in a temporary filename');
 
-    const failedReplacement = Object.create(SyncEngine.prototype) as any;
+    const failedReplacement = createTestSyncEngine() as any;
     failedReplacement.settings = {
         getSettings: () => ({ projectId: 'project' }),
     };
@@ -1603,7 +2387,7 @@ async function run(): Promise<void> {
     assert.equal(failedReplacement.fileTreeByPath.get('/figure.pdf').id, oldBinary.id,
         'a failed replacement must restore the original in-memory path');
 
-    const uncertainReplacement = Object.create(SyncEngine.prototype) as any;
+    const uncertainReplacement = createTestSyncEngine() as any;
     uncertainReplacement.settings = {
         getSettings: () => ({ projectId: 'project' }),
     };
@@ -1634,7 +2418,7 @@ async function run(): Promise<void> {
     assert.equal(uncertainReplacement.fileTree.has(oldBinary.id), true);
     assert.equal(uncertainReplacement.fileTreeByPath.has('/figure.pdf'), false);
 
-    const invalidUploadTracker = Object.create(SyncEngine.prototype) as any;
+    const invalidUploadTracker = createTestSyncEngine() as any;
     invalidUploadTracker.fileTree = new Map();
     invalidUploadTracker.fileTreeByPath = new Map();
     assert.throws(
@@ -1661,7 +2445,7 @@ async function run(): Promise<void> {
         'upload responses must not overwrite a concurrently tracked entity',
     );
 
-    const untrackedUpload = Object.create(SyncEngine.prototype) as any;
+    const untrackedUpload = createTestSyncEngine() as any;
     untrackedUpload.fileTree = new Map();
     untrackedUpload.fileTreeByPath = new Map();
     untrackedUpload.refreshProjectFileTree = async () => undefined;
@@ -1676,7 +2460,7 @@ async function run(): Promise<void> {
         'an empty upload response and unavailable HTTP tree must not create a false baseline',
     );
 
-    const folderRebase = Object.create(SyncEngine.prototype) as any;
+    const folderRebase = createTestSyncEngine() as any;
     const folderEntry = { id: 'folder', type: 'folder', name: 'old', path: '/old/' };
     const childEntry = { id: 'child', type: 'doc', name: 'child.tex', path: '/old/child.tex' };
     const nestedEntry = { id: 'nested', type: 'file', name: 'image.png', path: '/old/assets/image.png' };
@@ -1700,7 +2484,7 @@ async function run(): Promise<void> {
     assert.ok(folderRebase.fileCache.has('/renamed/assets/image.png'));
     assert.equal(folderRebase.fileTreeByPath.has('/old/child.tex'), false);
 
-    const collidingTransition = Object.create(SyncEngine.prototype) as any;
+    const collidingTransition = createTestSyncEngine() as any;
     const movingFolder = { id: 'moving-folder', type: 'folder', path: '/moving/' };
     const movingChild = { id: 'moving-child', type: 'doc', path: '/moving/child.tex' };
     const occupiedChild = { id: 'occupied-child', type: 'doc', path: '/renamed/child.tex' };
@@ -1728,7 +2512,7 @@ async function run(): Promise<void> {
         () => collidingTransition.assertRemotePathTransitionAvailable('/moving/', '/available/'),
     );
 
-    const subtreeRemoval = Object.create(SyncEngine.prototype) as any;
+    const subtreeRemoval = createTestSyncEngine() as any;
     const subtreeFolder = { id: 'folder', type: 'folder', name: 'folder', path: '/folder/' };
     const subtreeChild = { id: 'child', type: 'doc', name: 'child.tex', path: '/folder/child.tex' };
     subtreeRemoval.fileTree = new Map([['folder', subtreeFolder], ['child', subtreeChild]]);
@@ -1742,6 +2526,7 @@ async function run(): Promise<void> {
     ]);
     subtreeRemoval.fileCache = new Map([['/folder/child.tex', 'hash']]);
     subtreeRemoval.joinedDocs = new Set(['child']);
+    subtreeRemoval.documentSnapshots = new Map();
     subtreeRemoval.removeTrackedSubtree('/folder/');
     assert.equal(subtreeRemoval.fileTree.size, 0, 'folder removal must clear every descendant identity');
     assert.equal(subtreeRemoval.fileTreeByPath.size, 0);
@@ -1758,7 +2543,7 @@ async function run(): Promise<void> {
         ['D:\\safe-folder-delete\\folder\\nested', { type: 2 }],
         ['D:\\safe-folder-delete\\folder\\nested\\tracked.tex', { type: 1, content: 'nested' }],
     ]);
-    const safeFolderDelete = Object.create(SyncEngine.prototype) as any;
+    const safeFolderDelete = createTestSyncEngine() as any;
     safeFolderDelete.disposed = false;
     safeFolderDelete.fileTree = new Map([
         ['folder', { id: 'folder', type: 'folder', path: '/folder/' }],
@@ -1771,6 +2556,7 @@ async function run(): Promise<void> {
             `D:\\safe-folder-delete${projectPath.replace(/\/$/, '').replace(/\//g, '\\')}`
         ),
     };
+    safeFolderDelete.baseContent = new Map([['/folder/tracked.tex', Buffer.from('tracked')], ['/folder/nested/tracked.tex', Buffer.from('nested')]]);
     safeFolderDelete.shouldSync = () => true;
     safeFolderDelete.assertNoSymbolicLinks = async () => undefined;
     const safeFolderOutcome = await safeFolderDelete.deleteTrackedLocalEntry(
@@ -1789,7 +2575,7 @@ async function run(): Promise<void> {
     assert.ok(mockFileDeletes.every(deletion => deletion.recursive === false),
         'remote folder deletion must never issue a recursive local delete');
 
-    const acknowledgement = Object.create(SyncEngine.prototype) as any;
+    const acknowledgement = createTestSyncEngine() as any;
     acknowledgement.fileTree = new Map([
         ['root', { id: 'root', type: 'folder', path: '/' }],
     ]);
@@ -1803,7 +2589,7 @@ async function run(): Promise<void> {
     );
     assert.equal(acknowledgement.fileTreeByPath.get('/photo.jpg').id, 'socket-id-1');
 
-    const localCreate = Object.create(SyncEngine.prototype) as any;
+    const localCreate = createTestSyncEngine() as any;
     localCreate.disposed = false;
     localCreate.getRelativePath = () => '/new.tex';
     localCreate.shouldSync = () => true;
@@ -1815,7 +2601,7 @@ async function run(): Promise<void> {
     await localCreate.handleLocalFileCreate({});
     assert.equal(waitedForLock, true, 'locked local create events must wait instead of being discarded');
 
-    const orderedRemoteEvents = Object.create(SyncEngine.prototype) as any;
+    const orderedRemoteEvents = createTestSyncEngine() as any;
     orderedRemoteEvents.disposed = false;
     orderedRemoteEvents.remoteEventQueue = Promise.resolve();
     const eventOrder: string[] = [];
@@ -1832,7 +2618,7 @@ async function run(): Promise<void> {
     await orderedRemoteEvents.remoteEventQueue;
     assert.deepStrictEqual(eventOrder, ['first-start', 'first-end', 'second']);
 
-    const ownDocumentEcho = Object.create(SyncEngine.prototype) as any;
+    const ownDocumentEcho = createTestSyncEngine() as any;
     ownDocumentEcho.socket = { publicId: 'this-client' };
     ownDocumentEcho.suppressedRemoteDocumentUpdates = new Map();
     ownDocumentEcho.fileTree = new Map();
@@ -1843,7 +2629,7 @@ async function run(): Promise<void> {
         meta: { source: 'this-client', ts: Date.now(), user_id: 'user' },
     });
 
-    const remoteOt = Object.create(SyncEngine.prototype) as any;
+    const remoteOt = createTestSyncEngine() as any;
     const remoteOtUri = mockFileUri('D:\\ot-workspace\\chapter.tex');
     resetMockWorkspace([mockFileUri('D:\\ot-workspace')], [
         ['D:\\ot-workspace', { type: 2 }],
@@ -1861,6 +2647,7 @@ async function run(): Promise<void> {
         new TextEncoder().encode('server'),
     ]]);
     remoteOt.fileCache = new Map();
+    remoteOt.documentSnapshots = new Map([['doc', { content: new TextEncoder().encode('server'), version: 2 }]]);
     remoteOt.settings = {
         getFilePath: () => remoteOtUri,
         getSettings: () => ({ projectId: 'project' }),
@@ -1879,17 +2666,19 @@ async function run(): Promise<void> {
         meta: { source: 'other-client', ts: Date.now(), user_id: 'other' },
     });
     assert.equal(
-        new TextDecoder().decode(remoteOt.baseContent.get('/chapter.tex')),
+        new TextDecoder().decode(remoteOt.documentSnapshots.get('doc').content),
         'server!',
         'remote operations must be applied to the known server base, not an unsaved local edit',
     );
+    assert.equal(new TextDecoder().decode(remoteOt.baseContent.get('/chapter.tex')), 'server',
+        'skipping a remote update must retain the common baseline for the next automatic save');
 
     const evictedOtUri = mockFileUri('D:\\evicted-ot-workspace\\chapter.tex');
     resetMockWorkspace([mockFileUri('D:\\evicted-ot-workspace')], [
         ['D:\\evicted-ot-workspace', { type: 2 }],
         ['D:\\evicted-ot-workspace\\chapter.tex', { type: 1, content: 'server' }],
     ]);
-    const evictedOt = Object.create(SyncEngine.prototype) as any;
+    const evictedOt = createTestSyncEngine() as any;
     evictedOt.disposed = false;
     evictedOt.socket = { publicId: 'this-client' };
     evictedOt.suppressedRemoteDocumentUpdates = new Map();
@@ -1945,7 +2734,7 @@ async function run(): Promise<void> {
         const document = createMockTextDocument(uri, 'local edit');
         mockTextDocuments = [document];
 
-        const engine = Object.create(SyncEngine.prototype) as any;
+        const engine = createTestSyncEngine() as any;
         engine.disposed = false;
         engine.socket = { publicId: 'this-client' };
         engine.suppressedRemoteDocumentUpdates = new Map();
@@ -1962,6 +2751,7 @@ async function run(): Promise<void> {
             getFilePath: () => uri,
             getSettings: () => ({ projectId: 'project' }),
         };
+        engine.documentSnapshots.set('doc', {content: Buffer.from('server'), version: 2});
         engine.api = {};
         engine.shouldSync = () => true;
         engine.acquireLockWhenAvailable = async () => true;
@@ -1991,8 +2781,8 @@ async function run(): Promise<void> {
     assert.equal(mockFileWrites.length, 0, 'skipping a dirty conflict must not overwrite the editor or disk');
     assert.equal(
         new TextDecoder().decode(skippedDirtyRemote.engine.baseContent.get('/chapter.tex')),
-        'server!',
-        'the server base must advance even while dirty local edits are retained',
+        'server',
+        'the common baseline must remain unchanged while dirty local edits are retained',
     );
     assert.equal(
         skippedDirtyRemote.engine.shouldPropagate('/chapter.tex', new TextEncoder().encode('server')),
@@ -2013,7 +2803,7 @@ async function run(): Promise<void> {
         content: Uint8Array,
     ) => {
         pushedDirtyContent = new TextDecoder().decode(content);
-        return true;
+        return { content, pushed: true };
     };
     await keptDirtyRemote.engine.handleRemoteFileChanged(remoteEdit);
     assert.equal(pushedDirtyContent, 'local edit', 'Keep Local must push the in-memory editor, not stale disk');
@@ -2050,9 +2840,10 @@ async function run(): Promise<void> {
         mockTextDocuments = [document];
         const entry = { id: 'doc', type: 'doc', name: 'chapter.tex', path: '/chapter.tex' };
 
-        const engine = Object.create(SyncEngine.prototype) as any;
+        const engine = createTestSyncEngine() as any;
         engine.disposed = false;
         engine.project = { name: 'Test project', rootFolder: [] };
+        engine.refreshProjectFileTree = async () => undefined;
         engine.socket = {
             joinDoc: async () => ({ lines: ['server!'], version: 2 }),
             leaveDoc: async () => undefined,
@@ -2093,7 +2884,7 @@ async function run(): Promise<void> {
         content: Uint8Array,
     ) => {
         fullPullPushedContent = new TextDecoder().decode(content);
-        return true;
+        return { content, pushed: true };
     };
     await keptDirtyPull.engine.pullAll();
     assert.equal(fullPullPushedContent, 'local edit',
@@ -2112,8 +2903,8 @@ async function run(): Promise<void> {
     assert.equal(mockFileWrites.length, 0);
     assert.equal(
         new TextDecoder().decode(changedDuringFullPullPrompt.engine.baseContent.get('/chapter.tex')),
-        'server!',
-        'the remote base must advance when a full pull preserves newer editor text',
+        'server',
+        'the common baseline must remain unchanged when a full pull preserves newer editor text',
     );
 
     const structuralWorkspace = mockFileUri('D:\\structural-workspace');
@@ -2134,7 +2925,7 @@ async function run(): Promise<void> {
     ]);
     const dirtyStructuralDocument = createMockTextDocument(structuralSource, 'unsaved text');
     mockTextDocuments = [dirtyStructuralDocument];
-    const structuralEngine = Object.create(SyncEngine.prototype) as any;
+    const structuralEngine = createTestSyncEngine() as any;
     structuralEngine.settings = structuralSettings;
     assert.equal(
         await structuralEngine.deleteLocalPath('/draft.tex', structuralSource, false),
@@ -2177,7 +2968,7 @@ async function run(): Promise<void> {
     ]);
     const reuploadedDirtyDocument = createMockTextDocument(structuralSource, 'unsaved text');
     mockTextDocuments = [reuploadedDirtyDocument];
-    const reuploadEngine = Object.create(SyncEngine.prototype) as any;
+    const reuploadEngine = createTestSyncEngine() as any;
     reuploadEngine.disposed = false;
     reuploadEngine.settings = structuralSettings;
     reuploadEngine.baseContent = new Map();
@@ -2200,7 +2991,7 @@ async function run(): Promise<void> {
         're-uploading a dirty text file must use its editor buffer rather than stale disk content');
 
     const remoteEntry = { id: 'remote-doc', type: 'doc', name: 'remote.tex', path: '/remote.tex' };
-    const remoteDownload = Object.create(SyncEngine.prototype) as any;
+    const remoteDownload = createTestSyncEngine() as any;
     remoteDownload.settings = { getSettings: () => ({ projectId: 'project' }) };
     remoteDownload.joinedDocs = new Set([remoteEntry.id]);
     let socketLeaves = 0;
@@ -2223,7 +3014,8 @@ async function run(): Promise<void> {
         new TextDecoder().decode(await remoteDownload.getRemoteEntryContent(remoteEntry)),
         'live content',
     );
-    assert.equal(socketLeaves, 1, 'a temporary Socket.IO read must release its document join');
+    assert.equal(socketLeaves, 0, 'a Socket.IO snapshot must retain its live document subscription');
+    assert.equal(remoteDownload.joinedDocs.has(remoteEntry.id), true);
 
     let httpFallbacks = 0;
     remoteDownload.socket.joinDoc = async () => { throw new Error('join unavailable'); };
@@ -2237,7 +3029,7 @@ async function run(): Promise<void> {
         'a failed Socket.IO document read must genuinely fall back to HTTP',
     );
     assert.equal(httpFallbacks, 1);
-    assert.equal(socketLeaves, 2, 'a failed temporary join must still attempt cleanup');
+    assert.equal(socketLeaves, 0, 'a failed refresh must not unsubscribe a previously watched document');
 
     remoteDownload.api.getDocContent = async () => ({ type: 'error', message: 'HTTP unavailable' });
     await assert.rejects(
@@ -2246,7 +3038,7 @@ async function run(): Promise<void> {
         'a pull must fail visibly when neither transport can download a document',
     );
 
-    const watchFailure = Object.create(SyncEngine.prototype) as any;
+    const watchFailure = createTestSyncEngine() as any;
     watchFailure.socket = { joinDoc: async () => { throw new Error('watch unavailable'); } };
     watchFailure.fileTree = new Map([[remoteEntry.id, remoteEntry]]);
     watchFailure.joinedDocs = new Set();
@@ -2261,7 +3053,7 @@ async function run(): Promise<void> {
     );
     assert.equal(watchFailureStatus, 'error');
 
-    const floodedRemoteQueue = Object.create(SyncEngine.prototype) as any;
+    const floodedRemoteQueue = createTestSyncEngine() as any;
     floodedRemoteQueue.pendingRemoteEventCount = 10_000;
     floodedRemoteQueue.pendingRemoteEventCost = 0;
     floodedRemoteQueue.log = () => undefined;
@@ -2283,7 +3075,7 @@ async function run(): Promise<void> {
     assert.equal(floodedSocketDisconnected, true,
         'large queued OT payloads must be bounded independently from event count');
 
-    const automaticSync = Object.create(SyncEngine.prototype) as any;
+    const automaticSync = createTestSyncEngine() as any;
     const automaticSyncWorkspace = mockFileUri('D:\\automatic-sync-workspace');
     automaticSync.settings = {
         getSettings: () => ({ autoSync: true }),
@@ -2307,7 +3099,7 @@ async function run(): Promise<void> {
         ['D:\\scan-workspace\\nested\\other.tex', { type: 1, content: 'other' }],
         ['D:\\scan-workspace\\outside-link', { type: 2 | 64 }],
     ]);
-    const boundedLocalScan = Object.create(SyncEngine.prototype) as any;
+    const boundedLocalScan = createTestSyncEngine() as any;
     boundedLocalScan.settings = { getWorkspaceFolder: () => scanWorkspace };
     boundedLocalScan.assertNoSymbolicLinks = async () => undefined;
     boundedLocalScan.shouldSync = () => true;
@@ -2336,7 +3128,7 @@ async function run(): Promise<void> {
         [oversizedLocalWorkspace.fsPath, { type: 2 }],
         [oversizedLocalUri.fsPath, { type: 1, content: 'small mock', size: MAX_REMOTE_FILE_BYTES + 1 }],
     ]);
-    const boundedLocalRead = Object.create(SyncEngine.prototype) as any;
+    const boundedLocalRead = createTestSyncEngine() as any;
     boundedLocalRead.settings = { getWorkspaceFolder: () => oversizedLocalWorkspace };
     await assert.rejects(
         () => boundedLocalRead.readLocalFile(oversizedLocalUri),
@@ -2344,16 +3136,17 @@ async function run(): Promise<void> {
         'local uploads must reject oversized files before reading them into memory',
     );
 
-    const protectedPaths = Object.create(SyncEngine.prototype) as any;
+    const protectedPaths = createTestSyncEngine() as any;
     protectedPaths.ignoreParser = { shouldIgnore: () => false };
     assert.equal(protectedPaths.shouldSync('/.git/config'), false);
     assert.equal(protectedPaths.shouldSync('/.vscode/settings.json'), false);
     assert.equal(protectedPaths.shouldSync('/.localleaf/settings.json'), false);
     assert.equal(protectedPaths.shouldSync('/chapter.tex'), true);
 
-    const protectedPull = Object.create(SyncEngine.prototype) as any;
+    const protectedPull = createTestSyncEngine() as any;
     protectedPull.disposed = false;
     protectedPull.project = { name: 'Protected project', rootFolder: [] };
+    protectedPull.refreshProjectFileTree = async () => undefined;
     const protectedRoot = { id: 'root', type: 'folder', path: '/' };
     const protectedFolder = { id: 'git', type: 'folder', path: '/.git/' };
     protectedPull.fileTree = new Map([
@@ -2378,7 +3171,7 @@ async function run(): Promise<void> {
     assert.equal(protectedPull.baseContent.has('/.git/'), false,
         'a full pull must not materialize or track protected remote folders');
 
-    const cancellableLock = Object.create(SyncEngine.prototype) as any;
+    const cancellableLock = createTestSyncEngine() as any;
     cancellableLock.disposed = false;
     cancellableLock.syncLock = new Set(['/busy.tex']);
     cancellableLock.pendingWaits = new Map();
@@ -2395,11 +3188,12 @@ async function run(): Promise<void> {
     cancellableLock.baseContent = new Map();
     cancellableLock.pendingLocalCreates = new Set();
     cancellableLock.joinedDocs = new Set();
+    cancellableLock.documentSnapshots = new Map();
     const pendingLock = cancellableLock.acquireLockWhenAvailable('/busy.tex');
     cancellableLock.disconnect();
     assert.equal(await pendingLock, false, 'disconnect must cancel lock waits immediately');
 
-    const rootDeletion = Object.create(SyncEngine.prototype) as any;
+    const rootDeletion = createTestSyncEngine() as any;
     rootDeletion.suppressedRemoteDeletes = new Set();
     rootDeletion.fileTree = new Map([['root', { id: 'root', type: 'folder', path: '/' }]]);
     await assert.rejects(
@@ -2407,7 +3201,10 @@ async function run(): Promise<void> {
         /project root/,
     );
 
-    const cleanup = Object.create(SyncEngine.prototype) as any;
+    const cleanup = createTestSyncEngine() as any;
+    cleanup.disposed = false;
+    cleanup.syncLock = new Set();
+    cleanup.pendingWaits = new Map();
     const ignored = {
         id: 'aux-id',
         type: 'file',
@@ -2460,7 +3257,7 @@ async function run(): Promise<void> {
     assert.deepStrictEqual(deleted, ['/thesis.aux']);
     assert.equal(cleanup.fileTreeByPath.has('/thesis.tex'), true);
 
-    const selfHostedRefresh = Object.create(SyncEngine.prototype) as any;
+    const selfHostedRefresh = createTestSyncEngine() as any;
     const liveEntry = {
         id: 'live-id',
         type: 'file',
@@ -2468,6 +3265,7 @@ async function run(): Promise<void> {
         name: 'thesis.aux',
     };
     selfHostedRefresh.settings = { getSettings: () => ({ projectId: 'project' }) };
+    selfHostedRefresh.socket = { isConnected: true };
     selfHostedRefresh.api = {
         getProjectDetails: async () => ({
             type: 'success',
@@ -2480,7 +3278,7 @@ async function run(): Promise<void> {
     assert.equal(selfHostedRefresh.fileTreeByPath.get(liveEntry.path), liveEntry,
         'a self-hosted server without HTTP folder metadata must retain the live Socket.IO tree');
 
-    const unavailableRefresh = Object.create(SyncEngine.prototype) as any;
+    const unavailableRefresh = createTestSyncEngine() as any;
     unavailableRefresh.settings = selfHostedRefresh.settings;
     unavailableRefresh.api = selfHostedRefresh.api;
     unavailableRefresh.fileTree = new Map();
@@ -2515,6 +3313,10 @@ async function run(): Promise<void> {
     const projectsProvider = Object.create(ProjectsWebviewProvider.prototype) as any;
     projectsProvider.extensionUri = 'extension';
     const projectsHtml = projectsProvider.getHtml(mockWebview);
+    const { runErrorPresentationTests } = require('./errorPresentationTest') as {
+        runErrorPresentationTests(html: string): void;
+    };
+    runErrorPresentationTests(projectsHtml);
     assert.match(projectsHtml, /split\(\/\\s\+\/\)/, 'project initials must split on whitespace');
     assert.match(projectsHtml, /openLocalProject/, 'detected local projects must be openable from the panel');
     assert.match(projectsHtml, /ArrowDown/, 'project lists must support keyboard navigation');
@@ -2661,12 +3463,20 @@ async function run(): Promise<void> {
     await Promise.all([firstRefresh, duplicateRefresh]);
 
     const accountSource = fs.readFileSync(path.join(viewsDirectory, 'accountPanel.js'), 'utf8');
+    const { AccountPanel } = require('../views/accountPanel') as { AccountPanel: any };
+    const accountProvider = Object.create(AccountPanel.prototype) as any;
+    const { runConnectionSettingsTests } = require('./connectionSettingsTest') as {
+        runConnectionSettingsTests(html: string): Promise<void>;
+    };
+    await runConnectionSettingsTests(accountProvider.getHtml(mockWebview));
+    assert.deepStrictEqual(accountProvider.parseAction({ type: 'selectServer', serverUrl: ' https://other.example/ ' }),
+        { type: 'selectServer', serverUrl: 'https://other.example/' });
+    assert.equal(accountProvider.parseAction({ type: 'selectServer', serverUrl: 42 }), undefined);
     const cookieHandler = accountSource.indexOf("loginCookies.addEventListener('click'");
     const cookieClear = accountSource.indexOf("cookies.value = ''", cookieHandler);
     const cookiePost = accountSource.indexOf("vscode.postMessage({ type: 'loginCookies'", cookieHandler);
     assert.ok(cookieHandler >= 0 && cookieClear > cookieHandler && cookieClear < cookiePost,
         'session cookies must be removed from the DOM before the login message is posted');
-    const { AccountPanel } = require(path.join('..', 'views', 'accountPanel')) as { AccountPanel: any };
     const accountParser = Object.create(AccountPanel.prototype) as any;
     assert.deepStrictEqual(accountParser.parseAction({
         type: 'loginCookies',
@@ -2687,11 +3497,24 @@ async function run(): Promise<void> {
         serverUrl: 'https://overleaf.example',
         cookies: 'session=safe\r\nInjected: header',
     }), undefined, 'cookie messages containing header delimiters must be rejected in the webview host');
+    assert.match(accountSource, /loginBrowser/);
+    assert.match(accountSource, /cancelLogin/);
+    assert.match(accountSource, /verifySession/);
+    assert.match(accountSource, /aria-busy/,
+        'the Account panel must expose its busy state to assistive technology');
+    assert.doesNotMatch(accountSource, /\.innerHTML\s*=/,
+        'account and server values must never be interpolated through innerHTML');
 
     const extensionSource = fs.readFileSync(
         path.join(__dirname, '..', '..', 'src', 'extension.ts'),
         'utf8',
     );
+    const syncEngineSource = fs.readFileSync(
+        path.join(__dirname, '..', '..', 'src', 'sync', 'syncEngine.ts'),
+        'utf8',
+    );
+    assert.match(syncEngineSource, /Waiting for your choice in VS Code notifications/,
+        'interactive pulls must identify a required choice even when VS Code hides notifications');
     const cookieLoginStart = extensionSource.indexOf('async function loginWithCookies');
     const cookieLoginEnd = extensionSource.indexOf('// === Command Implementations ===', cookieLoginStart);
     const cookieLoginSource = extensionSource.slice(cookieLoginStart, cookieLoginEnd);
@@ -2703,12 +3526,74 @@ async function run(): Promise<void> {
     assert.match(extensionSource.slice(insecureWarning, cookieLoginStart), /modal:\s*true/);
     assert.ok(insecureWarning >= 0 && cookieApiCreation >= 0,
         'HTTP cookie login must require a modal warning before any API request');
-    assert.match(extensionSource, /if \(await loginWithCookies[\s\S]*await reconnectAfterLogin\(\)/,
+    assert.match(extensionSource, /if \(await loginWithCookies[\s\S]*await reconnectAfterLogin\(context\)/,
         'cancelling the HTTP warning must also skip reconnecting');
     assert.doesNotMatch(extensionSource, /serverUrl\.includes\(['"]overleaf\.com/,
         'official Overleaf detection must use the parsed hostname, not a substring');
-    assert.match(extensionSource, /async function cmdRefreshCookie[\s\S]*loginWithCookies\(serverUrl, cookies\)/,
-        'cookie refresh must use the same URL and HTTP safety policy as login');
+    assert.match(extensionSource, /async function cmdRefreshCookie[\s\S]*COMMANDS\.SHOW_ACCOUNT_PANEL/,
+        're-authentication commands must return users to the unified Account panel');
+    const activationStart = extensionSource.indexOf('export async function activate');
+    const activationEnd = extensionSource.indexOf('/**\n * Register all commands', activationStart);
+    const activationSource = extensionSource.slice(activationStart, activationEnd);
+    assert.ok(activationStart >= 0 && activationEnd > activationStart);
+    assert.match(activationSource, /startInitialSync\(context, settingsManager\);/,
+        'extension activation must start initial synchronization without awaiting an interactive pull');
+    assert.doesNotMatch(activationSource, /await initializeSync\(context, settingsManager\);/,
+        'an interactive initial pull must not block webview activation');
+    const initializeStart = extensionSource.indexOf('async function initializeSync');
+    const initializeEnd = extensionSource.indexOf('function updateStatusBar', initializeStart);
+    const initializeSource = extensionSource.slice(initializeStart, initializeEnd);
+    const credentialAwait = initializeSource.indexOf('await credentialManager.getCredential');
+    const pendingKeyPublication = initializeSource.indexOf('activeSyncKey = initializationSyncKey');
+    const staleInitializationCheck = initializeSource.indexOf(
+        'if (!isCurrentSyncInitialization(',
+        credentialAwait,
+    );
+    const engineCreation = initializeSource.indexOf('new SyncEngine', credentialAwait);
+    assert.ok(initializeStart >= 0 && initializeEnd > initializeStart);
+    assert.match(extensionSource, /function disposeCurrentSyncSession\(\): void \{[\s\S]*syncSessionGeneration\+\+;/,
+        'disposing a sync session must invalidate initializations that are still awaiting prerequisites');
+    assert.match(initializeSource, /if \(deactivating\) return;[\s\S]*const initializationGeneration = syncSessionGeneration;/,
+        'initial synchronization must capture an ownership generation and refuse to start during deactivation');
+    assert.ok(
+        pendingKeyPublication >= 0
+        && pendingKeyPublication < credentialAwait
+        && staleInitializationCheck > credentialAwait
+        && engineCreation > staleInitializationCheck,
+        'the pending key must be visible before SecretStorage and stale initialization must stop before engine creation',
+    );
+    assert.match(initializeSource, /await setAuthState[\s\S]*abandonStaleSyncEngine/,
+        'initial synchronization must re-check ownership after UI refreshes yield control');
+    assert.match(extensionSource, /if \(nextKey !== activeSyncKey\)[\s\S]*initializeSync\(context, current\)/,
+        'settings changes must invalidate pending as well as active synchronization');
+    const reconnectStart = extensionSource.indexOf('async function cmdReconnect');
+    const reconnectEnd = extensionSource.indexOf('/**', reconnectStart + 1);
+    const reconnectSource = extensionSource.slice(reconnectStart, reconnectEnd);
+    assert.match(reconnectSource, /if \(deactivating\) return;/);
+    assert.match(reconnectSource, /await settingsManager\.isLinked\(\)[\s\S]*deactivating[\s\S]*SettingsManager\.getCurrentInstance/,
+        'reconnect must revalidate its workspace after yielding');
+    assert.match(reconnectSource, /await initializeSync\(context, settingsManager\);/,
+        'reconnect must use the generation-guarded initialization path');
+    assert.doesNotMatch(reconnectSource, /new SyncEngine/,
+        'reconnect must not maintain a second unguarded engine-construction path');
+    assert.match(extensionSource, /captureCookiesViaBrowserLogin[\s\S]*controller\.signal/,
+        'browser login must be cancellable from the Account panel and native progress UI');
+    assert.match(extensionSource, /vscode\.env\.remoteName[\s\S]*manual cookie option/,
+        'remote extension hosts must fall back to manual cookies instead of launching a remote browser');
+    assert.match(extensionSource, /verifyCredentialsForServer\(requestedServerUrl/,
+        'session verification must accept an Account-panel server without requiring a linked project');
+    assert.match(extensionSource, /activeBrowserLogin\?\.abort\(\)[\s\S]*await waitForBrowserLoginCleanup/,
+        'extension deactivation must wait for browser process and profile cleanup');
+    assert.match(extensionSource, /if \(deactivating\) return false;[\s\S]*confirmInsecureServer[\s\S]*\|\| deactivating/,
+        'deactivation must prevent browser launch before and after an HTTP warning');
+    assert.match(extensionSource, /result\.authError === 'session_expired'[\s\S]*result\.authError === 'invalid_credentials'/,
+        'only explicit authentication failures may expire a stored session');
+    assert.match(extensionSource, /Could not verify the session[\s\S]*stored session was not changed/,
+        'transient verification failures must preserve the stored session');
+    assert.match(extensionSource, /onCleanupFailure:[\s\S]*could not remove its isolated browser profile/,
+        'failed temporary-profile cleanup must be visible to the user');
+    assert.match(extensionSource, /if \(accountActionInProgress\)[\s\S]*before logging out/,
+        'direct account commands must not race an active browser login');
     assert.doesNotMatch(extensionSource, /context\.subscriptions\.push\(tracker\)/,
         'reconnected cursor trackers must not be retained for the full extension lifetime');
     assert.match(extensionSource, /handleWorkspaceFoldersChanged[\s\S]*disposeCurrentSyncSession\(\)[\s\S]*initializeSync/,
@@ -2766,6 +3651,10 @@ async function run(): Promise<void> {
         'utf8',
     );
     assert.match(projectsSource, /Preparing synchronization\.\.\./);
+    assert.match(projectsSource, /result\.authError[\s\S]*onAuthenticationState\?\.\(credential\.serverUrl, 'expired'\)/,
+        'project-list authentication failures must update the Account panel state');
+    assert.match(projectsSource, /onAuthenticationState\?\.\(credential\.serverUrl, 'valid'\)/,
+        'a successful authenticated project request must verify the stored session');
     assert.doesNotMatch(projectsSource, /Ã|â€¦/,
         'project loading text must not contain mojibake');
 
@@ -3057,6 +3946,97 @@ async function run(): Promise<void> {
     assert.equal(emptyFolderProvider.state.status, 'not-logged-in');
     assert.equal(emptyFolderProvider.state.workspaceKind, 'empty');
 
+    const recoveryCredential = {
+        serverUrl: 'https://overleaf.example/latex',
+        identity: { cookies: 'test-cookie', csrfToken: 'test-csrf' },
+    };
+    const recoveryAuthStates: string[] = [];
+    const recoveryProvider = new ProjectsWebviewProvider('extension', {
+        getDefaultServer: () => recoveryCredential.serverUrl,
+        getCredential: async () => recoveryCredential,
+    }, (_server: string, authState: string) => { recoveryAuthStates.push(authState); }) as any;
+    fetchImplementation = async () => ({
+        ok: false, status: 502, statusText: 'Bad Gateway',
+        text: async () => gatewayPage, json: async () => ({}),
+        headers: { get: () => 'text/html', raw: () => ({}) },
+    });
+    await recoveryProvider.refresh();
+    assert.equal(recoveryProvider.state.status, 'connection-error');
+    assert.match(recoveryProvider.state.message, /^502:/);
+    assert.deepStrictEqual(recoveryAuthStates, [], 'a server failure must not change account validity');
+    const recoveryCommands: unknown[][] = [];
+    executeCommandImpl = async (...args: unknown[]) => { recoveryCommands.push(args); };
+    await recoveryProvider.handleMessage({ type: 'login' });
+    await recoveryProvider.handleMessage({ type: 'openFolder' });
+    assert.deepStrictEqual(recoveryCommands, [['localleaf.showAccountPanel'], ['vscode.openFolder']]);
+    let openedServer = '';
+    openExternalImpl = async uri => { openedServer = uri.toString(); return true; };
+    await recoveryProvider.handleMessage({ type: 'openServer', url: 'https://untrusted.example' });
+    assert.equal(openedServer, 'https://overleaf.example/latex/project',
+        'browser recovery must use the configured server and preserve its subpath');
+    openExternalImpl = async () => true;
+    executeCommandImpl = async () => undefined;
+
+    fetchImplementation = async () => { throw new Error(gatewayPage); };
+    await recoveryProvider.refresh();
+    assert.equal(recoveryProvider.state.message, 'Could not load Overleaf projects.',
+        'exceptions must not put an HTML page back into the sidebar');
+
+    fetchImplementation = async () => ({
+        ok: true, status: 200, statusText: 'OK',
+        text: async () => JSON.stringify({ projects: [{ _id: 'restored', name: 'Restored project' }] }),
+        json: async () => ({}), headers: { get: () => 'application/json', raw: () => ({}) },
+    });
+    await recoveryProvider.handleMessage({ type: 'refresh' });
+    assert.equal(recoveryProvider.state.status, 'ready', 'retry must restore the project list when the server recovers');
+    assert.equal(recoveryProvider.state.projects[0].id, 'restored');
+    assert.deepStrictEqual(recoveryAuthStates, ['valid']);
+
+    fetchImplementation = async () => ({
+        ok: false, status: 302, statusText: 'Found',
+        text: async () => 'Found. Redirecting to /login', json: async () => ({}),
+        headers: { get: name => name.toLowerCase() === 'location' ? '/login' : null, raw: () => ({}) },
+    });
+    await recoveryProvider.refresh();
+    assert.equal(recoveryProvider.state.status, 'not-logged-in',
+        'a 302 to login must lead to authentication rather than leave a retry-only error');
+    assert.match(recoveryProvider.state.message, /Re-authenticate/);
+    assert.deepStrictEqual(recoveryAuthStates, ['valid', 'expired']);
+
+    let selectedServerUrl = 'https://old.example';
+    let finishOldRequest: ((response: typeof fetchResponse) => void) | undefined;
+    let startedOldRequest: (() => void) | undefined;
+    const oldRequestStarted = new Promise<void>(resolve => { startedOldRequest = resolve; });
+    const switchingProvider = new ProjectsWebviewProvider('extension', {
+        getDefaultServer: () => selectedServerUrl,
+        getCredential: async (serverUrl: string) => ({ serverUrl, identity: { cookies: serverUrl, csrfToken: 'test' } }),
+    }) as any;
+    fetchImplementation = async url => {
+        if (String(url).startsWith('https://old.example/')) {
+            return new Promise(resolve => { finishOldRequest = resolve; startedOldRequest?.(); });
+        }
+        return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ projects: [{ _id: 'new-server-project', name: 'New server project' }] }),
+            json: async () => ({}), headers: { get: () => 'application/json', raw: () => ({}) },
+        };
+    };
+    const oldRefresh = switchingProvider.refresh();
+    await oldRequestStarted;
+    selectedServerUrl = 'https://new.example';
+    await switchingProvider.refresh();
+    finishOldRequest?.({
+        ok: false, status: 502,
+        text: async () => gatewayPage, json: async () => ({}),
+        headers: { get: () => 'text/html', raw: () => ({}) },
+    });
+    await oldRefresh;
+    assert.equal(switchingProvider.state.status, 'ready');
+    assert.equal(switchingProvider.state.projects[0].id, 'new-server-project',
+        'an old server failure must not replace projects from the newly selected connection');
+
+
+
     resetMockWorkspace([workspaceRoot], [
         ['D:\\workspace', { type: 2 }],
         ['D:\\workspace\\.localleaf', { type: 2 }],
@@ -3143,6 +4123,8 @@ async function run(): Promise<void> {
         'this checkout\'s local ignore rules must never be packaged');
     assert.match(vscodeIgnore, /^\.mailmap$/m,
         'repository-only author mappings must never be packaged');
+    assert.match(vscodeIgnore, /^test\/\*\*$/m,
+        'local end-to-end workspaces and personal documents must never be packaged');
     assert.match(vscodeIgnore, /^out\/\*\*$/m,
         'intermediate TypeScript output must not be packaged');
     assert.match(vscodeIgnore, /^node_modules\/\*\*$/m,
@@ -3211,11 +4193,6 @@ async function run(): Promise<void> {
     const bundleSource = fs.readFileSync(bundlePath, 'utf8');
     assert.doesNotMatch(
         bundleSource,
-        /require\(["']child_process["']\)/,
-        'the production bundle must not contain the legacy synchronous XHR helper',
-    );
-    assert.doesNotMatch(
-        bundleSource,
         /\beval\(/,
         'the production bundle must not contain the legacy JSON eval fallback',
     );
@@ -3225,7 +4202,27 @@ async function run(): Promise<void> {
         'the production bundle must not contain legacy XHR temporary-file helpers',
     );
     verifyBundledLegacySocketClient();
-    const bundle = require(bundlePath) as { activate?: unknown; deactivate?: unknown };
+    const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    assert.ok(
+        !navigatorDescriptor || navigatorDescriptor.configurable,
+        'the test runner must be able to emulate VS Code\'s guarded navigator global',
+    );
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        get: () => {
+            throw new Error('PendingMigrationError: navigator is guarded by VS Code');
+        },
+    });
+    let bundle: { activate?: unknown; deactivate?: unknown };
+    try {
+        bundle = require(bundlePath) as { activate?: unknown; deactivate?: unknown };
+    } finally {
+        if (navigatorDescriptor) {
+            Object.defineProperty(globalThis, 'navigator', navigatorDescriptor);
+        } else {
+            delete (globalThis as { navigator?: unknown }).navigator;
+        }
+    }
     assert.equal(typeof bundle.activate, 'function', 'the bundle must export activate');
     assert.equal(typeof bundle.deactivate, 'function', 'the bundle must export deactivate');
 
@@ -3266,6 +4263,13 @@ async function run(): Promise<void> {
     assert.match(socketTransportSource, /maxBufferedChunks:\s*16\s*\*\s*1024/);
     assert.match(socketTransportSource, /\.onopen\s*=/);
     assert.match(socketTransportSource, /\.onmessage\s*=/);
+    const socketUtilSource = fs.readFileSync(
+        path.join(__dirname, '..', '..', 'node_modules', 'socket.io-client', 'lib', 'util.js'),
+        'utf8',
+    );
+    assert.match(socketUtilSource, /util\.ua\.webkit\s*=\s*false/);
+    assert.match(socketUtilSource, /util\.ua\.iDevice\s*=\s*false/);
+    assert.doesNotMatch(socketUtilSource, /typeof navigator|navigator\.userAgent/);
     const socketLifecycleSource = fs.readFileSync(
         path.join(
             __dirname,
@@ -3301,6 +4305,26 @@ async function run(): Promise<void> {
     assert.match(wsClientSource, /head,\s*options\.maxPayload,/s);
     await verifyWebSocketCompatibility();
     await verifyHardenedXmlHttpRequest();
+    const socketPatchSource = fs.readFileSync(
+        path.join(__dirname, '..', '..',
+            'patches',
+            'socket.io-client+0.9.17-overleaf-5.patch',
+        ),
+        'utf8',
+    );
+    assert.match(socketPatchSource, /\+\s*util\.ua\.webkit\s*=\s*false/);
+    assert.match(socketPatchSource, /\+\s*util\.ua\.iDevice\s*=\s*false/);
+    assert.doesNotMatch(socketPatchSource, /\+.*module\.parent\.exports/);
+    assert.match(socketPatchSource, /\+\s*io\.Transport\.websocket\s*=\s*require/);
+    verifyBundledSocketClientCompatibility();
+    const { runBrowserCookieLoginTests } = require(path.join(__dirname, 'browserCookieLoginTest.js')) as {
+        runBrowserCookieLoginTests(): Promise<void>;
+    };
+    await runBrowserCookieLoginTests();
+    const { runSocketIOProtocolTests } = require(path.join(__dirname, 'socketioTest.js')) as {
+        runSocketIOProtocolTests(): Promise<void>;
+    };
+    await runSocketIOProtocolTests();
 
     Module._load = originalLoad;
     console.log('LocalLeaf synchronization and UI contract regression tests passed.');

@@ -447,3 +447,16 @@ export function createSettingsWatcher(
 
     return watcher;
 }
+
+/**
+ * Return whether local filesystem changes may be uploaded automatically.
+ * Either the workspace setting or the persisted project setting can opt out;
+ * explicit sync commands and incoming synchronization remain available.
+ */
+export function isAutomaticSyncEnabled(settings: SettingsManager): boolean {
+    const projectSetting = settings.getSettings()?.autoSync ?? true;
+    const workspaceSetting = vscode.workspace
+        .getConfiguration('localleaf', settings.getWorkspaceFolder())
+        .get<boolean>('autoSync', true);
+    return projectSetting && workspaceSetting;
+}

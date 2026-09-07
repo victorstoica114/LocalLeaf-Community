@@ -18,6 +18,8 @@ Parts of that proposal became the starting point for the interface used here. Th
 
 The disposition of every public pull request and every PR #3 commit is recorded in [docs/CONTRIBUTOR_INTEGRATION.md](docs/CONTRIBUTOR_INTEGRATION.md), including the security reasons for the feature groups that are not shipped.
 
+The browser-assisted login introduced after the first community release is also adapted from Asixa's work in commits `e8af676`, `7e3e591`, and `2f46c2b`. The Community implementation keeps that login and browser-selection concept while adding cancellation, bounded network operations, isolated-profile cleanup, stricter cookie validation, support for self-hosted URL subpaths, and integration with the current Account panel. Those later safeguards do not erase the authorship of the original feature.
+
 ## Victor Stoica
 
 Victor contributed fixes for file creation and binary synchronization, integrated and refined the new interface, addressed review and security findings, improved Windows path handling, and added compatibility fixes for self-hosted Overleaf servers. He maintains the community repository and the releases produced from it.

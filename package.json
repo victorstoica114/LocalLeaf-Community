@@ -2,7 +2,7 @@
   "name": "localleaf-community",
   "displayName": "LocalLeaf Community",
   "description": "Edit Overleaf projects locally in VS Code with two-way synchronization.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "victorstoica114",
   "repository": {
     "type": "git",
@@ -134,7 +134,7 @@
       },
       {
         "command": "localleaf.refreshCookie",
-        "title": "LocalLeaf: Refresh Cookie"
+        "title": "LocalLeaf: Re-authenticate"
       },
       {
         "command": "localleaf.removeComments",
@@ -152,7 +152,7 @@
         "localleaf.autoSync": {
           "type": "boolean",
           "default": true,
-          "description": "Enable automatic sync when files change"
+          "description": "Automatically upload local file changes to Overleaf"
         }
       }
     }
@@ -166,7 +166,7 @@
     "package": "npm run check-types && node esbuild.js --production",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js",
+    "test": "node ./out/test/runTest.js && node ./out/test/syncAuditTest.js",
     "postinstall": "patch-package",
     "website:dev": "npm run dev --prefix docs/website",
     "website:build": "npm run build --prefix docs/website"

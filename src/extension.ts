@@ -1,3 +1,4 @@
+import { selectDefaultServer } from './utils/connectionSettings';
 /**
  * LocalLeaf VS Code Extension
  * Local sync for Overleaf LaTeX projects
@@ -6,7 +7,10 @@
 import * as vscode from 'vscode';
 import { COMMANDS, EXTENSION_NAME, STATUS_BAR_PRIORITY, CONFIG_DIR, IGNORE_FILE } from './consts';
 import { CredentialManager, ServerCredential } from './utils/credentialManager';
-import { SettingsManager, createSettingsWatcher } from './utils/settingsManager';
+import {
+    SettingsManager,
+    createSettingsWatcher,
+} from './utils/settingsManager';
 import { BaseAPI, ProjectInfo } from './api/base';
 import { SyncEngine, SyncStatus } from './sync/syncEngine';
 import { IgnoreParser } from './sync/ignoreParser';
@@ -14,7 +18,7 @@ import { CursorTracker } from './collaboration/cursorTracker';
 import { setOutputChannel } from './api/socketio';
 import { ProjectsWebviewProvider } from './views/projectsWebviewProvider';
 import { MainWebviewProvider } from './views/mainWebviewProvider';
-import { AccountPanel, AccountPanelAction, AccountPanelState } from './views/accountPanel';
+import { AccountPanel, AccountPanelAction, AccountPanelOperation, AccountPanelState } from './views/accountPanel';
 import {
     LinkOperationGate,
     resolveRequestedProject,
@@ -29,11 +33,13 @@ import {
     revokeSyncTarget,
     SyncAuthorizationTarget,
 } from './utils/syncAuthorization';
+import { BrowserPreference, captureCookiesViaBrowserLogin } from './auth/browserCookieLogin';
+import { isSyncInitializationSnapshotCurrent } from './utils/syncInitialization';
 
 /**
  * Auth state type
  */
-type AuthState = 'valid' | 'expired' | 'none';
+type AuthState = 'valid' | 'expired' | 'unknown' | 'none';
 
 /**
  * Extension state
@@ -46,14 +52,23 @@ let loginStatusItem: vscode.StatusBarItem;
 let collaboratorStatusItem: vscode.StatusBarItem;
 let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
-let authState: AuthState = 'none';
+let authState: AuthState = 'unknown';
+let authStateServerUrl: string | undefined;
 let projectsWebviewProvider: ProjectsWebviewProvider;
 let mainWebviewProvider: MainWebviewProvider;
 let settingsWatcher: vscode.Disposable | undefined;
 let syncStatusSubscription: vscode.Disposable | undefined;
 let workspaceChangeGeneration = 0;
+let syncSessionGeneration = 0;
 let activeSyncKey: string | undefined;
 let extensionContext: vscode.ExtensionContext;
+let accountPanelOperation: AccountPanelOperation | undefined;
+let accountPanelServerOverride: string | undefined;
+let accountPanelSelectedServer: string | undefined;
+let activeBrowserLogin: AbortController | undefined;
+let activeBrowserLoginTask: Promise<unknown> | undefined;
+let accountActionInProgress = false;
+let deactivating = false;
 const linkOperationGate = new LinkOperationGate();
 const panelConfirmation = Object.freeze({ source: 'localleaf-panel' });
 const SYNC_AUTHORIZATION_STATE_KEY = 'localleaf.approvedSyncTargets.v1';
@@ -141,6 +156,9 @@ async function ensureSyncAuthorization(
 }
 
 function disposeCurrentSyncSession(): void {
+    // Invalidate initializations that are waiting on SecretStorage or another
+    // asynchronous prerequisite before they have an engine to dispose.
+    syncSessionGeneration++;
     const engine = syncEngine;
     syncEngine = undefined;
     syncStatusSubscription?.dispose();
@@ -150,6 +168,33 @@ function disposeCurrentSyncSession(): void {
     engine?.disconnect();
     activeSyncKey = undefined;
     stopStatusUpdates();
+}
+
+function isCurrentSyncInitialization(
+    generation: number,
+    settings: SettingsManager,
+    expectedSyncKey: string,
+): boolean {
+    return isSyncInitializationSnapshotCurrent({
+        deactivating,
+        currentGeneration: syncSessionGeneration,
+        expectedGeneration: generation,
+        currentSyncKey: getSyncKey(settings),
+        activeSyncKey,
+        expectedSyncKey,
+    });
+}
+
+function abandonStaleSyncEngine(
+    engine: SyncEngine,
+    generation: number,
+    settings: SettingsManager,
+    expectedSyncKey: string,
+): boolean {
+    if (syncEngine !== engine) return true;
+    if (isCurrentSyncInitialization(generation, settings, expectedSyncKey)) return false;
+    disposeCurrentSyncSession();
+    return true;
 }
 
 function listenForSyncStatus(engine: SyncEngine): void {
@@ -183,7 +228,7 @@ function configureSettingsWatcher(context: vscode.ExtensionContext, workspaceFol
         } else {
             statusBarItem.show();
             const nextKey = getSyncKey(current);
-            if (activeSyncKey && nextKey !== activeSyncKey) {
+            if (nextKey !== activeSyncKey) {
                 await initializeSync(context, current);
             }
         }
@@ -225,6 +270,7 @@ async function handleWorkspaceFoldersChanged(context: vscode.ExtensionContext): 
  * Extension activation
  */
 export async function activate(context: vscode.ExtensionContext) {
+    deactivating = false;
     try {
 
     extensionContext = context;
@@ -240,7 +286,11 @@ export async function activate(context: vscode.ExtensionContext) {
     credentialManager = CredentialManager.initialize(context);
 
     // Register the Activity Bar views adapted from PR #3.
-    projectsWebviewProvider = new ProjectsWebviewProvider(context.extensionUri, credentialManager);
+    projectsWebviewProvider = new ProjectsWebviewProvider(
+        context.extensionUri,
+        credentialManager,
+        (serverUrl, state) => updateAuthStatePresentation(state, serverUrl),
+    );
     mainWebviewProvider = new MainWebviewProvider(
         context.extensionUri,
         credentialManager,
@@ -279,7 +329,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Login status (left side, before sync)
     loginStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY + 1);
     loginStatusItem.name = `${EXTENSION_NAME} Login`;
-    loginStatusItem.command = COMMANDS.LOGIN;
+    loginStatusItem.command = COMMANDS.SHOW_ACCOUNT_PANEL;
     context.subscriptions.push(loginStatusItem);
 
     // Collaborator status (left side, next to sync)
@@ -299,7 +349,10 @@ export async function activate(context: vscode.ExtensionContext) {
         await settingsManager.load();
         // Show status bar only when linked
         statusBarItem.show();
-        await initializeSync(context, settingsManager);
+        // Activation must finish before VS Code can resolve the contributed
+        // webview. A first pull may legitimately wait for the user to resolve
+        // local/remote conflicts, so keep synchronization in the background.
+        startInitialSync(context, settingsManager);
     } else {
         // Hide sync status bar when not linked
         statusBarItem.hide();
@@ -328,13 +381,23 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 }
 
+function startInitialSync(context: vscode.ExtensionContext, settings: SettingsManager): void {
+    void initializeSync(context, settings).catch(error => {
+        if (deactivating) return;
+        const message = errorMessage(error);
+        log(`Failed to initialize sync: ${message}`);
+        updateStatusBar('error', message);
+        void vscode.window.showErrorMessage(`LocalLeaf: Failed to initialize synchronization - ${message}`);
+    });
+}
+
 /**
  * Register all commands
  */
 function registerCommands(context: vscode.ExtensionContext) {
     context.subscriptions.push(
-        vscode.commands.registerCommand(COMMANDS.LOGIN, cmdLogin),
-        vscode.commands.registerCommand(COMMANDS.LOGOUT, cmdLogout),
+        vscode.commands.registerCommand(COMMANDS.LOGIN, () => cmdShowAccountPanel(context)),
+        vscode.commands.registerCommand(COMMANDS.LOGOUT, cmdLogoutFromCommand),
         vscode.commands.registerCommand(COMMANDS.SHOW_ACCOUNT_PANEL, () => cmdShowAccountPanel(context)),
         vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: unknown) => cmdLinkFolder(context, project)),
         vscode.commands.registerCommand(COMMANDS.LINK_FOLDER, () => cmdLinkFolder(context)),
@@ -344,7 +407,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.PUSH_TO_OVERLEAF, cmdPushToOverleaf),
         vscode.commands.registerCommand(COMMANDS.EDIT_IGNORE_PATTERNS, cmdEditIgnorePatterns),
         vscode.commands.registerCommand(COMMANDS.CLEAN_IGNORED_REMOTE, cmdCleanIgnoredRemoteFiles),
-        vscode.commands.registerCommand(COMMANDS.SHOW_SYNC_STATUS, cmdShowSyncStatus),
+        vscode.commands.registerCommand(COMMANDS.SHOW_SYNC_STATUS, () => cmdShowSyncStatus(context)),
         vscode.commands.registerCommand(COMMANDS.SET_MAIN_DOCUMENT, cmdSetMainDocument),
         vscode.commands.registerCommand(COMMANDS.CONFIGURE, cmdConfigure),
         vscode.commands.registerCommand(COMMANDS.JUMP_TO_COLLABORATOR, cmdJumpToCollaborator),
@@ -358,18 +421,36 @@ function registerCommands(context: vscode.ExtensionContext) {
  * Initialize sync engine for linked folder
  */
 async function initializeSync(context: vscode.ExtensionContext, settings: SettingsManager): Promise<void> {
+    if (deactivating) return;
     disposeCurrentSyncSession();
+    const initializationGeneration = syncSessionGeneration;
     const projectSettings = settings.getSettings();
-    if (!projectSettings) return;
+    const initializationSyncKey = getSyncKey(settings);
+    if (!projectSettings || !initializationSyncKey) return;
+    // Publish the pending key before the first await so a settings watcher can
+    // invalidate this initialization even while SecretStorage is still busy.
+    activeSyncKey = initializationSyncKey;
 
     // Get credentials
     const credential = await credentialManager.getCredential(projectSettings.serverUrl);
+    if (!isCurrentSyncInitialization(initializationGeneration, settings, initializationSyncKey)) {
+        // A stale initialization for the same project must not clear the key
+        // already claimed by a newer generation.
+        if (
+            syncSessionGeneration === initializationGeneration
+            && activeSyncKey === initializationSyncKey
+        ) {
+            activeSyncKey = undefined;
+        }
+        return;
+    }
     if (!credential) {
         updateStatusBar('disconnected', 'Not logged in');
         void vscode.window.showWarningMessage('LocalLeaf: Please login to Overleaf first');
         return;
     }
     if (!(await ensureSyncAuthorization(context, settings))) return;
+    if (!isCurrentSyncInitialization(initializationGeneration, settings, initializationSyncKey)) return;
 
     // Create API
     const api = new BaseAPI(projectSettings.serverUrl);
@@ -378,7 +459,6 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     // Create sync engine
     const engine = new SyncEngine(api, settings, log);
     syncEngine = engine;
-    activeSyncKey = getSyncKey(settings);
 
     // Listen to status changes
     listenForSyncStatus(engine);
@@ -386,7 +466,9 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     // Connect
     try {
         await engine.connect();
-        if (syncEngine !== engine) return;
+        if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) return;
+        await setAuthState('valid', projectSettings.serverUrl);
+        if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) return;
 
         // Initialize cursor tracker
         const socket = engine.getSocket();
@@ -394,7 +476,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
             const tracker = new CursorTracker(socket, settings);
             cursorTracker = tracker;
             await tracker.initialize();
-            if (syncEngine !== engine) {
+            if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) {
                 tracker.dispose();
                 return;
             }
@@ -407,15 +489,20 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
 
         // Auto-detect main document from project settings
         await engine.detectMainDocument();
+        if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) return;
 
-        // Auto-pull on project load
+        // Pull the initial remote state and subscribe to remote document updates.
+        // `autoSync` controls propagation of local filesystem changes to
+        // Overleaf; it does not disable safe incoming synchronization.
         try {
             log('Auto-pulling files from Overleaf...');
             await engine.pullAll();
             log('Auto-pull complete');
+            if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) return;
 
             // Join all docs to receive real-time OT updates
             await engine.joinAllDocsForWatching();
+            if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) return;
             log('Watching for remote changes');
 
             void vscode.window.showInformationMessage(`LocalLeaf: Synced with "${projectSettings.projectName}"`);
@@ -491,9 +578,8 @@ function updateStatusBar(status: SyncStatus, message?: string) {
 /**
  * Update auth state and refresh UI
  */
-async function setAuthState(state: AuthState): Promise<void> {
-    authState = state;
-    await updateLoginStatus();
+async function setAuthState(state: AuthState, serverUrl?: string): Promise<void> {
+    await updateAuthStatePresentation(state, serverUrl);
     await refreshGui();
 }
 
@@ -510,6 +596,21 @@ function createCredentialTooltip(
         tooltip.appendMarkdown('\n\n_Click to refresh your cookie_');
     }
     return tooltip;
+}
+
+/** Update account/status UI without recursively refreshing the Projects view. */
+async function updateAuthStatePresentation(state: AuthState, serverUrl?: string): Promise<void> {
+    authState = state;
+    authStateServerUrl = state === 'none'
+        ? undefined
+        : await resolveActiveServerUrl(serverUrl);
+    await updateLoginStatus();
+    if (credentialManager) AccountPanel.updateIfOpen(await getAccountPanelState());
+}
+
+function getAuthStateForServer(serverUrl: string, hasCredential: boolean): AuthState {
+    if (!hasCredential) return 'none';
+    return authStateServerUrl === serverUrl && authState !== 'none' ? authState : 'unknown';
 }
 
 /**
@@ -529,32 +630,34 @@ async function updateLoginStatus() {
         return;
     }
     const credential = await credentialManager.getCredential(settings.serverUrl);
+    const serverAuthState = getAuthStateForServer(settings.serverUrl, Boolean(credential));
 
-    if (credential && authState === 'valid') {
+    if (credential && serverAuthState === 'valid') {
         // Logged in with valid session
         loginStatusItem.text = `$(account) ${credential.userEmail}`;
         loginStatusItem.tooltip = createCredentialTooltip(credential, false);
         loginStatusItem.backgroundColor = undefined;
-        loginStatusItem.command = COMMANDS.LOGOUT;
-    } else if (credential && authState === 'expired') {
+        loginStatusItem.command = COMMANDS.SHOW_ACCOUNT_PANEL;
+    } else if (credential && serverAuthState === 'expired') {
         // Session expired - show warning state
         loginStatusItem.text = `$(warning) ${credential.userEmail} (expired)`;
         loginStatusItem.tooltip = createCredentialTooltip(credential, true);
         loginStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-        loginStatusItem.command = COMMANDS.REFRESH_COOKIE;
+        loginStatusItem.command = COMMANDS.SHOW_ACCOUNT_PANEL;
     } else if (credential) {
-        // Credential exists but auth state not confirmed yet (assume valid until proven otherwise)
-        loginStatusItem.text = `$(account) ${credential.userEmail}`;
+        // A stored credential is not considered valid until a request confirms it.
+        loginStatusItem.text = `$(question) ${credential.userEmail} (not verified)`;
         loginStatusItem.tooltip = createCredentialTooltip(credential, false);
         loginStatusItem.backgroundColor = undefined;
-        loginStatusItem.command = COMMANDS.LOGOUT;
+        loginStatusItem.command = COMMANDS.SHOW_ACCOUNT_PANEL;
     } else {
         // Not logged in
         authState = 'none';
+        authStateServerUrl = undefined;
         loginStatusItem.text = '$(account) Not logged in';
         loginStatusItem.tooltip = 'Click to login to Overleaf';
         loginStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-        loginStatusItem.command = COMMANDS.LOGIN;
+        loginStatusItem.command = COMMANDS.SHOW_ACCOUNT_PANEL;
     }
 
     loginStatusItem.show();
@@ -566,12 +669,12 @@ async function updateLoginStatus() {
 async function showSessionExpiredNotification(): Promise<void> {
     const action = await vscode.window.showWarningMessage(
         'LocalLeaf: Your Overleaf session has expired.',
-        'Refresh Cookie',
+        'Open Account',
         'Dismiss'
     );
 
-    if (action === 'Refresh Cookie') {
-        await cmdRefreshCookie();
+    if (action === 'Open Account') {
+        await vscode.commands.executeCommand(COMMANDS.SHOW_ACCOUNT_PANEL);
     }
 }
 
@@ -677,6 +780,8 @@ function log(message: string) {
 
 /** Refresh whichever Activity Bar view is currently relevant. */
 async function refreshGui(): Promise<void> {
+    // Keep connection settings responsive while the project server is unavailable.
+    if (credentialManager) AccountPanel.updateIfOpen(await getAccountPanelState());
     const manager = SettingsManager.getCurrentInstance();
     const linked = Boolean(manager && await manager.isLinked());
     if (linked) {
@@ -689,28 +794,47 @@ async function refreshGui(): Promise<void> {
     }
 }
 
-async function getAccountPanelState(): Promise<AccountPanelState> {
+async function resolveActiveServerUrl(requestedServerUrl?: string): Promise<string> {
+    if (requestedServerUrl) return validateServerUrl(requestedServerUrl).url;
     const manager = SettingsManager.getCurrentInstance();
     if (manager && await manager.isLinked() && !manager.getSettings()) {
         await manager.load();
     }
-    const serverUrl = manager?.getSettings()?.serverUrl || credentialManager.getDefaultServer();
+    return validateServerUrl(
+        manager?.getSettings()?.serverUrl || credentialManager.getDefaultServer(),
+    ).url;
+}
+
+async function getAccountPanelState(): Promise<AccountPanelState> {
+    const serverUrl = accountPanelServerOverride || accountPanelSelectedServer || await resolveActiveServerUrl();
     const credential = await credentialManager.getCredential(serverUrl);
     return {
         serverUrl,
         loggedIn: Boolean(credential),
-        authState: credential ? (authState === 'expired' ? 'expired' : 'valid') : 'none',
+        authState: getAuthStateForServer(serverUrl, Boolean(credential)),
         userEmail: credential?.userEmail,
+        operation: accountPanelOperation,
     };
 }
 
+async function setAccountPanelOperation(
+    operation: AccountPanelOperation | undefined,
+    serverUrl?: string,
+): Promise<void> {
+    if (operation && serverUrl) accountPanelServerOverride = validateServerUrl(serverUrl).url;
+    if (!operation) accountPanelServerOverride = undefined;
+    accountPanelOperation = operation;
+    AccountPanel.updateIfOpen(await getAccountPanelState());
+}
+
 async function cmdShowAccountPanel(context: vscode.ExtensionContext): Promise<void> {
+    accountPanelSelectedServer = undefined;
     AccountPanel.createOrShow(
         context.extensionUri,
         await getAccountPanelState(),
         async action => {
             try {
-                await handleAccountPanelAction(action);
+                await handleAccountPanelAction(context, action);
             } catch (error) {
                 void vscode.window.showErrorMessage(`LocalLeaf: Account action failed - ${errorMessage(error)}`);
             } finally {
@@ -720,35 +844,155 @@ async function cmdShowAccountPanel(context: vscode.ExtensionContext): Promise<vo
     );
 }
 
-async function handleAccountPanelAction(action: AccountPanelAction): Promise<void> {
-    switch (action.type) {
-        case 'guidedLogin':
-            await cmdLogin();
-            await reconnectAfterLogin();
-            break;
-        case 'loginCookies':
-            if (await loginWithCookies(action.serverUrl, action.cookies)) {
-                await reconnectAfterLogin();
-            }
-            break;
-        case 'logout':
-            await cmdLogout();
-            break;
-        case 'openTutorial':
-            await vscode.env.openExternal(vscode.Uri.parse(
-                'https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies'
-            ));
-            break;
+async function handleAccountPanelAction(
+    context: vscode.ExtensionContext,
+    action: AccountPanelAction,
+): Promise<void> {
+    if (action.type === 'cancelLogin') {
+        activeBrowserLogin?.abort();
+        return;
+    }
+    if (action.type === 'openTutorial') {
+        await vscode.env.openExternal(vscode.Uri.parse(
+            'https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies'
+        ));
+        return;
+    }
+    if (accountActionInProgress) {
+        void vscode.window.showInformationMessage('LocalLeaf: An account operation is already in progress.');
+        return;
+    }
+
+    accountActionInProgress = true;
+    try {
+        switch (action.type) {
+            case 'selectServer':
+                accountPanelSelectedServer = await selectDefaultServer(action.serverUrl);
+                break;
+            case 'loginBrowser':
+                await loginViaBrowserAndStore(context, action.serverUrl, action.browserPreference);
+                break;
+            case 'loginCookies':
+                await setAccountPanelOperation({
+                    kind: 'cookieLogin',
+                    message: 'Validating the supplied Overleaf session...',
+                    cancellable: false,
+                }, action.serverUrl);
+                if (await loginWithCookies(action.serverUrl, action.cookies)) {
+                    await reconnectAfterLogin(context);
+                }
+                break;
+            case 'verifySession':
+                await verifyCredentialsForServer(action.serverUrl);
+                break;
+            case 'logout':
+                // Pin the target before the first await. The active workspace or
+                // default server may change while the confirmation dialog is open.
+                const serverUrl = validateServerUrl(action.serverUrl).url;
+                await setAccountPanelOperation({
+                    kind: 'logout',
+                    message: 'Removing the stored Overleaf session...',
+                    cancellable: false,
+                }, serverUrl);
+                await cmdLogout(serverUrl);
+                break;
+        }
+    } finally {
+        accountActionInProgress = false;
+        await setAccountPanelOperation(undefined);
     }
 }
 
-async function reconnectAfterLogin(): Promise<void> {
+async function loginViaBrowserAndStore(
+    context: vscode.ExtensionContext,
+    serverUrl: string,
+    browserPreference: BrowserPreference,
+): Promise<boolean> {
+    const task = performBrowserLoginAndStore(context, serverUrl, browserPreference);
+    activeBrowserLoginTask = task;
+    try {
+        return await task;
+    } finally {
+        if (activeBrowserLoginTask === task) activeBrowserLoginTask = undefined;
+    }
+}
+
+async function performBrowserLoginAndStore(
+    context: vscode.ExtensionContext,
+    serverUrl: string,
+    browserPreference: BrowserPreference,
+): Promise<boolean> {
+    if (deactivating) return false;
+    const server = validateServerUrl(serverUrl);
+    if (vscode.env.remoteName) {
+        void vscode.window.showWarningMessage(
+            `LocalLeaf: Browser login is unavailable in ${vscode.env.remoteName}. Use the manual cookie option in the Account panel instead.`,
+        );
+        return false;
+    }
+    if (!(await confirmInsecureServer(server, 'Overleaf session')) || deactivating) return false;
+
+    const controller = new AbortController();
+    activeBrowserLogin = controller;
+    await setAccountPanelOperation({
+        kind: 'browserLogin',
+        message: 'Opening an isolated browser and waiting for you to sign in...',
+        cancellable: true,
+    }, server.url);
+
+    try {
+        const result = await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: 'LocalLeaf: Waiting for browser login...',
+            cancellable: true,
+        }, async (_progress, token) => {
+            const cancellation = token.onCancellationRequested(() => controller.abort());
+            try {
+                return await captureCookiesViaBrowserLogin(server.url, browserPreference, {
+                    signal: controller.signal,
+                    log,
+                    onCleanupFailure: profilePath => {
+                        if (deactivating) return;
+                        void vscode.window.showWarningMessage(
+                            `LocalLeaf could not remove its isolated browser profile. Close any leftover browser window and delete: ${profilePath}`,
+                        );
+                    },
+                });
+            } finally {
+                cancellation.dispose();
+            }
+        });
+
+        if (result.type === 'cancelled') {
+            void vscode.window.showInformationMessage('LocalLeaf: Browser login cancelled.');
+            return false;
+        }
+        if (result.type === 'error') {
+            void vscode.window.showErrorMessage(`LocalLeaf: Browser login failed - ${result.message}`);
+            return false;
+        }
+        if (deactivating) return false;
+
+        await setAccountPanelOperation({
+            kind: 'browserLogin',
+            message: 'Login detected. Validating and storing the Overleaf session...',
+            cancellable: false,
+        });
+        if (!(await loginWithCookies(server.url, result.cookies, true))) return false;
+        await reconnectAfterLogin(context);
+        return true;
+    } finally {
+        if (activeBrowserLogin === controller) activeBrowserLogin = undefined;
+    }
+}
+
+async function reconnectAfterLogin(context: vscode.ExtensionContext): Promise<void> {
+    if (deactivating) return;
     const manager = SettingsManager.getCurrentInstance();
-    if (!manager || !(await manager.isLinked())) return;
-    if (!manager.getSettings()) await manager.load();
-    const settings = manager.getSettings();
-    if (!settings || !(await credentialManager.hasCredential(settings.serverUrl))) return;
-    await cmdReconnect();
+    if (!manager) return;
+    const linked = await manager.isLinked();
+    if (deactivating || manager !== SettingsManager.getCurrentInstance() || !linked) return;
+    await cmdReconnect(context);
 }
 
 async function confirmInsecureServer(server: ValidatedServerUrl, secretDescription: string): Promise<boolean> {
@@ -765,10 +1009,14 @@ async function confirmInsecureServer(server: ValidatedServerUrl, secretDescripti
     return choice === continueAction;
 }
 
-async function loginWithCookies(serverUrl: string, cookies: string): Promise<boolean> {
+async function loginWithCookies(
+    serverUrl: string,
+    cookies: string,
+    skipInsecureConfirmation = false,
+): Promise<boolean> {
     const server = validateServerUrl(serverUrl);
     const normalizedServer = server.url;
-    if (!(await confirmInsecureServer(server, 'Overleaf session cookie'))) return false;
+    if (!skipInsecureConfirmation && !(await confirmInsecureServer(server, 'Overleaf session cookie'))) return false;
 
     const api = new BaseAPI(normalizedServer);
     let result: Awaited<ReturnType<BaseAPI['cookiesLogin']>>;
@@ -785,6 +1033,7 @@ async function loginWithCookies(serverUrl: string, cookies: string): Promise<boo
     if (result.type !== 'success' || !result.userInfo || !result.identity) {
         throw new Error(result.message || 'Cookie validation failed.');
     }
+    if (deactivating) return false;
 
     await credentialManager.storeCredential({
         serverUrl: normalizedServer,
@@ -797,7 +1046,7 @@ async function loginWithCookies(serverUrl: string, cookies: string): Promise<boo
         normalizedServer,
         vscode.ConfigurationTarget.Global,
     );
-    await setAuthState('valid');
+    await setAuthState('valid', normalizedServer);
     void vscode.window.showInformationMessage(`LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
     return true;
 }
@@ -825,128 +1074,53 @@ async function chooseWorkspaceFolder(): Promise<vscode.Uri | undefined> {
 }
 
 /**
- * Login to Overleaf
- */
-async function cmdLogin() {
-    const serverInput = await vscode.window.showInputBox({
-        prompt: 'Enter Overleaf server URL',
-        value: credentialManager.getDefaultServer(),
-        placeHolder: 'https://www.overleaf.com',
-    });
-
-    if (!serverInput) return;
-
-    let server: ValidatedServerUrl;
-    try {
-        server = validateServerUrl(serverInput);
-    } catch (error) {
-        void vscode.window.showErrorMessage(`LocalLeaf: ${errorMessage(error)}`);
-        return;
-    }
-    const serverUrl = server.url;
-
-    // Official Overleaf hosts use cookie-based login.
-    const isOfficialServer = server.isOfficialOverleaf;
-
-    if (isOfficialServer) {
-        // Show help option before asking for cookies
-        const helpChoice = await vscode.window.showInformationMessage(
-            'You need to paste your Overleaf cookies to login.',
-            'How to get cookies?',
-            'Continue'
-        );
-
-        if (!helpChoice) return;
-
-        if (helpChoice === 'How to get cookies?') {
-            await vscode.env.openExternal(vscode.Uri.parse('https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies'));
-            // Show input box after opening the tutorial
-        }
-
-        const cookies = await vscode.window.showInputBox({
-            prompt: 'Paste your Overleaf cookies (see tutorial for help)',
-            placeHolder: 'overleaf_session2=...',
-            password: true,
-        });
-
-        if (!cookies) return;
-
-        try {
-            await loginWithCookies(serverUrl, cookies);
-        } catch (error) {
-            void vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${errorMessage(error)}`);
-        }
-    } else {
-        if (!(await confirmInsecureServer(server, 'Overleaf email and password'))) return;
-        // For self-hosted, use email/password
-        const email = await vscode.window.showInputBox({
-            prompt: 'Enter your email',
-            placeHolder: 'email@example.com',
-        });
-
-        if (!email) return;
-
-        const password = await vscode.window.showInputBox({
-            prompt: 'Enter your password',
-            password: true,
-        });
-
-        if (!password) return;
-
-        try {
-            const api = new BaseAPI(serverUrl);
-            let result: Awaited<ReturnType<BaseAPI['passportLogin']>>;
-            try {
-                result = await api.passportLogin(email, password);
-            } finally {
-                api.dispose();
-            }
-
-            if (result.type === 'success' && result.userInfo && result.identity) {
-                const credential: ServerCredential = {
-                    serverUrl,
-                    userId: result.userInfo.userId,
-                    userEmail: result.userInfo.userEmail,
-                    identity: result.identity,
-                };
-                await credentialManager.storeCredential(credential);
-                await vscode.workspace.getConfiguration('localleaf').update(
-                    'defaultServer', serverUrl, vscode.ConfigurationTarget.Global
-                );
-                await setAuthState('valid');
-                void vscode.window.showInformationMessage(`LocalLeaf: Logged in as ${result.userInfo.userEmail}`);
-            } else {
-                void vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${result.message}`);
-            }
-        } catch (error) {
-            void vscode.window.showErrorMessage(`LocalLeaf: Login failed - ${errorMessage(error)}`);
-        }
-    }
-}
-
-/**
  * Logout from Overleaf
  */
-async function cmdLogout() {
+async function cmdLogout(requestedServerUrl: string): Promise<void> {
+    // Normalize once, before displaying the prompt, so every subsequent action
+    // applies to the credential the user actually chose to remove.
+    const serverUrl = validateServerUrl(requestedServerUrl).url;
     const confirm = await vscode.window.showWarningMessage(
-        'Are you sure you want to logout from Overleaf?',
+        `Are you sure you want to logout from ${serverUrl}?`,
         'Logout',
         'Cancel'
     );
 
     if (confirm !== 'Logout') return;
 
-    const settingsManager = SettingsManager.getCurrentInstance();
-    if (settingsManager && await settingsManager.isLinked() && !settingsManager.getSettings()) {
-        await settingsManager.load();
-    }
-    const serverUrl = settingsManager?.getSettings()?.serverUrl || credentialManager.getDefaultServer();
     // Cancel all local/remote work before removing the stored session.
     disposeCurrentSyncSession();
     await credentialManager.deleteCredential(serverUrl);
     updateStatusBar('disconnected', 'Logged out');
-    await setAuthState('none');
+    await setAuthState('none', serverUrl);
     void vscode.window.showInformationMessage('LocalLeaf: Logged out');
+}
+
+async function cmdLogoutFromCommand(): Promise<void> {
+    if (accountActionInProgress) {
+        void vscode.window.showInformationMessage(
+            'LocalLeaf: Finish or cancel the current account operation before logging out.',
+        );
+        return;
+    }
+    // Capture the cached project/default target synchronously. In particular,
+    // do not re-resolve it after the Account panel update or confirmation await.
+    const serverUrl = validateServerUrl(
+        SettingsManager.getCurrentInstance()?.getSettings()?.serverUrl
+            || credentialManager.getDefaultServer(),
+    ).url;
+    accountActionInProgress = true;
+    try {
+        await setAccountPanelOperation({
+            kind: 'logout',
+            message: 'Removing the stored Overleaf session...',
+            cancellable: false,
+        }, serverUrl);
+        await cmdLogout(serverUrl);
+    } finally {
+        accountActionInProgress = false;
+        await setAccountPanelOperation(undefined);
+    }
 }
 
 /**
@@ -980,7 +1154,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?
         const credential = await credentialManager.getCredential(serverUrl);
         if (!credential) {
             void vscode.window.showWarningMessage('LocalLeaf: Please login first');
-            await cmdLogin();
+            await cmdShowAccountPanel(context);
             return;
         }
 
@@ -1382,9 +1556,16 @@ async function cmdCleanIgnoredRemoteFiles(confirmation?: object) {
 /**
  * Show sync status
  */
-async function cmdShowSyncStatus() {
+async function cmdShowSyncStatus(context: vscode.ExtensionContext) {
     const settingsManager = SettingsManager.getCurrentInstance();
     const settings = settingsManager?.getSettings();
+    const statusServerUrl = settings ? validateServerUrl(settings.serverUrl).url : undefined;
+    const statusCredential = statusServerUrl
+        ? await credentialManager.getCredential(statusServerUrl)
+        : undefined;
+    const statusAuthState = statusServerUrl
+        ? getAuthStateForServer(statusServerUrl, Boolean(statusCredential))
+        : 'none';
 
     const items: vscode.QuickPickItem[] = [];
     const currentStatus = syncEngine?.status || 'disconnected';
@@ -1441,15 +1622,15 @@ async function cmdShowSyncStatus() {
     }
 
     // Show refresh cookie option when auth is expired
-    if (settings && authState === 'expired') {
+    if (settings && statusAuthState === 'expired') {
         items.push({
-            label: '$(key) Refresh Cookie',
-            description: 'Session expired - click to enter new cookie',
+            label: '$(key) Re-authenticate',
+            description: 'Open the Account panel and replace the expired session',
         });
     }
 
     // Show verify credentials option when connected
-    if (settings && authState !== 'expired') {
+    if (settings && statusCredential && statusAuthState !== 'expired') {
         items.push({
             label: '$(shield) Verify Credentials',
             description: 'Check if your session is still valid',
@@ -1477,8 +1658,8 @@ async function cmdShowSyncStatus() {
     if (selected?.label.includes('Resync')) {
         await cmdPullFromOverleaf();
     } else if (selected?.label.includes('Reconnect')) {
-        await cmdReconnect();
-    } else if (selected?.label.includes('Refresh Cookie')) {
+        await cmdReconnect(context);
+    } else if (selected?.label.includes('Re-authenticate')) {
         await cmdRefreshCookie();
     } else if (selected?.label.includes('Verify Credentials')) {
         await cmdVerifyCredentials();
@@ -1492,14 +1673,24 @@ async function cmdShowSyncStatus() {
 /**
  * Reconnect to Overleaf (after disconnect or error)
  */
-async function cmdReconnect() {
+async function cmdReconnect(context: vscode.ExtensionContext) {
+    if (deactivating) return;
     const settingsManager = SettingsManager.getCurrentInstance();
-    if (!settingsManager || !(await settingsManager.isLinked())) {
+    if (!settingsManager) {
         void vscode.window.showWarningMessage('LocalLeaf: No linked project');
         return;
     }
+
+    const linked = await settingsManager.isLinked();
+    if (deactivating || settingsManager !== SettingsManager.getCurrentInstance()) return;
+    if (!linked) {
+        void vscode.window.showWarningMessage('LocalLeaf: No linked project');
+        return;
+    }
+
     if (!settingsManager.getSettings()) await settingsManager.load();
-    await initializeSync(extensionContext, settingsManager);
+    if (deactivating || settingsManager !== SettingsManager.getCurrentInstance()) return;
+    await initializeSync(context, settingsManager);
 }
 
 /**
@@ -1576,24 +1767,21 @@ async function cmdJumpToCollaborator(clientId?: string) {
 /**
  * Verify credentials are still valid
  */
-async function cmdVerifyCredentials() {
-    const settingsManager = SettingsManager.getCurrentInstance();
-    if (!settingsManager || !(await settingsManager.isLinked())) {
-        void vscode.window.showInformationMessage('LocalLeaf: No linked project');
-        return;
-    }
-
-    const projectSettings = settingsManager.getSettings();
-    if (!projectSettings) return;
-
-    const credential = await credentialManager.getCredential(projectSettings.serverUrl);
+async function verifyCredentialsForServer(requestedServerUrl?: string): Promise<boolean> {
+    const serverUrl = await resolveActiveServerUrl(requestedServerUrl);
+    const credential = await credentialManager.getCredential(serverUrl);
     if (!credential) {
-        await setAuthState('none');
+        await setAuthState('none', serverUrl);
         void vscode.window.showWarningMessage('LocalLeaf: Not logged in');
-        return;
+        return false;
     }
 
-    const api = new BaseAPI(projectSettings.serverUrl);
+    await setAccountPanelOperation({
+        kind: 'verifySession',
+        message: 'Checking the stored Overleaf session...',
+        cancellable: false,
+    }, serverUrl);
+    const api = new BaseAPI(serverUrl);
     api.setIdentity(credential.identity);
 
     let result: Awaited<ReturnType<BaseAPI['verifyCredentials']>>;
@@ -1602,16 +1790,47 @@ async function cmdVerifyCredentials() {
             location: vscode.ProgressLocation.Notification,
             title: 'LocalLeaf: Verifying credentials...',
         }, () => api.verifyCredentials());
+    } catch (error) {
+        void vscode.window.showErrorMessage(
+            `LocalLeaf: Could not verify the session - ${errorMessage(error)}. The stored session was not changed.`,
+        );
+        return false;
     } finally {
         api.dispose();
     }
 
     if (result.type === 'success') {
-        await setAuthState('valid');
+        await setAuthState('valid', serverUrl);
         void vscode.window.showInformationMessage('LocalLeaf: Credentials are valid');
-    } else {
-        await setAuthState('expired');
-        await showSessionExpiredNotification();
+        return true;
+    } else if (result.authError === 'session_expired' || result.authError === 'invalid_credentials') {
+        await setAuthState('expired', serverUrl);
+        void showSessionExpiredNotification().catch(error => {
+            log(`Could not show the expired-session notification: ${errorMessage(error)}`);
+        });
+        return false;
+    }
+
+    void vscode.window.showErrorMessage(
+        `LocalLeaf: Could not verify the session - ${result.message || 'Overleaf returned an unexpected response'}. `
+        + 'The stored session was not changed.',
+    );
+    return false;
+}
+
+async function cmdVerifyCredentials(): Promise<void> {
+    if (accountActionInProgress) {
+        void vscode.window.showInformationMessage(
+            'LocalLeaf: Finish or cancel the current account operation before verifying the session.',
+        );
+        return;
+    }
+    accountActionInProgress = true;
+    try {
+        await verifyCredentialsForServer();
+    } finally {
+        accountActionInProgress = false;
+        await setAccountPanelOperation(undefined);
     }
 }
 
@@ -1619,60 +1838,35 @@ async function cmdVerifyCredentials() {
  * Refresh cookie (re-login without clearing stored info)
  */
 async function cmdRefreshCookie() {
-    const settingsManager = SettingsManager.getCurrentInstance();
-    if (!settingsManager || !(await settingsManager.isLinked())) {
-        void vscode.window.showWarningMessage('LocalLeaf: No linked project');
-        return;
-    }
-
-    const projectSettings = settingsManager.getSettings();
-    if (!projectSettings) return;
-
-    const serverUrl = projectSettings.serverUrl;
-
-    // Get existing credential to show user info
-    const existingCredential = await credentialManager.getCredential(serverUrl);
-    const userInfo = existingCredential
-        ? `Refreshing session for ${existingCredential.userEmail}`
-        : 'Enter your Overleaf cookie';
-
-    // Show help option
-    const helpChoice = await vscode.window.showInformationMessage(
-        userInfo,
-        'How to get cookies?',
-        'Continue'
-    );
-
-    if (!helpChoice) return;
-
-    if (helpChoice === 'How to get cookies?') {
-        await vscode.env.openExternal(vscode.Uri.parse(
-            'https://github.com/overleaf-workshop/Overleaf-Workshop/blob/master/docs/wiki.md#login-with-cookies'
-        ));
-    }
-
-    const cookies = await vscode.window.showInputBox({
-        prompt: 'Paste your fresh Overleaf cookie',
-        placeHolder: 'overleaf_session2=...',
-        password: true,
-    });
-
-    if (!cookies) return;
-
-    try {
-        if (!(await loginWithCookies(serverUrl, cookies))) return;
-        await cmdReconnect();
-    } catch (error) {
-        void vscode.window.showErrorMessage(`LocalLeaf: Cookie validation failed - ${errorMessage(error)}`);
-    }
+    await vscode.commands.executeCommand(COMMANDS.SHOW_ACCOUNT_PANEL);
 }
 
 /**
  * Extension deactivation
  */
-export function deactivate() {
+async function waitForBrowserLoginCleanup(task: Promise<unknown>, timeoutMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        await Promise.race([
+            task.then(() => undefined, () => undefined),
+            new Promise<void>(resolve => {
+                timer = setTimeout(resolve, timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+export async function deactivate(): Promise<void> {
+    deactivating = true;
     workspaceChangeGeneration++;
+    activeBrowserLogin?.abort();
+    activeBrowserLogin = undefined;
     settingsWatcher?.dispose();
     settingsWatcher = undefined;
     disposeCurrentSyncSession();
+    const browserLoginTask = activeBrowserLoginTask;
+    if (browserLoginTask) await waitForBrowserLoginCleanup(browserLoginTask, 12_000);
+    activeBrowserLoginTask = undefined;
 }

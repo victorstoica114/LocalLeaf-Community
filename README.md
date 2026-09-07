@@ -17,6 +17,7 @@ The idea is deliberately simple: write with the local tools you already like, an
 
 - Synchronize files in both directions with Overleaf and self-hosted Overleaf instances
 - Show and link remote projects from the VS Code sidebar
+- Sign in through an isolated Chrome or Edge window, with manual cookies as a fallback
 - Keep documents updated in real time
 - Show collaborators and jump to their cursor positions
 - Help resolve local and remote conflicts with a visual diff
@@ -47,21 +48,23 @@ Contributions are welcome, whether they are code, documentation, bug reports, or
 ## Getting started
 
 1. Open the folder that should contain your local project.
-2. Run `LocalLeaf: Login` and authenticate with your Overleaf server.
+2. Run `LocalLeaf: Login`, choose your server and browser, then finish signing in in the isolated browser window.
 3. Choose a project from the LocalLeaf sidebar and link it to the folder.
 4. Review the first synchronization prompts before choosing which copy to keep.
 
 > [!WARNING]
 > Your Overleaf cookies grant access to your account. Only send them to the real server you intend to use, check the URL carefully, and treat them like a password. LocalLeaf stores them in VS Code Secret Storage rather than inside the workspace. Use `LocalLeaf: Logout` if you suspect they were exposed.
 
+Browser login uses a temporary, isolated Chromium profile and removes it after the session is captured. If cleanup is blocked by another process, LocalLeaf reports the exact temporary folder so you can remove it manually. If the extension is running on a remote extension host (Remote SSH, WSL, or a Dev Container), use the manual cookie option because the browser cannot be opened safely on your local desktop from that host.
+
 ## Commands
 
 | Command | What it does |
 |---------|--------------|
-| `LocalLeaf: Login` | Connects an Overleaf account |
+| `LocalLeaf: Login` | Opens the Account panel for browser or manual-cookie login |
 | `LocalLeaf: Logout` | Removes the stored credentials |
 | `LocalLeaf: Verify Credentials` | Checks whether the current session is still valid |
-| `LocalLeaf: Refresh Cookie` | Replaces an expired session cookie |
+| `LocalLeaf: Re-authenticate` | Opens the Account panel to replace an expired session |
 | `LocalLeaf: Link Folder to Overleaf Project` | Links the current folder to a project |
 | `LocalLeaf: Unlink Folder` | Removes the local project link |
 | `LocalLeaf: Sync Now` | Starts a two-way synchronization |

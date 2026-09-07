@@ -321,6 +321,8 @@ export class SocketIOAPI {
     private socketEventTimeoutMs = 5000;
     private pendingSocketEventCount = 0;
     private maxPendingSocketEvents = MAX_PENDING_SOCKET_EVENTS;
+    private disposed = false;
+    private readonly pendingDocumentWrites = new Set<() => void>();
 
     constructor(
         private readonly api: BaseAPI,
@@ -335,10 +337,13 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts init()
      */
     private init(mode: ConnectionMode = 'legacy') {
+        if (this.disposed) throw new Error('Socket connection has been disposed.');
         this.teardownSocket();
         this.connectionMode = mode;
 
         // Create handshake promise
+        this._connected = false;
+        this._publicId = undefined;
         this._handshakeComplete = false;
         this._handshakePromise = new Promise((resolve) => {
             this._handshakeResolve = resolve;
@@ -365,6 +370,9 @@ export class SocketIOAPI {
     }
 
     private teardownSocket(): void {
+        this._connectionFailureResolve?.(new Error('Socket connection was disposed.'));
+        for (const cancel of this.pendingDocumentWrites) cancel();
+        this.pendingDocumentWrites.clear();
         const socket = this.socket;
         this.socket = undefined;
         if (!socket) return;
@@ -516,6 +524,10 @@ export class SocketIOAPI {
             log(`Connection rejected: ${message}`);
             this._connected = false;
             this.failConnection(socket, new Error(message || 'Socket connection rejected'));
+            if (this.projectRecord) {
+                this.handlers.forEach(handler => handler.onDisconnected?.(this.isAuthRelatedMessage(message)));
+                this.teardownSocket();
+            }
         });
 
         socket.on('connectionAccepted', (_session: unknown, value: unknown) => {
@@ -699,6 +711,7 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts joinProject()
      */
     async joinProject(): Promise<ProjectEntity> {
+        if (this.disposed) throw new Error('Socket connection has been disposed.');
         let legacyError: unknown;
         try {
             const project = await this.joinProjectLegacy();
@@ -706,6 +719,7 @@ export class SocketIOAPI {
             log('Connected to project (real-time, legacy protocol)');
             return project;
         } catch (error) {
+            if (this.disposed || this.isAuthRelatedMessage(errorMessage(error))) throw error;
             legacyError = error;
             log(`Legacy Socket.IO project join failed: ${errorMessage(error)}`);
         }
@@ -718,9 +732,11 @@ export class SocketIOAPI {
             return project;
         } catch (queryError) {
             this.teardownSocket();
+            if (this.disposed || this.isAuthRelatedMessage(errorMessage(queryError))) throw queryError;
             throw new Error(
                 `Unable to join the Overleaf project using either Socket.IO protocol. `
-                + `Legacy: ${errorMessage(legacyError)}. Query: ${errorMessage(queryError)}.`
+                + `Legacy protocol: ${errorMessage(legacyError)}. Project-query protocol: ${errorMessage(queryError)}.`,
+                { cause: legacyError },
             );
         }
     }
@@ -789,7 +805,49 @@ export class SocketIOAPI {
         if (!safeUpdate || safeUpdate.doc !== safeDocId) {
             throw new Error('Refusing to send an invalid document update.');
         }
-        await this.emit('applyOtUpdate', safeDocId, safeUpdate);
+        if (this.disposed) throw new Error('Socket connection has been disposed.');
+        const socket = this.socket;
+        if (!socket) throw new Error('Socket connection is unavailable.');
+        let rejectApplied!: (error: Error) => void;
+        let resolveApplied!: () => void;
+        const applied = new Promise<void>((resolve, reject) => {
+            resolveApplied = resolve;
+            rejectApplied = reject;
+        });
+        const onApplied = (candidate: DocumentUpdate) => {
+            if (candidate?.doc !== docId) return;
+            const currentVersion = Number.isSafeInteger(candidate.v) && candidate.v >= update.v;
+            const ownSource = this.publicId !== undefined && candidate.meta?.source === this.publicId
+                && currentVersion;
+            // Overleaf sends the originating client only { doc, v }; other
+            // clients receive the full operation and source metadata.
+            const ownAcknowledgement = !candidate.meta?.source && candidate.op === undefined && currentVersion;
+            const exactEcho = candidate.v === update.v
+                && JSON.stringify(candidate.op) === JSON.stringify(update.op);
+            if (ownSource || ownAcknowledgement || (!candidate.meta?.source && exactEcho)) resolveApplied();
+        };
+        const onError = (reason: unknown, details?: { doc_id?: string }) => {
+            if (!details?.doc_id || details.doc_id === docId) {
+                rejectApplied(new Error(`Overleaf rejected the document update: ${String(reason)}`));
+            }
+        };
+        const onDisconnected = () => rejectApplied(new Error('Socket disconnected before the document update was applied.'));
+        const timer = setTimeout(() => rejectApplied(new Error('Document update confirmation timed out.')), 10000);
+        this.pendingDocumentWrites.add(onDisconnected);
+        socket.on('otUpdateApplied', onApplied);
+        socket.on('otUpdateError', onError);
+        socket.on('disconnect', onDisconnected);
+        try {
+            // The RPC acknowledgement only confirms queueing. Wait until the
+            // document updater broadcasts the committed operation as well.
+            await Promise.all([this.emit('applyOtUpdate', safeDocId, safeUpdate), applied]);
+        } finally {
+            clearTimeout(timer);
+            this.pendingDocumentWrites.delete(onDisconnected);
+            socket.removeListener('otUpdateApplied', onApplied);
+            socket.removeListener('otUpdateError', onError);
+            socket.removeListener('disconnect', onDisconnected);
+        }
     }
 
     /**
@@ -851,6 +909,8 @@ export class SocketIOAPI {
      * Disconnect from socket
      */
     disconnect() {
+        if (this.disposed) return;
+        this.disposed = true;
         this.teardownSocket();
         this.handlers = [];
         this._connected = false;
@@ -861,13 +921,11 @@ export class SocketIOAPI {
      */
     private isAuthRelatedMessage(message: string | undefined): boolean {
         if (!message) return false;
-        const msg = message.toLowerCase();
-        return msg.includes('unauthorized') ||
-               msg.includes('not logged in') ||
-               msg.includes('session expired') ||
-               msg.includes('invalid session') ||
-               msg.includes('403') ||
-               msg.includes('401') ||
-               msg.includes('authentication');
+        const msg = message.trim().toLowerCase().replace(
+            /^(?:(?:error|connection rejected|force disconnected)\s*:\s*)+/,
+            '',
+        );
+        return /^(?:unauthorized|not logged in|not authenticated|session expired|invalid session|authentication (?:failed|required)|login required)(?:\b|:)/.test(msg)
+            || /^(?:http\s+)?401(?:\b|:)/.test(msg);
     }
 }
