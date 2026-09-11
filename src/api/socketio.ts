@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { BaseAPI, ProjectEntity, FileEntity } from './base';
 import { Identity } from '../utils/credentialManager';
 import { validateProjectEntityName } from '../utils/pathSafety';
+import { conciseErrorMessage } from '../utils/errorMessages';
 import {
     MAX_REMOTE_DOCUMENT_CHARACTERS,
     MAX_REMOTE_DOCUMENT_OPERATIONS,
@@ -107,6 +108,17 @@ type ConnectionMode = 'legacy' | 'query';
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+class ProjectJoinError extends Error {
+    constructor(message: string, cause: unknown, readonly temporary: boolean) {
+        super(message, { cause });
+    }
+}
+
+function isTemporaryConnectionFailure(error: unknown): boolean {
+    if (error instanceof ProjectJoinError) return error.temporary;
+    return /Socket handshake timeout|project join timed out|Socket event "joinProject" timed out|Socket connection failed|Socket disconnected before|HTTP handshake failed: (?:network error|HTTP (?:408|429|5\d\d))|\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN)\b|Unexpected server response: (?:408|429|5\d\d)/i.test(errorMessage(error));
 }
 
 function projectFromResponse(value: unknown): ProjectEntity {
@@ -319,7 +331,16 @@ export class SocketIOAPI {
     private _connectionFailurePromise!: Promise<Error>;
     private _connectionFailureResolve!: (error: Error) => void;
     private socketEventTimeoutMs = 5000;
+    private documentReadTimeoutMs = 120_000;
+    private handshakeTimeoutMs = 30_000;
+    private projectJoinTimeoutMs = 120_000;
+    private connectionStage = 'HTTP handshake';
+    private connectionStartedAt = 0;
+    private initialRetryDelaysMs = [1000, 2000];
+    private cancelConnectionRetry?: () => void;
+    private reconnectPromise?: Promise<ProjectEntity>;
     private pendingSocketEventCount = 0;
+    private readonly pendingSocketEvents = new Set<(error: Error) => void>();
     private maxPendingSocketEvents = MAX_PENDING_SOCKET_EVENTS;
     private disposed = false;
     private readonly pendingDocumentWrites = new Set<() => void>();
@@ -340,6 +361,9 @@ export class SocketIOAPI {
         if (this.disposed) throw new Error('Socket connection has been disposed.');
         this.teardownSocket();
         this.connectionMode = mode;
+        this.connectionStage = 'HTTP handshake';
+        this.connectionStartedAt = Date.now();
+        log(`Connecting to Overleaf (${mode} protocol; HTTP handshake)`);
 
         // Create handshake promise
         this._connected = false;
@@ -370,7 +394,9 @@ export class SocketIOAPI {
     }
 
     private teardownSocket(): void {
-        this._connectionFailureResolve?.(new Error('Socket connection was disposed.'));
+        const error = new Error('Socket connection was disposed.');
+        this._connectionFailureResolve?.(error);
+        this.cancelPendingSocketEvents(error);
         for (const cancel of this.pendingDocumentWrites) cancel();
         this.pendingDocumentWrites.clear();
         const socket = this.socket;
@@ -383,6 +409,12 @@ export class SocketIOAPI {
     private failConnection(socket: SocketIOClient.Socket, error: Error): void {
         if (this.socket !== socket || this._connected) return;
         this._connectionFailureResolve(error);
+        this.cancelPendingSocketEvents(error);
+    }
+
+    private cancelPendingSocketEvents(error: Error): void {
+        for (const cancel of this.pendingSocketEvents) cancel(error);
+        this.pendingSocketEvents.clear();
     }
 
     private async raceConnectionFailure<T>(operation: Promise<T>): Promise<T> {
@@ -397,7 +429,7 @@ export class SocketIOAPI {
     private withTimeout<T>(
         promise: Promise<T>,
         timeoutMs: number,
-        message: string,
+        message: string | (() => string),
         onTimeout?: () => void,
     ): Promise<T> {
         return new Promise<T>((resolve, reject) => {
@@ -407,7 +439,7 @@ export class SocketIOAPI {
                 } catch (error) {
                     log(`Failed to clean up a timed-out socket operation: ${errorMessage(error)}`);
                 }
-                reject(new Error(message));
+                reject(new Error(typeof message === 'function' ? message() : message));
             }, timeoutMs);
             promise.then(
                 value => {
@@ -434,6 +466,10 @@ export class SocketIOAPI {
     }
 
     private emit(event: string, ...args: unknown[]): Promise<unknown[]> {
+        return this.emitWithTimeout(this.socketEventTimeoutMs, event, ...args);
+    }
+
+    private emitWithTimeout(timeoutMs: number, event: string, ...args: unknown[]): Promise<unknown[]> {
         const socket = this.socket;
         if (!socket) {
             return Promise.reject(new Error('Socket is not initialized'));
@@ -446,7 +482,10 @@ export class SocketIOAPI {
         }
 
         this.pendingSocketEventCount++;
+        let cancel!: (error: Error) => void;
         const response = new Promise<unknown[]>((resolve, reject) => {
+            cancel = reject;
+            this.pendingSocketEvents.add(cancel);
             socket.emit(event, ...args, (error: unknown, ...data: unknown[]) => {
                 if (error) {
                     reject(error instanceof Error ? error : new Error(String(error)));
@@ -457,10 +496,11 @@ export class SocketIOAPI {
         });
         return this.withTimeout(
             response,
-            this.socketEventTimeoutMs,
+            timeoutMs,
             `Socket event "${event}" timed out`,
             () => this.abortTimedOutSocket(socket),
         ).finally(() => {
+            this.pendingSocketEvents.delete(cancel);
             this.pendingSocketEventCount = Math.max(0, this.pendingSocketEventCount - 1);
         });
     }
@@ -470,8 +510,14 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts initInternalHandlers()
      */
     private setupInternalHandlers(socket: SocketIOClient.Socket, mode: ConnectionMode) {
+        socket.on('connecting', (transport: unknown) => {
+            if (this.socket !== socket) return;
+            this.connectionStage = transport === 'websocket' ? 'WebSocket connection' : 'polling connection';
+            log(`HTTP handshake completed; opening ${this.connectionStage} (${Date.now() - this.connectionStartedAt} ms)`);
+        });
         socket.on('connect', () => {
             if (this.socket !== socket) return;
+            log(`Socket connected; waiting for project (${Date.now() - this.connectionStartedAt} ms)`);
             this._handshakeComplete = true;
             this._handshakeResolve();
         });
@@ -498,7 +544,15 @@ export class SocketIOAPI {
 
         socket.on('error', (err: unknown) => {
             if (this.socket !== socket) return;
-            log(`Socket error: ${errorMessage(err).slice(0, MAX_PROFILE_FIELD_LENGTH)}`);
+            const detail = err instanceof Error || typeof err === 'string'
+                ? err
+                : objectRecord(err)?.message;
+            const message = conciseErrorMessage(detail, 'Socket transport error');
+            log(`Socket error during ${this.connectionStage}: ${message}`);
+            if (!this._connected) this.failConnection(socket, new Error(
+                /^Socket\.IO HTTP handshake failed: HTTP 401\b/i.test(message)
+                    ? `401 Unauthorized: ${message}` : message,
+            ));
         });
 
         socket.on('disconnect', () => {
@@ -506,6 +560,7 @@ export class SocketIOAPI {
             log('Disconnected from Overleaf');
             const wasConnected = this._connected;
             this._connected = false;
+            this.failConnection(socket, new Error('Socket disconnected before the operation completed'));
             if (wasConnected) {
                 this.handlers.forEach(h => h.onDisconnected?.(false));
             } else {
@@ -694,15 +749,15 @@ export class SocketIOAPI {
     /**
      * Wait for socket handshake to complete
      */
-    private async waitForHandshake(timeoutMs: number = 5000): Promise<void> {
+    private async waitForHandshake(): Promise<void> {
         if (this._handshakeComplete) {
             return;
         }
 
         await this.withTimeout(
             this.raceConnectionFailure(this._handshakePromise),
-            timeoutMs,
-            'Socket handshake timeout',
+            this.handshakeTimeoutMs,
+            () => `Socket handshake timeout during ${this.connectionStage} after ${this.handshakeTimeoutMs / 1000}s`,
         );
     }
 
@@ -711,6 +766,30 @@ export class SocketIOAPI {
      * Reference: Overleaf-Workshop socketio.ts joinProject()
      */
     async joinProject(): Promise<ProjectEntity> {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await this.joinProjectOnce();
+            } catch (error) {
+                if (this.disposed || !isTemporaryConnectionFailure(error)
+                    || attempt >= this.initialRetryDelaysMs.length) throw error;
+                log(`Temporary connection failure; reconnecting automatically (${attempt + 1}/${this.initialRetryDelaysMs.length}): ${errorMessage(error)}`);
+                await new Promise<void>((resolve, reject) => {
+                    const timer = setTimeout(() => {
+                        this.cancelConnectionRetry = undefined;
+                        resolve();
+                    }, this.initialRetryDelaysMs[attempt]);
+                    this.cancelConnectionRetry = () => {
+                        clearTimeout(timer);
+                        reject(new Error('Socket connection has been disposed.'));
+                    };
+                });
+                if (this.disposed) throw new Error('Socket connection has been disposed.');
+                this.init();
+            }
+        }
+    }
+
+    private async joinProjectOnce(): Promise<ProjectEntity> {
         if (this.disposed) throw new Error('Socket connection has been disposed.');
         let legacyError: unknown;
         try {
@@ -733,10 +812,11 @@ export class SocketIOAPI {
         } catch (queryError) {
             this.teardownSocket();
             if (this.disposed || this.isAuthRelatedMessage(errorMessage(queryError))) throw queryError;
-            throw new Error(
+            throw new ProjectJoinError(
                 `Unable to join the Overleaf project using either Socket.IO protocol. `
                 + `Legacy protocol: ${errorMessage(legacyError)}. Project-query protocol: ${errorMessage(queryError)}.`,
-                { cause: legacyError },
+                legacyError,
+                isTemporaryConnectionFailure(queryError),
             );
         }
     }
@@ -747,11 +827,26 @@ export class SocketIOAPI {
         }
         await this.waitForHandshake();
         const response = await this.withTimeout(
-            this.raceConnectionFailure(this.emit('joinProject', { project_id: this.projectId })),
-            5000,
+            this.raceConnectionFailure(this.emitWithTimeout(this.projectJoinTimeoutMs, 'joinProject', { project_id: this.projectId })),
+            this.projectJoinTimeoutMs,
             'Legacy project join timed out',
         );
         return projectFromResponse(response[0]);
+    }
+
+    /** Reuse this API object so cursor and sync handlers survive reconnection. */
+    reconnect(): Promise<ProjectEntity> {
+        if (this.disposed) return Promise.reject(new Error('Socket connection has been disposed.'));
+        if (this.reconnectPromise) return this.reconnectPromise;
+        this.init();
+        // SyncEngine already owns the retry budget when recovering a live sync.
+        const operation = this.joinProjectOnce();
+        this.reconnectPromise = operation;
+        void operation.then(
+            () => { if (this.reconnectPromise === operation) this.reconnectPromise = undefined; },
+            () => { if (this.reconnectPromise === operation) this.reconnectPromise = undefined; },
+        );
+        return operation;
     }
 
     private async joinProjectFromHandshake(): Promise<ProjectEntity> {
@@ -761,7 +856,7 @@ export class SocketIOAPI {
         await this.waitForHandshake();
         return this.withTimeout(
             this.raceConnectionFailure(this.projectRecordPromise),
-            5000,
+            this.projectJoinTimeoutMs,
             'Query project join timed out',
         );
     }
@@ -777,7 +872,9 @@ export class SocketIOAPI {
      */
     async joinDoc(docId: string): Promise<{ lines: string[]; version: number }> {
         const safeDocId = validateOverleafId(docId, 'document ID');
-        const response = await this.emit('joinDoc', safeDocId, {
+        // A document may need loading from storage before the server can reply.
+        // Large text/CSV documents need more time than small RPC acknowledgements.
+        const response = await this.emitWithTimeout(this.documentReadTimeoutMs, 'joinDoc', safeDocId, {
             encodeRanges: true,
         });
         const lines = decodeSocketDocumentLines(response[0]);
@@ -911,6 +1008,8 @@ export class SocketIOAPI {
     disconnect() {
         if (this.disposed) return;
         this.disposed = true;
+        this.cancelConnectionRetry?.();
+        this.cancelConnectionRetry = undefined;
         this.teardownSocket();
         this.handlers = [];
         this._connected = false;
@@ -926,6 +1025,7 @@ export class SocketIOAPI {
             '',
         );
         return /^(?:unauthorized|not logged in|not authenticated|session expired|invalid session|authentication (?:failed|required)|login required)(?:\b|:)/.test(msg)
-            || /^(?:http\s+)?401(?:\b|:)/.test(msg);
+            || /^(?:http\s+)?401(?:\b|:)/.test(msg)
+            || /^socket\.io http handshake failed: http 401\b/.test(msg);
     }
 }

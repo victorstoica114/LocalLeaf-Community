@@ -1177,17 +1177,21 @@ export class BaseAPI {
                 rawEntity?.id,
                 uploadObject?.entity_id,
             );
-            const file: FileEntity | undefined = entityId
+            const rawType = rawEntity?._type ?? rawEntity?.type ?? uploadObject?.entity_type;
+            if (rawType !== undefined && rawType !== 'file' && rawType !== 'doc') {
+                return { type: 'error', message: 'Overleaf returned an invalid uploaded entity type.' };
+            }
+            const entity: FileEntity | undefined = entityId
                 ? {
                     _id: entityId,
-                    // This endpoint creates fileRefs. Do not let malformed
-                    // response metadata turn the result into a doc or folder.
-                    _type: 'file',
+                    _type: rawType === 'doc' ? 'doc' : 'file',
                     name: filename,
                 }
                 : undefined;
 
-            return { type: 'success', file };
+            return entity?._type === 'doc'
+                ? { type: 'success', doc: entity }
+                : { type: 'success', file: entity };
         }
         return this.responseError(res);
     }

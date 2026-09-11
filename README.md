@@ -22,7 +22,7 @@ The idea is deliberately simple: write with the local tools you already like, an
 - Show collaborators and jump to their cursor positions
 - Help resolve local and remote conflicts with a visual diff
 - Ignore build output and other generated files through `.leafignore`
-- Remove old ignored artifacts from the remote project after confirmation
+- Preview and remove ignored folders or files that exist only on Overleaf, while keeping local files
 - Work alongside LaTeX Workshop for local compilation and PDF preview
 
 ## Installation
@@ -71,7 +71,7 @@ Browser login uses a temporary, isolated Chromium profile and removes it after t
 | `LocalLeaf: Pull from Overleaf` | Downloads the latest remote state |
 | `LocalLeaf: Push to Overleaf` | Explains the automatic push behavior |
 | `LocalLeaf: Edit Ignore Patterns` | Opens `.leafignore` |
-| `LocalLeaf: Clean Ignored Files from Overleaf` | Removes ignored remote artifacts after confirmation |
+| `LocalLeaf: Clean Remote Files` | Select ignored folders and remote-only files to delete from Overleaf; local files are kept |
 | `LocalLeaf: Show Sync Status` | Shows the connection and synchronization state |
 | `LocalLeaf: Set Main Document` | Selects the primary `.tex` document |
 | `LocalLeaf: Configure Settings` | Opens the extension settings |

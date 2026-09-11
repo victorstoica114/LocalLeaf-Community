@@ -76,7 +76,7 @@ const { BaseAPI } = require('../api/base');
 const { SocketIOAPI } = require('../api/socketio');
 Module._load = originalLoad;
 
-function fixture() {
+function fixture(documentName = 'main.tex') {
     disk = new Map([[key(uri(rootPath)), { type: 2 }]]);
     prompts = [];
     promptChoice = undefined;
@@ -86,7 +86,7 @@ function fixture() {
     const subscriptions = new Set();
     const project: any = {
         _id: 'project', name: 'Audit fixture',
-        rootFolder: [{ _id: 'root', name: '', docs: [{ _id: 'doc', name: 'main.tex' }], fileRefs: [], folders: [] }],
+        rootFolder: [{ _id: 'root', name: '', docs: [{ _id: 'doc', name: documentName }], fileRefs: [], folders: [] }],
     };
     const settings = {
         getWorkspaceFolder: () => uri(rootPath),
@@ -97,6 +97,7 @@ function fixture() {
     };
     let refreshCount = 0;
     const api = {
+        dispose() {},
         async getDocContent(_projectId: string, id: string) { return { type: 'success', lines: server.get(id)!.text.split('\n') }; },
         async getProjectDetails() {
             refreshCount++;
@@ -106,6 +107,12 @@ function fixture() {
     const socket = {
         isConnected: true,
         publicId: 'local-client',
+        async reconnect() {
+            socket.isConnected = true;
+            subscriptions.clear();
+            return project;
+        },
+        disconnect() { socket.isConnected = false; subscriptions.clear(); },
         async joinDoc(id: string) {
             subscriptions.add(id);
             return { lines: server.get(id)!.text.split('\n'), version: server.get(id)!.version };
@@ -135,7 +142,7 @@ function fixture() {
         engine.setBaseContent(relative, bytes(text));
         engine.fileCache.set(relative, hash(bytes(text)));
     };
-    baseline('/main.tex', 'A');
+    baseline('/' + documentName, 'A');
     engine.setDocumentSnapshot('doc', { content: bytes('A'), version: 1 });
     return { engine, server, project, settings, api, socket, subscriptions, put, read, baseline, refreshCount: () => refreshCount };
 }
@@ -343,6 +350,9 @@ async function testPullSubscriptionsAndTree(): Promise<void> {
     const unavailable = fixture();
     unavailable.engine.api = { getProjectDetails: async () => ({ type: 'success', projectData: {} }) };
     await unavailable.engine.pullAll(); // Live socket tree remains usable on older servers.
+    unavailable.socket.isConnected = false;
+    await assert.rejects(() => unavailable.engine.refreshProjectFileTree(), /connection was lost.*Retry sync/,
+        'a lost socket must report a reconnection problem instead of missing server metadata');
     unavailable.engine.socket = undefined;
     await assert.rejects(() => unavailable.engine.pullAll(), /no folder tree/,
         'an HTTP session cannot claim success using an unrefreshable tree');
@@ -352,6 +362,320 @@ async function suppressExpectedError(operation: () => Promise<void>): Promise<vo
     const original = console.error;
     console.error = () => {};
     try { await operation(); } finally { console.error = original; }
+}
+
+async function testAutomaticPullRecovery(): Promise<void> {
+    const f = fixture();
+    const join = f.socket.joinDoc.bind(f.socket);
+    let reads = 0;
+    let reconnects = 0;
+    let oldEventStarted = false;
+    f.engine.api = {
+        ...f.api,
+        getProjectDetails: async () => ({ type: 'success', projectData: {} }),
+        getDocContent: async () => ({ type: 'error', message: 'HTTP 404' }),
+    };
+    f.put('/main.tex', 'local draft');
+    f.engine.askConflictResolution = async () => 'skip';
+    f.engine.askNewRemoteFileResolution = async () => 'useRemote';
+    f.socket.joinDoc = async id => {
+        if (++reads === 1) {
+            f.engine.enqueueRemoteEvent(async (isCurrent: () => boolean) => {
+                oldEventStarted = true;
+                await f.engine.handleRemoteFileRemoved('doc', isCurrent);
+            });
+            // Let the obsolete event start waiting for the bulk pull's lock.
+            await new Promise(resolve => setImmediate(resolve));
+            assert(oldEventStarted);
+            f.socket.isConnected = false;
+            throw new Error('Socket event "joinDoc" timed out');
+        }
+        return join(id);
+    };
+    f.socket.reconnect = async () => {
+        reconnects++;
+        f.socket.isConnected = true;
+        assert.equal(Buffer.from(f.engine.baseContent.get('/main.tex')).toString(), 'A',
+            'recovery must retain the common baseline used to protect local changes');
+        f.project.rootFolder[0].docs.push({ _id: 'new-doc', name: 'new.tex' });
+        f.server.set('new-doc', { text: 'added while disconnected', version: 1 });
+        return f.project;
+    };
+    const pull = f.engine.pullAll();
+    assert.equal(f.engine.pullAll(), pull, 'concurrent pulls must share automatic recovery');
+    await pull;
+    await f.engine.remoteEventQueue;
+    assert.equal(reconnects, 1, 'an interrupted read must reconnect without a user command');
+    assert.equal(reads, 3, 'resume using the new tree, including files added while disconnected');
+    assert.equal(f.read('/main.tex'), 'local draft', 'recovery must preserve unsynchronized local edits');
+    assert.equal(Buffer.from(f.engine.baseContent.get('/main.tex')).toString(), 'A');
+    assert.equal(f.read('/new.tex'), 'added while disconnected');
+    assert(f.engine.fileTree.has('doc'), 'events waiting on a lock from the old connection must be discarded');
+    assert(f.subscriptions.has('doc') && f.subscriptions.has('new-doc'));
+    assert.equal(f.engine.status, 'idle');
+    assert.equal(prompts.length, 0, 'transport recovery must not require a Retry prompt');
+
+    const fallback = fixture();
+    const fallbackJoin = fallback.socket.joinDoc.bind(fallback.socket);
+    let fallbackReads = 0;
+    let fallbackReconnects = 0;
+    fallback.socket.joinDoc = async id => {
+        if (++fallbackReads === 1) {
+            fallback.socket.isConnected = false;
+            throw new Error('Socket disconnected');
+        }
+        return fallbackJoin(id);
+    };
+    fallback.socket.reconnect = async () => {
+        fallbackReconnects++;
+        fallback.socket.isConnected = true;
+        return fallback.project;
+    };
+    fallback.engine.waitForRetry = async () => true;
+    await fallback.engine.pullAll();
+    assert.equal(fallbackReconnects, 1, 'a successful HTTP fallback must still restore live synchronization');
+    assert(fallback.subscriptions.has('doc'));
+
+    const stalled = fixture();
+    let stalledReads = 0;
+    let stalledReconnects = 0;
+    stalled.engine.waitForRetry = async () => true;
+    stalled.engine.api.getDocContent = async () => ({ type: 'error', message: 'HTTP 404' });
+    stalled.socket.joinDoc = async () => {
+        stalledReads++;
+        stalled.socket.isConnected = false;
+        throw new Error('Socket event "joinDoc" timed out');
+    };
+    stalled.socket.reconnect = async () => {
+        stalledReconnects++;
+        stalled.socket.isConnected = true;
+        return stalled.project;
+    };
+    await assert.rejects(stalled.engine.pullAll(), /joinDoc.*timed out/);
+    assert.equal(stalledReads, 3, 'a persistent failure must stop after the initial read and two retries');
+    assert.equal(stalledReconnects, 2);
+    assert.equal(stalled.engine.status, 'error');
+    assert.equal(stalled.read('/main.tex'), 'A');
+
+    const idle = fixture();
+    idle.socket.isConnected = false;
+    const scheduled: Array<() => Promise<void>> = [];
+    idle.engine.scheduleOperation = (operation: () => Promise<void>) => scheduled.push(operation);
+    idle.engine.scheduleAutomaticRecovery();
+    idle.engine.scheduleAutomaticRecovery();
+    assert.equal(scheduled.length, 1, 'idle disconnection notifications must coalesce');
+    await scheduled[0]();
+    assert(idle.socket.isConnected);
+    assert(idle.subscriptions.has('doc'));
+    assert.equal(idle.engine.status, 'idle');
+
+    const cancelled = fixture();
+    let cancellationReconnects = 0;
+    cancelled.socket.joinDoc = async () => {
+        cancelled.socket.isConnected = false;
+        throw new Error('Socket disconnected');
+    };
+    cancelled.engine.api.getDocContent = async () => ({ type: 'error', message: 'HTTP 404' });
+    cancelled.socket.reconnect = async () => { cancellationReconnects++; return cancelled.project; };
+    const wait = cancelled.engine.waitForRetry.bind(cancelled.engine);
+    cancelled.engine.waitForRetry = (delay: number) => {
+        const pending = wait(delay);
+        if (delay === 1000) setImmediate(() => cancelled.engine.disconnect());
+        return pending;
+    };
+    await assert.rejects(cancelled.engine.pullAll(), /sync session was closed/);
+    assert.equal(cancellationReconnects, 0, 'closing or switching the workspace must cancel delayed recovery');
+    assert.equal(cancelled.read('/main.tex'), 'A');
+
+    const expired = fixture();
+    let authReconnects = 0;
+    expired.socket.joinDoc = async () => { expired.socket.isConnected = false; throw new Error('Session expired'); };
+    expired.socket.reconnect = async () => { authReconnects++; return expired.project; };
+    await assert.rejects(expired.engine.pullAll(), /Session expired/);
+    assert.equal(authReconnects, 0, 'expired sessions need login, not automatic retries');
+}
+
+async function testLargeTextFiles(): Promise<void> {
+    const largeText = 'sample,value\r\n' + '123,456\r\n'.repeat(350_000);
+    const setup = () => {
+        const f = fixture('samples.csv');
+        const files = new Map<string, Buffer>();
+        let uploads = 0;
+        let otWrites = 0;
+        let failUpload = false;
+        f.socket.applyOtUpdate = async () => {
+            otWrites++;
+            throw new Error('Update takes doc over max doc size');
+        };
+        f.engine.api = {
+            ...f.api,
+            async renameEntity(_project: string, type: string, id: string, name: string) {
+                const entities = type === 'doc' ? f.project.rootFolder[0].docs : f.project.rootFolder[0].fileRefs;
+                entities.find((entity: any) => entity._id === id).name = name;
+                return { type: 'success' };
+            },
+            async uploadFile(_project: string, parent: string, name: string, content: Uint8Array) {
+                assert.equal(parent, 'root');
+                if (failUpload) return { type: 'error', message: 'Upload unavailable' };
+                const id = 'file-' + ++uploads;
+                files.set(id, Buffer.from(content));
+                f.project.rootFolder[0].fileRefs.push({ _id: id, name });
+                return { type: 'success', file: { _id: id, _type: 'file', name } };
+            },
+            async deleteEntity(_project: string, type: string, id: string) {
+                assert(uploads > 0, 'keep the original until its replacement is uploaded');
+                const list = type === 'doc' ? 'docs' : 'fileRefs';
+                f.project.rootFolder[0][list] = f.project.rootFolder[0][list].filter((entity: any) => entity._id !== id);
+                return { type: 'success' };
+            },
+            async getFile(_project: string, id: string) {
+                return { type: 'success', content: files.get(id) };
+            },
+        };
+        return { ...f, files, uploads: () => uploads, otWrites: () => otWrites,
+            failUpload: () => { failUpload = true; } };
+    };
+
+    const updated = setup();
+    updated.put('/samples.csv', largeText);
+    await updated.engine.handleLocalFileChange(updated.settings.getFilePath('/samples.csv'));
+    assert.equal(updated.otWrites(), 0, 'a CSV over 2 MiB must not enter the server document updater');
+    assert.equal(updated.uploads(), 1);
+    assert.equal(updated.read('/samples.csv'), largeText, 'preserve all local bytes and Windows line endings');
+    assert.equal(updated.files.get('file-1')!.toString(), largeText);
+    assert.equal(updated.engine.fileTreeByPath.get('/samples.csv').type, 'file');
+    assert.equal(updated.engine.joinedDocs.has('doc'), false);
+    assert.equal(updated.engine.documentSnapshots.has('doc'), false);
+    assert(updated.socket.isConnected);
+    await updated.engine.handleLocalFileChange(updated.settings.getFilePath('/samples.csv'));
+    await updated.engine.pullAll();
+    assert.equal(updated.uploads(), 1, 'the next save and pull must recognize the uploaded file');
+    assert.equal(updated.engine.status, 'idle');
+
+    const bulk = setup();
+    bulk.put('/samples.csv', largeText);
+    bulk.engine.askConflictResolution = async () => 'useLocal';
+    await bulk.engine.pullAll();
+    assert.equal(bulk.otWrites(), 0, 'choosing Local during a pull must also support large documents');
+    assert.equal(bulk.uploads(), 1);
+    assert.equal(bulk.read('/samples.csv'), largeText);
+    assert.equal(bulk.engine.status, 'idle');
+
+    const newFile = setup();
+    newFile.put('/new.csv', largeText);
+    await newFile.engine.uploadLocalFile('/new.csv');
+    assert.equal(newFile.otWrites(), 0);
+    assert.equal(newFile.uploads(), 1, 'new large CSV files must use multipart upload directly');
+    assert.equal(newFile.engine.fileTreeByPath.get('/new.csv').type, 'file');
+    newFile.put('/watched.csv', largeText);
+    await newFile.engine.handleLocalFileCreate(newFile.settings.getFilePath('/watched.csv'));
+    assert.equal(newFile.uploads(), 2, 'filesystem-created large CSV files need the same upload path');
+
+    const failed = setup();
+    failed.put('/samples.csv', largeText);
+    failed.failUpload();
+    await suppressExpectedError(() => failed.engine.handleLocalFileChange(failed.settings.getFilePath('/samples.csv')));
+    assert.equal(failed.engine.fileTreeByPath.get('/samples.csv').id, 'doc');
+    assert.equal(failed.project.rootFolder[0].docs[0].name, 'samples.csv');
+    assert.equal(failed.server.get('doc')!.text, 'A');
+    assert.equal(failed.read('/samples.csv'), largeText, 'an unsuccessful conversion must retain both versions');
+    assert.equal(failed.engine.fileCache.get('/samples.csv'), hash(bytes('A')));
+    assert.equal(failed.engine.status, 'error');
+
+    const conflict = setup();
+    conflict.put('/samples.csv', largeText);
+    conflict.server.set('doc', { text: 'collaborator edit', version: 2 });
+    conflict.engine.askConflictResolution = async () => 'skip';
+    await conflict.engine.handleLocalFileChange(conflict.settings.getFilePath('/samples.csv'));
+    assert.equal(conflict.uploads(), 0, 'large-file conversion must respect existing conflict decisions');
+    assert.equal(conflict.server.get('doc')!.text, 'collaborator edit');
+
+    const main = setup();
+    main.project.rootDoc_id = 'doc';
+    main.put('/samples.csv', largeText);
+    await suppressExpectedError(() => main.engine.handleLocalFileChange(main.settings.getFilePath('/samples.csv')));
+    assert.equal(main.uploads(), 0, 'never silently convert the compilation root into an attachment');
+    assert.equal(main.engine.fileTreeByPath.get('/samples.csv').id, 'doc');
+}
+
+async function testIgnoredFoldersAndRemoteCleanup(): Promise<void> {
+    const setup = () => {
+        const f = fixture();
+        f.project.rootDoc_id = 'doc';
+        f.put('/.leafignore', '/analysis/\n/scripts/\n__pycache__/\n');
+        f.project.rootFolder[0].folders.push({ _id: 'analysis', name: 'analysis', docs: [], fileRefs: [], folders: [
+            { _id: 'raw', name: 'raw_data', docs: [{ _id: 'data', name: 'data.csv' }], fileRefs: [], folders: [] },
+        ] });
+        f.project.rootFolder[0].docs.push({ _id: 'sample', name: 'samples.csv' });
+        const deleted: string[] = [];
+        f.engine.api.deleteEntity = async (_project: string, _type: string, id: string) => {
+            deleted.push(id);
+            return { type: 'success' };
+        };
+        return { ...f, deleted };
+    };
+
+    const f = setup();
+    await f.engine.ignoreParser.load();
+    assert(f.engine.ignoreParser.shouldIgnore('/analysis/raw_data/data.csv'),
+        'anchored directory rules must exclude descendants visited directly by socket events and pulls');
+    assert(f.engine.ignoreParser.shouldIgnore('/analysis/'));
+    assert(f.engine.ignoreParser.shouldIgnore('/scripts/tool.py'));
+    assert(f.engine.ignoreParser.shouldIgnore('/nested/__pycache__/compiled.pyc'));
+    assert.equal(f.engine.ignoreParser.shouldIgnore('/other/analysis/data.csv'), false);
+    assert.equal(f.engine.ignoreParser.shouldIgnore('/analysis-notes.tex'), false);
+    f.put('/analysis/local.txt', 'keep local analysis');
+    f.engine.api.uploadFile = async () => { throw new Error('Ignored content must never be uploaded'); };
+    await f.engine.handleLocalFileCreate(f.settings.getFilePath('/analysis/local.txt'));
+    assert.equal(f.engine.status, 'disconnected', 'ignored file events must not start a transfer');
+
+    const candidates = await f.engine.getRemoteCleanupCandidates();
+    assert.deepEqual(candidates.map((candidate: any) => [candidate.path, candidate.reason]), [
+        ['/analysis/', 'ignored'], ['/samples.csv', 'missing-local'],
+    ], 'preview the ignored folder as one target and the root-only sample separately');
+    const result = await f.engine.deleteRemoteCleanupCandidates(candidates);
+    assert.deepEqual(result, { deleted: 2, skipped: 0, failed: [] });
+    assert.deepEqual(f.deleted, ['analysis', 'sample'], 'delete an ignored subtree with one folder request');
+    assert.equal(f.read('/analysis/local.txt'), 'keep local analysis', 'remote cleanup must preserve local ignored data');
+    assert.equal(f.read('/main.tex'), 'A');
+    assert.equal(f.engine.fileTreeByPath.has('/analysis/raw_data/data.csv'), false);
+    assert.equal(f.engine.fileTreeByPath.has('/analysis/'), false);
+    assert.equal(f.engine.fileTreeByPath.has('/samples.csv'), false);
+
+    const exception = setup();
+    exception.put('/.leafignore', '/analysis/\n!/analysis/raw_data/data.csv\n');
+    assert.deepEqual(await exception.engine.getIgnoredRemoteFiles(), [],
+        'a folder containing an explicitly included file must never be deleted recursively');
+
+    const changedRules = setup();
+    const oldIgnored = (await changedRules.engine.getRemoteCleanupCandidates()).filter((candidate: any) => candidate.reason === 'ignored');
+    changedRules.put('/.leafignore', '# no exclusions now\n');
+    assert.equal((await changedRules.engine.deleteRemoteCleanupCandidates(oldIgnored)).skipped, 1);
+    assert.deepEqual(changedRules.deleted, []);
+
+    const replaced = setup();
+    const oldMissing = (await replaced.engine.getRemoteCleanupCandidates()).filter((candidate: any) => candidate.reason === 'missing-local');
+    replaced.project.rootFolder[0].docs.find((doc: any) => doc._id === 'sample')._id = 'replacement';
+    assert.equal((await replaced.engine.deleteRemoteCleanupCandidates(oldMissing)).skipped, 1,
+        'a new remote file at the same path must not inherit approval for the old identity');
+    assert.deepEqual(replaced.deleted, []);
+
+    const appeared = setup();
+    const selectedMissing = (await appeared.engine.getRemoteCleanupCandidates()).filter((candidate: any) => candidate.reason === 'missing-local');
+    appeared.put('/samples.csv', 'new local file');
+    assert.equal((await appeared.engine.deleteRemoteCleanupCandidates(selectedMissing)).skipped, 1);
+    assert.deepEqual(appeared.deleted, []);
+    assert.equal(appeared.read('/samples.csv'), 'new local file');
+
+    const open = setup();
+    vscode.workspace.textDocuments = [{ uri: open.settings.getFilePath('/samples.csv'), isDirty: true }];
+    assert.equal((await open.engine.getRemoteCleanupCandidates()).some((candidate: any) => candidate.path === '/samples.csv'), false,
+        'an open unsaved document is not a remote-only deletion candidate');
+
+    const protectedMain = setup();
+    protectedMain.put('/.leafignore', '/**\n');
+    assert.equal((await protectedMain.engine.getIgnoredRemoteFiles()).includes('/main.tex'), false,
+        'cleanup must preserve the compilation root even when an ignore rule matches it');
 }
 
 async function testUploadRetryAndTransformation(): Promise<void> {
@@ -389,13 +713,14 @@ async function testAppliedConfirmation(): Promise<void> {
     const tick = () => new Promise<void>(resolve => setImmediate(resolve));
     const makeSocket = () => {
         const wire = new (require('node:events').EventEmitter)();
-        const client: any = Object.create(SocketIOAPI.prototype);
-        Object.assign(client, { _publicId: 'self', handlers: [], pendingDocumentWrites: new Set(), disposed: false });
-        client.socket = {
+        const socket = {
             on: wire.on.bind(wire), removeListener: wire.removeListener.bind(wire),
             removeAllListeners: wire.removeAllListeners.bind(wire), disconnect() {},
             emit(_event: string, ...args: any[]) { args.at(-1)(null); },
         };
+        const client: any = new SocketIOAPI({ initSocket: () => socket },
+            { cookies: 'audit=synthetic', csrfToken: 'synthetic' }, 'project');
+        client._publicId = 'self';
         return { client, wire };
     };
     const update = { doc: 'doc', v: 2, op: [{ p: 1, i: 'x' }] };
@@ -433,13 +758,14 @@ async function testAppliedConfirmation(): Promise<void> {
 async function testBinaryMultipartUpload(): Promise<void> {
     const http = require('node:http');
     const bodies: Buffer[] = [];
+    let responseType = 'file';
     const server = http.createServer((request: any, response: any) => {
         const chunks: Buffer[] = [];
         request.on('data', (chunk: Buffer) => chunks.push(chunk));
         request.on('end', () => {
             bodies.push(Buffer.concat(chunks));
             response.writeHead(200, { 'Content-Type': 'application/json' });
-            response.end(JSON.stringify({ entity_id: 'uploaded', entity_type: 'file' }));
+            response.end(JSON.stringify({ entity_id: 'uploaded', entity_type: responseType }));
         });
     });
     await new Promise<void>((resolve, reject) => {
@@ -460,6 +786,13 @@ async function testBinaryMultipartUpload(): Promise<void> {
             const end = body.indexOf('\r\n--', start);
             assert.deepEqual(body.subarray(start, end), Buffer.from(data), 'multipart upload must preserve the exact binary bytes');
         }
+        responseType = 'doc';
+        const editable = await api.uploadFile('project', 'root', 'small.csv', bytes('x,y\n'));
+        assert.equal(editable.doc?._type, 'doc', 'respect the storage type returned by the upload endpoint');
+        assert.equal(editable.file, undefined, 'an editable upload must not be misidentified as an attachment');
+        responseType = 'folder';
+        const invalid = await api.uploadFile('project', 'root', 'small.csv', bytes('x,y\n'));
+        assert.equal(invalid.type, 'error', 'invalid upload types must not authorize deleting a replacement backup');
     } finally {
         api.dispose();
         server.closeAllConnections();
@@ -469,7 +802,8 @@ async function testBinaryMultipartUpload(): Promise<void> {
 
 async function run(): Promise<void> {
     const tests = [testVersionedSnapshots, testAutomaticConflicts, testSafeRemoteDeletion,
-        testPullSubscriptionsAndTree, testUploadRetryAndTransformation, testAppliedConfirmation, testBinaryMultipartUpload];
+        testPullSubscriptionsAndTree, testAutomaticPullRecovery, testLargeTextFiles, testIgnoredFoldersAndRemoteCleanup,
+        testUploadRetryAndTransformation, testAppliedConfirmation, testBinaryMultipartUpload];
     for (const test of tests) {
         await test();
         console.log(`Passed: ${test.name}`);

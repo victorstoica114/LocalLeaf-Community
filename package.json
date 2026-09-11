@@ -2,7 +2,7 @@
   "name": "localleaf-community",
   "displayName": "LocalLeaf Community",
   "description": "Edit Overleaf projects locally in VS Code with two-way synchronization.",
-  "version": "0.2.4",
+  "version": "0.2.9",
   "publisher": "victorstoica114",
   "repository": {
     "type": "git",
@@ -110,7 +110,7 @@
       },
       {
         "command": "localleaf.cleanIgnoredRemoteFiles",
-        "title": "LocalLeaf: Clean Ignored Files from Overleaf"
+        "title": "LocalLeaf: Clean Remote Files"
       },
       {
         "command": "localleaf.showSyncStatus",

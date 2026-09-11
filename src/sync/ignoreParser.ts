@@ -4,7 +4,7 @@
  */
 
 import * as vscode from 'vscode';
-import { minimatch } from 'minimatch';
+import { Minimatch } from 'minimatch';
 import { IGNORE_FILE, VAR_MAIN_TEX, VAR_MAIN_PDF, DEFAULT_IGNORE_PATTERNS } from '../consts';
 import { ProjectSettings } from '../utils/settingsManager';
 import { assertSafeWorkspacePath, isFileNotFoundError } from '../utils/pathSafety';
@@ -44,6 +44,7 @@ function escapeGlobLiteral(value: string): string {
 export class IgnoreParser {
     private patterns: string[] = [];
     private resolvedPatterns: string[] = [];
+    private compiledPatterns: Array<{ negated: boolean; anchored: Minimatch; relative: Minimatch }> = [];
 
     constructor(
         private readonly workspaceFolder: vscode.Uri,
@@ -116,6 +117,17 @@ export class IgnoreParser {
 
             return [resolved];
         });
+        this.compiledPatterns = this.resolvedPatterns.flatMap(rawPattern => {
+            const negated = rawPattern.startsWith('!');
+            const pattern = negated ? rawPattern.slice(1) : rawPattern;
+            if (!pattern) return [];
+            const options = { dot: true, nonegate: true };
+            return [{
+                negated,
+                anchored: new Minimatch(pattern.startsWith('/') ? pattern : '**/' + pattern, options),
+                relative: new Minimatch(pattern, options),
+            }];
+        });
     }
 
     /**
@@ -132,22 +144,23 @@ export class IgnoreParser {
     shouldIgnore(relativePath: string): boolean {
         // Normalize path (ensure it starts with /)
         const normalizedPath = relativePath.startsWith('/') ? relativePath : '/' + relativePath;
+        const candidates = [normalizedPath];
+        // A directory rule also applies to every descendant. Socket events and
+        // bulk pulls visit files directly, without first visiting their parent.
+        for (let index = normalizedPath.indexOf('/', 1); index >= 0; index = normalizedPath.indexOf('/', index + 1)) {
+            if (index < normalizedPath.length - 1) candidates.push(normalizedPath.slice(0, index + 1));
+        }
+        let ignored = false;
 
-        for (const pattern of this.resolvedPatterns) {
-            // Handle patterns that start with / (anchored to root)
-            const patternToMatch = pattern.startsWith('/') ? pattern : '**/' + pattern;
-
-            if (minimatch(normalizedPath, patternToMatch, { dot: true })) {
-                return true;
-            }
-
-            // Also try matching without leading slash
-            if (minimatch(normalizedPath.slice(1), pattern, { dot: true })) {
-                return true;
+        for (const rule of this.compiledPatterns) {
+            if (candidates.some(candidate =>
+                rule.anchored.match(candidate) || rule.relative.match(candidate.slice(1))
+            )) {
+                ignored = !rule.negated;
             }
         }
 
-        return false;
+        return ignored;
     }
 
     /**

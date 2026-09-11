@@ -36,6 +36,9 @@ const MAX_SUPPRESSED_RENAME_ENTITIES = 10_000;
 const MAX_SUPPRESSED_RENAMES_PER_ENTITY = 16;
 const MAX_SUPPRESSED_DELETES = 10_000;
 const SYNCHRONIZED_CONTENT_MARKER = new Uint8Array(0);
+// Overleaf's default editable-document limit. Larger text belongs in the file
+// upload path, where the server chooses its supported storage type.
+const MAX_EDITABLE_DOCUMENT_CHARACTERS = 2 * 1024 * 1024;
 
 /**
  * Sync status
@@ -57,6 +60,13 @@ export interface SyncStatusEvent {
     message?: string;
     file?: string;
     authError?: boolean;
+}
+
+export interface RemoteCleanupCandidate {
+    path: string;
+    id: string;
+    type: 'file' | 'doc' | 'folder';
+    reason: 'ignored' | 'missing-local';
 }
 
 /**
@@ -172,6 +182,8 @@ export class SyncEngine {
     private pendingRemoteEventCount = 0;
     private pendingRemoteEventCost = 0;
     private activePull?: Promise<void>;
+    private automaticRecoveryScheduled = false;
+    private remoteEventGeneration = 0;
     private readonly remoteDiffContents = new Map<string, string>();
     private remoteDiffCharacters = 0;
     private readonly maxRemoteDiffCharacters = MAX_REMOTE_DIFF_CHARACTERS;
@@ -198,6 +210,11 @@ export class SyncEngine {
      */
     get status(): SyncStatus {
         return this._status;
+    }
+
+    /** Established sessions recover inside pullAll without losing their baselines. */
+    get needsInitialization(): boolean {
+        return this.disposed || !this.project;
     }
 
     /**
@@ -230,9 +247,11 @@ export class SyncEngine {
     }
 
     private enqueueRemoteEvent(
-        operation: () => Promise<void>,
+        operation: (isCurrent: () => boolean) => Promise<void>,
         estimatedCost: number = DEFAULT_REMOTE_EVENT_COST,
     ): void {
+        const generation = this.remoteEventGeneration;
+        const isCurrent = () => !this.disposed && generation === this.remoteEventGeneration;
         const safeCost = Number.isSafeInteger(estimatedCost) && estimatedCost > 0
             ? estimatedCost
             : DEFAULT_REMOTE_EVENT_COST;
@@ -251,7 +270,7 @@ export class SyncEngine {
         this.pendingRemoteEventCost += safeCost;
         this.remoteEventQueue = this.remoteEventQueue
             .then(async () => {
-                if (!this.disposed) await operation();
+                if (isCurrent()) await operation(isCurrent);
             })
             .catch(error => {
                 if (!this.disposed) {
@@ -316,22 +335,23 @@ export class SyncEngine {
                         this.setStatus('error', 'Session expired', undefined, true);
                     } else {
                         this.setStatus('disconnected', 'Disconnected');
+                        this.scheduleAutomaticRecovery();
                     }
                 },
                 onFileCreated: (parentId, type, entity) => this.enqueueRemoteEvent(
-                    () => this.handleRemoteFileCreated(parentId, type, entity)
+                    isCurrent => this.handleRemoteFileCreated(parentId, type, entity, isCurrent)
                 ),
                 onFileRenamed: (entityId, newName) => this.enqueueRemoteEvent(
-                    () => this.handleRemoteFileRenamed(entityId, newName)
+                    isCurrent => this.handleRemoteFileRenamed(entityId, newName, isCurrent)
                 ),
                 onFileRemoved: (entityId) => this.enqueueRemoteEvent(
-                    () => this.handleRemoteFileRemoved(entityId)
+                    isCurrent => this.handleRemoteFileRemoved(entityId, isCurrent)
                 ),
                 onFileMoved: (entityId, newParentId) => this.enqueueRemoteEvent(
-                    () => this.handleRemoteFileMoved(entityId, newParentId)
+                    isCurrent => this.handleRemoteFileMoved(entityId, newParentId, isCurrent)
                 ),
                 onFileChanged: (update) => this.enqueueRemoteEvent(
-                    () => this.handleRemoteFileChanged(update),
+                    isCurrent => this.handleRemoteFileChanged(update, isCurrent),
                     this.estimateDocumentUpdateCost(update),
                 ),
                 onRootDocUpdated: (rootDocId) => this.enqueueRemoteEvent(
@@ -380,12 +400,8 @@ export class SyncEngine {
                     this.buildFileTree(httpProject);
                     this.project = httpProject;
                 } else {
-                    const socketReason = socketError instanceof Error
-                        ? socketError.message
-                        : String(socketError || 'unknown Socket.IO error');
                     throw new Error(
-                        `Real-time synchronization failed (${socketReason.slice(0, 512)}). `
-                        + 'Safe HTTP synchronization is unavailable because this server does not expose folder IDs.'
+                        'Safe HTTP synchronization is unavailable because this server does not expose folder IDs.'
                     );
                 }
 
@@ -899,13 +915,13 @@ export class SyncEngine {
         this.syncLock.delete(path);
     }
 
-    private waitForRetry(): Promise<boolean> {
+    private waitForRetry(delayMs = DEBOUNCE_DELAY): Promise<boolean> {
         if (this.disposed) return Promise.resolve(false);
         return new Promise(resolve => {
             const timer = setTimeout(() => {
                 this.pendingWaits.delete(timer);
                 resolve(!this.disposed);
-            }, DEBOUNCE_DELAY);
+            }, delayMs);
             this.pendingWaits.set(timer, resolve);
         });
     }
@@ -1384,6 +1400,21 @@ export class SyncEngine {
                 }
                 snapshot = latest;
             }
+            if (this.requiresFileUpload(newContent)) {
+                const entry = this.fileTree.get(docId);
+                if (!entry || entry.type !== 'doc' || entry.path !== path) {
+                    throw new Error(`Cannot upload ${path}: the document identity changed`);
+                }
+                if (this.project?.rootDoc_id === docId) {
+                    throw new Error(`Cannot upload ${path}: the main document exceeds Overleaf's editable-document limit`);
+                }
+                await this.replaceRemoteFile(entry, newContent);
+                const replacement = this.fileTreeByPath.get(path)!;
+                // Callers must record the uploaded entity's type and identity.
+                Object.assign(entry, replacement);
+                this.log(`Uploaded large text file: ${path} (${newContent.byteLength} bytes)`);
+                return { content: newContent, pushed: true };
+            }
             const { version } = snapshot;
             if (version === undefined) {
                 throw new Error(`Cannot update ${path}: no authoritative document version is available`);
@@ -1497,6 +1528,9 @@ export class SyncEngine {
                 debugLog('HTTP project tree refresh unavailable; keeping the live project tree');
                 return;
             }
+            if (this.socket && !this.socket.isConnected) {
+                throw new Error('The real-time connection was lost. Retry sync to reconnect and refresh the project.');
+            }
             throw new Error('Refresh project file tree: Overleaf returned no folder tree');
         }
 
@@ -1521,21 +1555,23 @@ export class SyncEngine {
     }
 
     private trackUploadedEntity(
-        result: { file?: FileEntity },
+        result: { file?: FileEntity; doc?: FileEntity },
         parentId: string,
         name: string,
         path: string
     ): FileTreeEntry | undefined {
-        if (!result.file?._id) {
+        const entity = result.doc || result.file;
+        if (!entity?._id) {
             return undefined;
         }
-        const entityId = validateOverleafId(result.file._id, 'uploaded entity ID');
-        if (result.file._type !== 'file') {
+        const entityId = validateOverleafId(entity._id, 'uploaded entity ID');
+        const type = result.doc ? 'doc' : 'file';
+        if (entity._type !== type || (result.doc && result.file)) {
             throw new Error(`Overleaf returned an invalid uploaded entity type for ${path}`);
         }
         const existing = this.fileTree.get(entityId);
         if (existing) {
-            if (existing.path !== path || existing.type !== 'file') {
+            if (existing.path !== path || existing.type !== type) {
                 throw new Error(`Overleaf reused uploaded entity ID: ${entityId}`);
             }
             return existing;
@@ -1547,7 +1583,7 @@ export class SyncEngine {
 
         const entry: FileTreeEntry = {
             id: entityId,
-            type: 'file',
+            type,
             name,
             path,
             parentId,
@@ -1559,7 +1595,7 @@ export class SyncEngine {
     }
 
     private async resolveUploadedFile(
-        result: { file?: FileEntity },
+        result: { file?: FileEntity; doc?: FileEntity },
         parentId: string,
         name: string,
         path: string,
@@ -1569,7 +1605,7 @@ export class SyncEngine {
             await this.refreshProjectFileTree();
             entry = this.fileTreeByPath.get(path);
         }
-        if (!entry || entry.type !== 'file') {
+        if (!entry || (entry.type !== 'file' && entry.type !== 'doc')) {
             throw new Error(`Upload ${path}: the uploaded file identity could not be verified`);
         }
         return entry;
@@ -1650,6 +1686,8 @@ export class SyncEngine {
         }
 
         this.fileTree.delete(entry.id);
+        this.joinedDocs.delete(entry.id);
+        this.deleteDocumentSnapshot(entry.id);
         this.clearSuppressedDocumentUpdates(entry.id);
         this.suppressedRemoteRenames.delete(entry.id);
         if (this.fileTreeByPath.get(entry.path)?.id === entry.id) {
@@ -1886,7 +1924,7 @@ export class SyncEngine {
                     throw readError;
                 }
 
-                const isTextFile = this.isTextFile(name);
+                const isTextFile = this.isTextFile(name) && !this.requiresFileUpload(content);
 
                 if (isTextFile) {
                     content = await this.createTextDocumentWithContent(
@@ -1905,9 +1943,8 @@ export class SyncEngine {
                             content
                         );
                         ensureApiSuccess(result, `Upload ${relativePath}`);
-                        await this.resolveUploadedFile(result, parentId, name, relativePath);
-                        this.setBaseContent(relativePath, SYNCHRONIZED_CONTENT_MARKER);
-                        this.fileCache.set(relativePath, hashContent(content));
+                        const entry = await this.resolveUploadedFile(result, parentId, name, relativePath);
+                        this.recordSynchronizedContent(entry, content);
                     });
                 }
             }
@@ -1995,7 +2032,7 @@ export class SyncEngine {
     /**
      * Handle remote file created
      */
-    private async handleRemoteFileCreated(parentId: string, type: 'doc' | 'file' | 'folder', entity: FileEntity): Promise<void> {
+    private async handleRemoteFileCreated(parentId: string, type: 'doc' | 'file' | 'folder', entity: FileEntity, isCurrent = () => true): Promise<void> {
         const safeParentId = validateOverleafId(parentId, 'parent folder ID');
         const entityId = validateOverleafId(entity?._id, 'entity ID');
         const parent = this.fileTree.get(safeParentId);
@@ -2037,6 +2074,7 @@ export class SyncEngine {
         if (!(await this.acquireLockWhenAvailable(path))) return;
 
         try {
+            if (!isCurrent()) return;
             trackedEntry ??= trackEntry();
             if (!this.shouldSync(path)) return;
             this.setStatus('pulling', `Downloading ${path}`, path);
@@ -2068,7 +2106,7 @@ export class SyncEngine {
     /**
      * Handle remote file renamed
      */
-    private async handleRemoteFileRenamed(entityId: string, newName: string): Promise<void> {
+    private async handleRemoteFileRenamed(entityId: string, newName: string, isCurrent = () => true): Promise<void> {
         entityId = validateOverleafId(entityId, 'entity ID');
         if (this.consumeSuppressedRemoteRename(entityId, newName)) {
             return;
@@ -2094,6 +2132,7 @@ export class SyncEngine {
         if (!(await this.acquireLockWhenAvailable(oldPath))) return;
 
         try {
+            if (!isCurrent()) return;
             this.setStatus('pulling', `Renaming ${oldPath} to ${newPath}`, oldPath);
 
             const oldUri = this.settings.getFilePath(oldPath);
@@ -2210,7 +2249,7 @@ export class SyncEngine {
     /**
      * Handle remote file removed
      */
-    private async handleRemoteFileRemoved(entityId: string): Promise<void> {
+    private async handleRemoteFileRemoved(entityId: string, isCurrent = () => true): Promise<void> {
         entityId = validateOverleafId(entityId, 'entity ID');
         if (this.suppressedRemoteDeletes.delete(entityId)) {
             const suppressedEntry = this.fileTree.get(entityId);
@@ -2240,6 +2279,7 @@ export class SyncEngine {
         if (!(await this.acquireLockWhenAvailable(entry.path))) return;
 
         try {
+            if (!isCurrent()) return;
             this.setStatus('pulling', `Deleting ${entry.path}`, entry.path);
 
             const removedEntries = this.getTrackedSubtreeEntries(entry.path);
@@ -2276,7 +2316,7 @@ export class SyncEngine {
     /**
      * Handle remote file moved
      */
-    private async handleRemoteFileMoved(entityId: string, newParentId: string): Promise<void> {
+    private async handleRemoteFileMoved(entityId: string, newParentId: string, isCurrent = () => true): Promise<void> {
         entityId = validateOverleafId(entityId, 'entity ID');
         newParentId = validateOverleafId(newParentId, 'parent folder ID');
         const entry = this.fileTree.get(entityId);
@@ -2295,6 +2335,7 @@ export class SyncEngine {
         if (!(await this.acquireLockWhenAvailable(oldPath))) return;
 
         try {
+            if (!isCurrent()) return;
             this.setStatus('pulling', `Moving ${oldPath} to ${newPath}`, oldPath);
 
             const oldUri = this.settings.getFilePath(oldPath);
@@ -2335,7 +2376,7 @@ export class SyncEngine {
     /**
      * Handle remote file content changed (OT update)
      */
-    private async handleRemoteFileChanged(update: DocumentUpdate): Promise<void> {
+    private async handleRemoteFileChanged(update: DocumentUpdate, isCurrent = () => true): Promise<void> {
         validateOverleafId(update?.doc, 'document ID');
         if (
             update.op !== undefined
@@ -2358,6 +2399,7 @@ export class SyncEngine {
         if (!(await this.acquireLockWhenAvailable(entry.path))) return;
 
         try {
+            if (!isCurrent()) return;
             const snapshot = this.documentSnapshots.get(update.doc);
             if (snapshot?.version !== undefined && Number.isSafeInteger(update.v)
                 && update.v < snapshot.version) {
@@ -3018,7 +3060,7 @@ export class SyncEngine {
 
         this.setStatus('pushing', `Uploading ${relativePath}`, relativePath);
 
-        if (isTextFile) {
+        if (isTextFile && !this.requiresFileUpload(content)) {
             content = await this.createTextDocumentWithContent(
                 projectSettings.projectId,
                 parentId,
@@ -3036,9 +3078,8 @@ export class SyncEngine {
                 );
                 this.throwIfDisposed();
                 ensureApiSuccess(result, `Upload ${relativePath}`);
-                await this.resolveUploadedFile(result, parentId, name, relativePath);
-                this.setBaseContent(relativePath, SYNCHRONIZED_CONTENT_MARKER);
-                this.fileCache.set(relativePath, hashContent(content));
+                const entry = await this.resolveUploadedFile(result, parentId, name, relativePath);
+                this.recordSynchronizedContent(entry, content);
             });
         }
     }
@@ -3054,11 +3095,92 @@ export class SyncEngine {
     private async getIgnoredRemoteFilesExclusive(): Promise<string[]> {
         await this.ignoreParser.load();
         await this.refreshProjectFileTree();
+        return this.getIgnoredRemoteRoots().map(entry => entry.path);
+    }
 
-        return Array.from(this.fileTree.values())
-            .filter(entry => entry.type !== 'folder' && this.ignoreParser.shouldIgnore(entry.path))
-            .map(entry => entry.path)
-            .sort((a, b) => a.localeCompare(b));
+    /** Collapse fully ignored subtrees into one server-side folder deletion. */
+    private getIgnoredRemoteRoots(): FileTreeEntry[] {
+        const entries = [...this.fileTree.values()];
+        const ignored = new Set(entries.filter(entry => entry.path !== '/'
+            && entry.id !== this.project?.rootDoc_id && this.ignoreParser.shouldIgnore(entry.path))
+            .map(entry => entry.path));
+        const protectedFolders = new Set<string>();
+        for (const entry of entries) {
+            if (ignored.has(entry.path)) continue;
+            for (let index = entry.path.indexOf('/', 1); index >= 0; index = entry.path.indexOf('/', index + 1)) {
+                if (index < entry.path.length - 1) protectedFolders.add(entry.path.slice(0, index + 1));
+            }
+        }
+        const folders = new Set(entries.filter(entry => entry.type === 'folder'
+            && ignored.has(entry.path) && !protectedFolders.has(entry.path)).map(entry => entry.path));
+        return entries.filter(entry => {
+            if (!ignored.has(entry.path) || (entry.type === 'folder' && !folders.has(entry.path))) return false;
+            for (let index = entry.path.indexOf('/', 1); index >= 0; index = entry.path.indexOf('/', index + 1)) {
+                if (index < entry.path.length - 1 && folders.has(entry.path.slice(0, index + 1))) return false;
+            }
+            return true;
+        }).sort((a, b) => a.path.localeCompare(b.path));
+    }
+
+    getRemoteCleanupCandidates(): Promise<RemoteCleanupCandidate[]> {
+        return this.runWorkspaceExclusive(async () => {
+            await this.ignoreParser.load();
+            await this.refreshProjectFileTree();
+            const ignored = this.getIgnoredRemoteRoots();
+            const candidates: RemoteCleanupCandidate[] = ignored.map(entry => ({
+                path: entry.path, id: entry.id, type: entry.type, reason: 'ignored',
+            }));
+            for (const entry of this.fileTree.values()) {
+                if (await this.isRemoteOnlyCleanupCandidate(entry)) {
+                    candidates.push({ path: entry.path, id: entry.id, type: entry.type, reason: 'missing-local' });
+                }
+            }
+            return candidates.sort((a, b) => a.path.localeCompare(b.path));
+        });
+    }
+
+    private async isRemoteOnlyCleanupCandidate(entry: FileTreeEntry): Promise<boolean> {
+        if (entry.type === 'folder' || entry.id === this.project?.rootDoc_id || !this.shouldSync(entry.path)) return false;
+        const uri = this.settings.getFilePath(entry.path);
+        await this.assertNoSymbolicLinks(uri);
+        return !this.getOpenTextDocument(uri) && !(await this.localFileExists(uri));
+    }
+
+    deleteRemoteCleanupCandidates(candidates: readonly RemoteCleanupCandidate[]): Promise<{
+        deleted: number; skipped: number; failed: Array<{ path: string; error: unknown }>;
+    }> {
+        return this.runWorkspaceExclusive(async () => {
+            await this.ignoreParser.load();
+            await this.refreshProjectFileTree();
+            const ignoredRoots = new Set(this.getIgnoredRemoteRoots().map(entry => entry.path));
+            let deleted = 0;
+            let skipped = 0;
+            const failed: Array<{ path: string; error: unknown }> = [];
+            this.setStatus('pushing', 'Cleaning selected entries from Overleaf...');
+            for (const candidate of candidates) {
+                this.throwIfDisposed();
+                const entry = this.fileTreeByPath.get(candidate.path);
+                if (!entry || entry.id !== candidate.id || entry.type !== candidate.type) {
+                    skipped++;
+                    continue;
+                }
+                try {
+                    const eligible = candidate.reason === 'ignored'
+                        ? ignoredRoots.has(entry.path)
+                        : candidate.reason === 'missing-local' && await this.isRemoteOnlyCleanupCandidate(entry);
+                    if (!eligible) { skipped++; continue; }
+                    await this.deleteRemoteEntry(entry, true);
+                    this.removeTrackedSubtree(entry.path);
+                    this.log(`Deleted ${candidate.reason === 'ignored' ? 'ignored' : 'remote-only'} entry from Overleaf: ${entry.path}`);
+                    deleted++;
+                } catch (error) {
+                    failed.push({ path: candidate.path, error });
+                }
+            }
+            this.setStatus(failed.length ? 'error' : 'idle',
+                `Cleanup complete: ${deleted} deleted, ${skipped} skipped, ${failed.length} failed`);
+            return { deleted, skipped, failed };
+        });
     }
 
     /**
@@ -3076,6 +3198,7 @@ export class SyncEngine {
     ): Promise<{ deleted: number; failed: Array<{ path: string; error: unknown }> }> {
         await this.ignoreParser.load();
         await this.refreshProjectFileTree();
+        const ignoredRoots = new Set(this.getIgnoredRemoteRoots().map(entry => entry.path));
 
         let deleted = 0;
         const failed: Array<{ path: string; error: unknown }> = [];
@@ -3083,14 +3206,13 @@ export class SyncEngine {
 
         for (const path of paths) {
             const entry = this.fileTreeByPath.get(path);
-            if (!entry || entry.type === 'folder' || !this.ignoreParser.shouldIgnore(path)) {
+            if (!entry || !ignoredRoots.has(path)) {
                 continue;
             }
 
             try {
                 await this.deleteRemoteEntry(entry, true);
-                this.deleteBaseContent(path);
-                this.fileCache.delete(path);
+                this.removeTrackedSubtree(path);
                 this.log(`Deleted ignored file from Overleaf: ${path}`);
                 deleted++;
             } catch (error) {
@@ -3185,7 +3307,7 @@ export class SyncEngine {
         // mutations execute exactly once.
         if (this.activePull) return this.activePull;
 
-        const operation = this.runWorkspaceExclusive(() => this.performPullAll());
+        const operation = this.runWorkspaceExclusive(() => this.pullWithRecovery());
         this.activePull = operation;
         void operation.then(
             () => {
@@ -3196,6 +3318,54 @@ export class SyncEngine {
             },
         );
         return operation;
+    }
+
+    private scheduleAutomaticRecovery(): void {
+        if (this.disposed || !this.project || this.activePull || this.automaticRecoveryScheduled) return;
+        this.automaticRecoveryScheduled = true;
+        this.scheduleOperation(async () => {
+            try {
+                await this.pullAll();
+                await this.joinAllDocsForWatching();
+            } finally {
+                this.automaticRecoveryScheduled = false;
+            }
+        });
+    }
+
+    /** Retry reads with fresh server metadata, retaining all local baselines. */
+    private async pullWithRecovery(): Promise<void> {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                if (this.socket?.isConnected === false) {
+                    this.setStatus('connecting', 'Reconnecting automatically...');
+                    this.remoteEventGeneration = (this.remoteEventGeneration ?? 0) + 1;
+                    const project = await this.socket.reconnect();
+                    this.throwIfDisposed();
+                    this.buildFileTree(project);
+                    this.project = project;
+                    this.joinedDocs.clear();
+                    this.documentSnapshots.clear();
+                    this.retainedSnapshotBytes = 0;
+                    this.log('Reconnected; resuming synchronization with the current project tree');
+                }
+                await this.performPullAll();
+                if (this.socket?.isConnected === false) {
+                    throw new Error('Real-time connection was lost during the pull.');
+                }
+                return;
+            } catch (error) {
+                this.throwIfDisposed();
+                if (isAuthError(error) || this.socket?.isConnected !== false || attempt === 2) {
+                    const authError = isAuthError(error);
+                    this.setStatus('error', authError ? 'Session expired' : `Pull failed: ${errorMessage(error)}`, undefined, authError);
+                    throw error;
+                }
+                this.log(`Connection interrupted; retrying synchronization automatically (${attempt + 1}/2): ${errorMessage(error)}`);
+                this.setStatus('connecting', 'Connection interrupted; resuming automatically...');
+                if (!(await this.waitForRetry(1000 * (attempt + 1)))) this.throwIfDisposed();
+            }
+        }
     }
 
     private async performPullAll(): Promise<void> {
@@ -3448,6 +3618,12 @@ export class SyncEngine {
         ];
         const lower = filename.toLowerCase();
         return textExtensions.some(ext => lower.endsWith(ext) || lower === ext.slice(1));
+    }
+
+    private requiresFileUpload(content: Uint8Array): boolean {
+        // The server's limit counts UTF-16 characters, not UTF-8 bytes.
+        return content.byteLength >= MAX_EDITABLE_DOCUMENT_CHARACTERS
+            && new TextDecoder().decode(content).length >= MAX_EDITABLE_DOCUMENT_CHARACTERS;
     }
 
     /**

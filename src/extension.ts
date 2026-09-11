@@ -296,7 +296,7 @@ export async function activate(context: vscode.ExtensionContext) {
         credentialManager,
         async command => {
             if (command === COMMANDS.CLEAN_IGNORED_REMOTE) {
-                await cmdCleanIgnoredRemoteFiles(panelConfirmation);
+                await cmdCleanIgnoredRemoteFiles();
             } else if (command === COMMANDS.UNLINK_FOLDER) {
                 await cmdUnlinkFolder(panelConfirmation);
             }
@@ -1288,17 +1288,6 @@ async function cmdUnlinkFolder(confirmation?: object) {
  * Sync now (bidirectional)
  */
 async function cmdSyncNow() {
-    if (!syncEngine) {
-        const manager = SettingsManager.getCurrentInstance();
-        if (manager && await manager.isLinked()) {
-            if (!manager.getSettings()) await manager.load();
-            await initializeSync(extensionContext, manager);
-            return;
-        }
-        void vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
-        return;
-    }
-
     // For now, just pull
     await cmdPullFromOverleaf();
 }
@@ -1307,22 +1296,26 @@ async function cmdSyncNow() {
  * Pull from Overleaf
  */
 async function cmdPullFromOverleaf() {
-    if (!syncEngine) {
-        await cmdSyncNow();
+    if (!syncEngine || syncEngine.needsInitialization) {
+        await cmdReconnect(extensionContext);
         return;
     }
 
+    const engine = syncEngine;
     try {
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: 'LocalLeaf: Pulling from Overleaf...',
             cancellable: false,
         }, async () => {
-            await syncEngine!.pullAll();
-            await syncEngine!.joinAllDocsForWatching();
+            await engine.pullAll();
+            if (deactivating || syncEngine !== engine) return;
+            await engine.joinAllDocsForWatching();
         });
+        if (deactivating || syncEngine !== engine) return;
         void vscode.window.showInformationMessage('LocalLeaf: Pull complete');
     } catch (error) {
+        if (deactivating || syncEngine !== engine) return;
         void vscode.window.showErrorMessage(`LocalLeaf: Pull failed - ${error}`);
     }
 }
@@ -1497,42 +1490,45 @@ async function cmdEditIgnorePatterns() {
 }
 
 /**
- * Remove stale remote files only after they match the current .leafignore
- * rules and the user explicitly confirms the operation.
+ * Preview ignored and remote-only entries before deleting the selected targets.
  */
-async function cmdCleanIgnoredRemoteFiles(confirmation?: object) {
+async function cmdCleanIgnoredRemoteFiles() {
     if (!syncEngine) {
         void vscode.window.showWarningMessage('LocalLeaf: Not connected. Please link a folder first.');
         return;
     }
 
+    const engine = syncEngine;
     try {
-        const paths = await syncEngine.getIgnoredRemoteFiles();
-        if (paths.length === 0) {
-            void vscode.window.showInformationMessage('LocalLeaf: No ignored files exist on Overleaf.');
+        const candidates = await engine.getRemoteCleanupCandidates();
+        if (syncEngine !== engine || deactivating) return;
+        if (candidates.length === 0) {
+            void vscode.window.showInformationMessage('LocalLeaf: No ignored or remote-only entries exist on Overleaf.');
             return;
         }
 
-        const visiblePaths = paths.slice(0, 12);
-        const remaining = paths.length - visiblePaths.length;
-        const preview = visiblePaths.join('\n') +
-            (remaining > 0 ? `\n... and ${remaining} more` : '');
-        if (confirmation !== panelConfirmation) {
-            const choice = await vscode.window.showWarningMessage(
-                `Delete ${paths.length} ignored file(s) from Overleaf?\n\n${preview}`,
-                { modal: true },
-                'Delete Ignored Files'
-            );
-            if (choice !== 'Delete Ignored Files') {
-                return;
-            }
-        }
+        const selected = await vscode.window.showQuickPick(candidates.map(candidate => ({
+            label: candidate.path,
+            description: candidate.reason === 'ignored'
+                ? (candidate.type === 'folder' ? 'Ignored folder and its contents' : 'Ignored by .leafignore')
+                : 'Exists only on Overleaf',
+            picked: candidate.reason === 'ignored',
+            candidate,
+        })), {
+            title: 'Delete selected files and folders from Overleaf',
+            placeHolder: 'Select entries to delete, then press Enter. Local files are kept.',
+            canPickMany: true,
+            matchOnDescription: true,
+            ignoreFocusOut: true,
+        });
+        if (!selected?.length || syncEngine !== engine || deactivating) return;
 
         const result = await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
-            title: 'LocalLeaf: Cleaning ignored files from Overleaf...',
+            title: 'LocalLeaf: Cleaning selected entries from Overleaf...',
             cancellable: false,
-        }, () => syncEngine!.deleteIgnoredRemoteFiles(paths));
+        }, () => engine.deleteRemoteCleanupCandidates(selected.map(item => item.candidate)));
+        if (syncEngine !== engine || deactivating) return;
 
         if (result.failed.length > 0) {
             const failedPreview = result.failed
@@ -1540,15 +1536,17 @@ async function cmdCleanIgnoredRemoteFiles(confirmation?: object) {
                 .map(item => item.path)
                 .join(', ');
             void vscode.window.showWarningMessage(
-                `LocalLeaf: Deleted ${result.deleted} ignored file(s); ` +
+                `LocalLeaf: Deleted ${result.deleted} selected entry/entries; ` +
                 `${result.failed.length} failed: ${failedPreview}`
             );
         } else {
             void vscode.window.showInformationMessage(
-                `LocalLeaf: Deleted ${result.deleted} ignored file(s) from Overleaf.`
+                `LocalLeaf: Deleted ${result.deleted} selected entry/entries from Overleaf.`
+                + (result.skipped ? ` ${result.skipped} skipped because they changed after the preview.` : '')
             );
         }
     } catch (error) {
+        if (syncEngine !== engine || deactivating) return;
         void vscode.window.showErrorMessage(`LocalLeaf: Cleanup failed - ${errorMessage(error)}`);
     }
 }

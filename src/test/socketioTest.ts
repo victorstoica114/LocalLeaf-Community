@@ -98,6 +98,8 @@ export async function runSocketIOProtocolTests(): Promise<void> {
                 onDisconnected?: (isAuthError?: boolean) => void;
             }): void;
             joinProject(): Promise<ProjectEntity>;
+            reconnect(): Promise<ProjectEntity>;
+            joinDoc(id: string): Promise<unknown>;
             disconnect(): void;
         };
     };
@@ -142,7 +144,7 @@ export async function runSocketIOProtocolTests(): Promise<void> {
     let fileEvents = 0;
     let negotiationDisconnects = 0;
     const queryApi = new FakeApi((socket, attempt, query) => {
-        if (attempt === 0) {
+        if (attempt % 2 === 0) {
             assert.equal(query, undefined);
             socket.trigger('connect');
             socket.trigger('connectionRejected', { message: 'project query required' });
@@ -179,7 +181,20 @@ export async function runSocketIOProtocolTests(): Promise<void> {
         0,
         'an initial protocol rejection must not flash a disconnected state before fallback succeeds',
     );
+    const pendingRead = querySocket.joinDoc('doc-id');
+    const cancelledRead = assert.rejects(pendingRead, /Socket disconnected/,
+        'transport loss must cancel a large read immediately, without waiting two minutes');
+    queryApi.sockets[1].trigger('disconnect');
+    await cancelledRead;
+    const recovering = querySocket.reconnect();
+    assert.equal(querySocket.reconnect(), recovering, 'concurrent recovery requests must share one negotiation');
+    assert.equal(await recovering, project);
+    assert.equal(queryApi.sockets.length, 4);
+    assert.equal(fileEvents, 2, 'existing event handlers must remain attached after automatic recovery');
+    assert.equal(negotiationDisconnects, 1, 'recovery negotiation must not trigger additional recovery loops');
     querySocket.disconnect();
+    await assert.rejects(querySocket.reconnect(), /disposed/);
+    assert.equal(queryApi.sockets.length, 4, 'a disposed workspace must not open another socket');
 
     for (const authMessage of ['not logged in', 'Not authenticated', 'invalid session', '401 Unauthorized']) {
         const authApi = new FakeApi((socket, _attempt, query) => {

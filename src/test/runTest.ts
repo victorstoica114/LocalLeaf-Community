@@ -1063,6 +1063,22 @@ async function run(): Promise<void> {
     );
     boundaryClient.disconnect();
 
+    const slowDocumentSocket = new FakeSocket((event, args) => {
+        if (event !== 'joinDoc') return;
+        const callback = args.at(-1) as (...values: unknown[]) => void;
+        setTimeout(() => callback(null, ['loaded from storage'], 4), 10);
+    });
+    const slowDocumentClient = new SocketIOAPI({
+        initSocket: () => slowDocumentSocket,
+    }, { cookies: 'cookie', csrfToken: 'csrf' }, 'project');
+    (slowDocumentClient as any).socketEventTimeoutMs = 1;
+    (slowDocumentClient as any).documentReadTimeoutMs = 1000;
+    assert.deepStrictEqual(await slowDocumentClient.joinDoc('doc-id'), {
+        lines: ['loaded from storage'], version: 4,
+    }, 'document reads must survive a response slower than the generic event acknowledgement deadline');
+    assert.equal(slowDocumentSocket.disconnectCount, 0, 'a successful slow document read must keep the socket alive');
+    slowDocumentClient.disconnect();
+
     const stalledSocket = new FakeSocket();
     const stalledClient = new SocketIOAPI({
         initSocket: () => stalledSocket,
@@ -1072,7 +1088,7 @@ async function run(): Promise<void> {
         onDisconnected: () => { timeoutDisconnectNotifications++; },
     });
     (stalledClient as any)._connected = true;
-    (stalledClient as any).socketEventTimeoutMs = 1;
+    (stalledClient as any).documentReadTimeoutMs = 1;
     await assert.rejects(
         () => stalledClient.joinDoc('doc-id'),
         /Socket event "joinDoc" timed out/,
@@ -1089,7 +1105,7 @@ async function run(): Promise<void> {
         initSocket: () => overloadedSocket,
     }, { cookies: 'cookie', csrfToken: 'csrf' }, 'project');
     (overloadedClient as any)._connected = true;
-    (overloadedClient as any).socketEventTimeoutMs = 5;
+    (overloadedClient as any).documentReadTimeoutMs = 5;
     (overloadedClient as any).maxPendingSocketEvents = 1;
     const firstPendingEvent = overloadedClient.joinDoc('first-doc');
     await assert.rejects(
@@ -1099,7 +1115,7 @@ async function run(): Promise<void> {
     );
     assert.equal(overloadedSocket.disconnectCount, 1,
         'exceeding the pending ACK limit must close the stalled transport');
-    await assert.rejects(() => firstPendingEvent, /timed out/);
+    await assert.rejects(() => firstPendingEvent, /disposed/);
     assert.equal((overloadedClient as any).pendingSocketEventCount, 0);
 
     const forcedSocket = new FakeSocket();
@@ -1184,12 +1200,8 @@ async function run(): Promise<void> {
         type: string;
         file?: { _id: string; _type: string; name: string };
     };
-    assert.equal(upload.type, 'success');
-    assert.deepStrictEqual(upload.file, {
-        _id: 'binary-id-1',
-        _type: 'file',
-        name: 'figure.pdf',
-    });
+    assert.equal(upload.type, 'error', 'an invalid upload type must not be relabeled as a file');
+    assert.equal(upload.file, undefined);
     fetchResponse = {
         ok: true,
         status: 200,
@@ -3235,6 +3247,10 @@ async function run(): Promise<void> {
     ]);
     cleanup.baseContent = new Map();
     cleanup.fileCache = new Map();
+    cleanup.joinedDocs = new Set();
+    cleanup.documentSnapshots = new Map();
+    cleanup.pendingLocalCreates = new Set();
+    cleanup.suppressedRemoteDocumentUpdates = new Map();
     cleanup.ignoreParser = {
         load: async () => undefined,
         shouldIgnore: (candidate: string) =>
@@ -3251,10 +3267,10 @@ async function run(): Promise<void> {
     };
 
     const ignoredRemote = await cleanup.getIgnoredRemoteFiles();
-    assert.deepStrictEqual(ignoredRemote, ['/thesis.aux']);
+    assert.deepStrictEqual(ignoredRemote, ['/build/', '/thesis.aux']);
     const cleanupResult = await cleanup.deleteIgnoredRemoteFiles(ignoredRemote);
-    assert.deepStrictEqual(cleanupResult, { deleted: 1, failed: [] });
-    assert.deepStrictEqual(deleted, ['/thesis.aux']);
+    assert.deepStrictEqual(cleanupResult, { deleted: 2, failed: [] });
+    assert.deepStrictEqual(deleted, ['/build/', '/thesis.aux']);
     assert.equal(cleanup.fileTreeByPath.has('/thesis.tex'), true);
 
     const selfHostedRefresh = createTestSyncEngine() as any;
@@ -4317,6 +4333,10 @@ async function run(): Promise<void> {
     assert.doesNotMatch(socketPatchSource, /\+.*module\.parent\.exports/);
     assert.match(socketPatchSource, /\+\s*io\.Transport\.websocket\s*=\s*require/);
     verifyBundledSocketClientCompatibility();
+    const { runSocketTransportTests } = require('./socketTransportTest') as {
+        runSocketTransportTests(): Promise<void>;
+    };
+    await runSocketTransportTests();
     const { runBrowserCookieLoginTests } = require(path.join(__dirname, 'browserCookieLoginTest.js')) as {
         runBrowserCookieLoginTests(): Promise<void>;
     };
@@ -4325,6 +4345,10 @@ async function run(): Promise<void> {
         runSocketIOProtocolTests(): Promise<void>;
     };
     await runSocketIOProtocolTests();
+    const { runSyncRecoveryTests } = require('./syncRecoveryTest') as {
+        runSyncRecoveryTests(): Promise<void>;
+    };
+    await runSyncRecoveryTests();
 
     Module._load = originalLoad;
     console.log('LocalLeaf synchronization and UI contract regression tests passed.');

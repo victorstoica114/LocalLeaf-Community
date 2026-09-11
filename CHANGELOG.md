@@ -2,6 +2,51 @@
 
 All notable changes to LocalLeaf Community will be documented in this file.
 
+## [0.2.9] - 2026-09-11
+
+### Fixed
+
+- Allow 30 seconds for connection establishment and two minutes for project metadata instead of aborting both after five seconds
+- Retry temporary initial connection failures automatically, with bounded attempts and cancellation when the workspace closes
+- Abort pending HTTP handshakes and transport timers when a connection is discarded, preventing abandoned requests from opening sockets later
+- Report HTTP handshake status and connection stages instead of hiding transport failures behind generic timeouts
+- Avoid repeating the complete real-time error inside the HTTP fallback explanation
+
+[0.2.9]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.4...v0.2.9
+
+## [0.2.8] - 2026-09-10
+
+### Fixed
+
+- Apply ignored directory patterns such as `/analysis/` to all descendants, including direct file events and bulk synchronization
+- Include fully ignored folders in remote cleanup while preserving explicitly included descendants and the main document
+- Preview ignored and remote-only entries in Clean Remote Files, then delete only selected identities that still qualify, preserving local content
+
+## [0.2.7] - 2026-09-10
+
+### Fixed
+
+- Truncate long sidebar status messages and file paths with an ellipsis, keeping the full text available on hover
+
+## [0.2.6] - 2026-09-10
+
+### Fixed
+
+- Upload large text files through the file upload endpoint instead of sending updates above Overleaf's default editable-document limit (2 Mi characters)
+- Convert existing oversized documents using a verified replacement and rollback copy, preserving local content, conflict decisions, and the compilation root
+- Respect the document or file storage type returned by Overleaf's upload endpoint
+
+## [0.2.5] - 2026-09-10
+
+### Fixed
+
+- Reconnect lost real-time sessions when using Sync Now, Retry sync, or Pull from Overleaf, even after an error replaces the disconnected status
+- Allow up to two minutes for large document reads without extending the deadline for ordinary Socket.IO acknowledgements
+- Automatically reconnect and resume interrupted pulls, with two retries and a refreshed project tree while retaining local changes and conflict baselines
+- Recover idle real-time disconnections automatically and discard queued events from the previous connection
+- Explain connection loss when a server supplies its project tree only through Socket.IO
+- Keep an interrupted pull from subscribing documents or reporting completion after a workspace switch
+
 ## [0.2.4] - 2026-09-07
 
 ### Added

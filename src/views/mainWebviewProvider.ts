@@ -286,7 +286,7 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
         .notice { display: flex; align-items: flex-start; gap: 7px; margin-top: 8px; padding: 7px 8px; border: 1px solid var(--vscode-panel-border); border-left: 3px solid var(--vscode-editorInfo-foreground); border-radius: 5px; background: var(--vscode-editorWidget-background, transparent); }
         .notice.warning { border-left-color: var(--vscode-editorWarning-foreground); }
         .notice.error { border-left-color: var(--vscode-editorError-foreground); }
-        .notice-copy { min-width: 0; flex: 1; line-height: 1.35; font-size: 11px; }
+        .notice-copy { min-width: 0; flex: 1; line-height: 1.35; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .notice-action { flex: 0 0 auto; border: 0; border-radius: 4px; padding: 3px 6px; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); cursor: pointer; }
         .notice-action:hover { background: var(--vscode-button-secondaryHoverBackground); }
         .tabs { display: flex; border-bottom: 1px solid var(--vscode-panel-border); }
@@ -345,7 +345,7 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
             { icon: '↓', label: 'Pull from Overleaf', copy: 'Refresh all project files', command: '${COMMANDS.PULL_FROM_OVERLEAF}' },
             { icon: '≡', label: 'Edit ignore patterns', copy: 'Open .leafignore', command: '${COMMANDS.EDIT_IGNORE_PATTERNS}' },
             { icon: '%', label: 'Remove standalone comments', copy: 'Preview and remove full-line LaTeX comments', command: '${COMMANDS.REMOVE_COMMENTS}' },
-            { icon: '⌫', label: 'Clean ignored remote files', copy: 'Remove ignored artifacts from Overleaf', command: '${COMMANDS.CLEAN_IGNORED_REMOTE}', confirm: 'Delete every remote file currently matched by .leafignore?' },
+            { icon: '⌫', label: 'Clean remote files', copy: 'Choose ignored or remote-only entries to delete', command: '${COMMANDS.CLEAN_IGNORED_REMOTE}' },
             { icon: 'T', label: 'Set main document', copy: 'Choose the primary .tex document', command: '${COMMANDS.SET_MAIN_DOCUMENT}' },
             { icon: '⚙', label: 'Project settings', copy: 'Open LocalLeaf settings', command: '${COMMANDS.CONFIGURE}' },
             { icon: '●', label: 'Account', copy: 'Manage the Overleaf session', command: '${COMMANDS.SHOW_ACCOUNT_PANEL}' },
@@ -384,12 +384,16 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
             refresh.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
             const dot = element('span', 'status-dot');
             dot.setAttribute('aria-hidden', 'true');
-            status.append(dot, element('span', 'status-copy', state.statusText), refresh);
+            const statusCopy = element('span', 'status-copy', state.statusText);
+            statusCopy.title = state.statusText;
+            status.append(dot, statusCopy, refresh);
 
             const notice = state.notice ? element('div', 'notice ' + state.notice.kind) : null;
             if (notice) {
                 notice.setAttribute('role', state.notice.kind === 'error' ? 'alert' : 'status');
-                notice.append(element('span', 'notice-copy', state.notice.message));
+                const noticeCopy = element('span', 'notice-copy', state.notice.message);
+                noticeCopy.title = state.notice.message;
+                notice.append(noticeCopy);
                 if (state.notice.actionLabel && state.notice.actionCommand) {
                     const action = element('button', 'notice-action', state.notice.actionLabel);
                     action.type = 'button';

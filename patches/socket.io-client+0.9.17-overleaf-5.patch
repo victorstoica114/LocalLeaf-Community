@@ -16,10 +16,16 @@ index 0820a52..e1885fb 100644
    // In the optional fourth stage, we recursively walk the new structure, passing
    // each name/value pair to a reviver function for possible transformation.
 diff --git a/node_modules/socket.io-client/lib/socket.js b/node_modules/socket.io-client/lib/socket.js
-index 07c1c3f..862ebcd 100644
+index 07c1c3f..dd8c6b7 100644
 --- a/node_modules/socket.io-client/lib/socket.js
 +++ b/node_modules/socket.io-client/lib/socket.js
-@@ -152,11 +152,27 @@
+@@ -147,22 +147,51 @@
+       });
+     } else {
+       var xhr = io.util.request();
++      self.handshakeRequest = xhr;
+ 
+       xhr.open('GET', url, true);
        if (this.isXDomain()) {
          xhr.withCredentials = true;
        }
@@ -32,22 +38,44 @@ index 07c1c3f..862ebcd 100644
        xhr.onreadystatechange = function () {
          if (xhr.readyState == 4) {
            xhr.onreadystatechange = empty;
++          if (self.handshakeRequest !== xhr) return;
++          self.handshakeRequest = null;
  
            if (xhr.status == 200) {
++            // Do not treat a proxy/login HTML page as a Socket.IO session.
++            if (!/^[A-Za-z0-9_-]{1,256}:\d+(?:\.\d+)?:\d+(?:\.\d+)?:[a-z,-]+$/i.test(xhr.responseText)) {
++              self.connecting = false;
++              self.onError(new Error('Invalid Socket.IO HTTP handshake response'));
++              return;
++            }
 +            // extract set-cookie headers
 +            const matches = xhr.getAllResponseHeaders().match(/set-cookie:\s*([^\r\n]+)/gi);
 +            matches && matches.forEach(function (header) {
 +              const newCookie = header.split(':')[1].split(';')[0].trim();
-+              const optCookie = self.options['extraHeaders']['Cookie'];
++              const optCookie = self.options['extraHeaders'] && self.options['extraHeaders']['Cookie'];
 +              const mergedCookie = optCookie ? `${optCookie}; ${newCookie}` : newCookie;
 +              self.options['extraHeaders'] = self.options['extraHeaders'] || {};
 +              self.options['extraHeaders']['Cookie'] = mergedCookie;
 +            });
 +
              complete(xhr.responseText);
-           } else if (xhr.status == 403) {
-             self.onError(xhr.responseText);
-@@ -229,7 +245,7 @@
+-          } else if (xhr.status == 403) {
+-            self.onError(xhr.responseText);
+           } else {
+-            self.connecting = false;            
+-            !self.reconnecting && self.onError(xhr.responseText);
++            self.connecting = false;
++            // The body can contain HTML, credentials or unbounded proxy output.
++            // Preserve the status/code, never the response body or request URL.
++            var code = xhr.statusText && xhr.statusText.code;
++            var detail = xhr.status
++              ? 'HTTP ' + xhr.status
++              : 'network error' + (typeof code === 'string' && /^[A-Z0-9_]+$/.test(code) ? ' (' + code + ')' : '');
++            self.onError(new Error('Socket.IO HTTP handshake failed: ' + detail));
+           }
+         }
+       };
+@@ -229,7 +258,7 @@
          self.transport.ready(self, function () {
            self.connecting = true;
            self.publish('connecting', self.transport.name);
@@ -56,7 +84,22 @@ index 07c1c3f..862ebcd 100644
  
            if (self.options['connect timeout']) {
              self.connectTimeoutTimer = setTimeout(function () {
-@@ -369,6 +385,12 @@
+@@ -338,6 +367,14 @@
+    */
+ 
+   Socket.prototype.disconnect = function () {
++    if (this.handshakeRequest) {
++      var xhr = this.handshakeRequest;
++      this.handshakeRequest = null;
++      xhr.onreadystatechange = empty;
++      xhr.abort();
++    }
++    clearTimeout(this.connectTimeoutTimer);
++    clearTimeout(this.heartbeatTimeoutTimer);
+     if (this.connected || this.connecting) {
+       if (this.open) {
+         this.of('').packet({ type: 'disconnect' });
+@@ -369,6 +406,12 @@
      ].join('/') + '/?disconnect=1';
  
      xhr.open('GET', uri, false);
@@ -69,12 +112,11 @@ index 07c1c3f..862ebcd 100644
      xhr.send(null);
  
      // handle disconnection immediately
-@@ -476,5 +498,14 @@
-     this.connected = false;
+@@ -477,6 +520,16 @@
      this.connecting = false;
      this.open = false;
--
-+
+ 
++    clearTimeout(this.connectTimeoutTimer);
 +    // ACK callbacks and queued packets belong to the disconnected transport.
 +    // Retaining them indefinitely leaks callbacks and potentially sensitive data.
 +    for (var endpoint in this.namespaces) {
@@ -85,9 +127,16 @@ index 07c1c3f..862ebcd 100644
 +    this.buffer = [];
 +
      if (wasConnected || wasConnecting) {
-@@ -579 +610 @@
+       this.onClose()
+       if (this.transport) this.transport.close();
+@@ -576,6 +629,6 @@
+ 
+ })(
+     'undefined' != typeof io ? io : module.exports
 -  , 'undefined' != typeof io ? io : module.parent.exports
 +  , 'undefined' != typeof io ? io : require('./io')
+   , this
+ );
 diff --git a/node_modules/socket.io-client/lib/transports/websocket.js b/node_modules/socket.io-client/lib/transports/websocket.js
 index 0dfa483..eab07d3 100644
 --- a/node_modules/socket.io-client/lib/transports/websocket.js
