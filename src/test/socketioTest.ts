@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as path from 'path';
 import type { BaseAPI, FileEntity, ProjectEntity } from '../api/base';
 import type { Identity } from '../utils/credentialManager';
+import type { SocketEventHandlers } from '../api/socketio';
 
 type Listener = (...args: unknown[]) => void;
 type EmitCallback = (error?: unknown, ...data: unknown[]) => void;
@@ -140,6 +141,38 @@ export async function runSocketIOProtocolTests(): Promise<void> {
     assert.equal(authClassifier.isAuthRelatedMessage('failure in authentication-notes.tex'), false);
     assert.equal(authClassifier.isAuthRelatedMessage('Connection rejected: Not authenticated'), true);
     legacySocket.disconnect();
+
+    const rootEvents: Array<{ parentId: string; type: string; name: string }> = [];
+    const moves: string[] = [];
+    const rootApi = new FakeApi(socket => {
+        socket.onEmit = (event, _args, callback) => {
+            if (event === 'joinProject') callback?.(undefined, project);
+        };
+        socket.trigger('connect');
+    });
+    const rootSocket = new SocketIOAPI(rootApi as unknown as BaseAPI, identity, project._id);
+    rootSocket.registerHandlers({
+        onFileCreated: (parentId, type, entity) => rootEvents.push({ parentId, type, name: entity.name }),
+        onFileMoved: (_id: string, parentId: string) => moves.push(parentId),
+    } as SocketEventHandlers);
+    await rootSocket.joinProject();
+    rootApi.sockets[0].trigger('reciveNewFile', null, { _id: 'restored-pdf', name: 'main-old.pdf' });
+    rootApi.sockets[0].trigger('reciveNewDoc', undefined, { _id: 'restored-doc', name: 'old.tex' });
+    rootApi.sockets[0].trigger('reciveNewFolder', null, { _id: 'restored-folder', name: 'restored' });
+    rootApi.sockets[0].trigger('reciveEntityMove', 'restored-pdf', null);
+    assert.deepStrictEqual(rootEvents, [
+        { parentId: 'root-folder-id', type: 'file', name: 'main-old.pdf' },
+        { parentId: 'root-folder-id', type: 'doc', name: 'old.tex' },
+        { parentId: 'root-folder-id', type: 'folder', name: 'restored' },
+    ], 'a missing parent in Overleaf events denotes the joined project root');
+    assert.deepStrictEqual(moves, ['root-folder-id']);
+    for (const malformedParent of ['', 0, false, {}, []]) {
+        rootApi.sockets[0].trigger('reciveNewFile', malformedParent, { _id: 'unsafe', name: 'unsafe.pdf' });
+        rootApi.sockets[0].trigger('reciveEntityMove', 'restored-pdf', malformedParent);
+    }
+    assert.equal(rootEvents.length, 3, 'invalid parent values must not be silently redirected to the root');
+    assert.equal(moves.length, 1);
+    rootSocket.disconnect();
 
     let fileEvents = 0;
     let negotiationDisconnects = 0;

@@ -1261,12 +1261,39 @@ export class SyncEngine {
         }
 
         const content = await this.getRemoteEntryContent(entry);
-
-        const resolution = await this.askNewRemoteFileResolution(entry.path, content);
+        const diskContent = await this.readLocalFileIfExists(localUri);
+        const openDocument = this.getOpenTextDocument(localUri);
+        const openVersion = openDocument?.version;
+        const localContent = openDocument ? this.getOpenDocumentContent(openDocument) : diskContent;
+        if (localContent !== undefined && !contentEquals(localContent, content)) {
+            this.setStatus('pulling', `Waiting for your choice in VS Code notifications: ${entry.path}`, entry.path);
+            const choice = await vscode.window.showWarningMessage(
+                `The new Overleaf file "${entry.path}" differs from your local copy.`,
+                'Replace Local',
+                'Keep Local',
+            );
+            this.throwIfDisposed();
+            if (choice !== 'Replace Local') return 'skipped';
+        }
         this.throwIfDisposed();
-        if (resolution === 'skip') return 'skipped';
 
-        await vscode.workspace.fs.writeFile(localUri, content);
+        // Downloads and conflict choices can take time. Never overwrite a file
+        // or editor that appeared/changed while waiting for either operation.
+        const currentDocument = this.getOpenTextDocument(localUri);
+        const currentDiskContent = await this.readLocalFileIfExists(localUri);
+        this.throwIfDisposed();
+        if (!contentEquals(diskContent, currentDiskContent)
+            || currentDocument !== openDocument || currentDocument?.version !== openVersion) {
+            this.log(`Kept newer local changes while receiving ${entry.path}`);
+            return 'skipped';
+        }
+        if (currentDocument?.isDirty) {
+            const result = await this.applyRemoteContentToOpenDocument(currentDocument, openVersion!, content);
+            this.throwIfDisposed();
+            if (result !== 'applied') return 'skipped';
+        } else if (!contentEquals(diskContent, content)) {
+            await vscode.workspace.fs.writeFile(localUri, content);
+        }
         this.recordSynchronizedContent(entry, content);
         this.log(`Downloaded from Overleaf: ${entry.path}`);
         return 'downloaded';
@@ -2518,12 +2545,6 @@ export class SyncEngine {
                 }
             }
 
-            // A skipped initial download must not become an unsolicited write
-            // merely because the subscribed document changed later.
-            if (localBytes === undefined && baseBytes === undefined) {
-                if (await this.askNewRemoteFileResolution(entry.path, contentBytes) === 'skip') return;
-            }
-
             // Recheck the same editor or disk revision shown in the conflict prompt.
             let currentBytes: Uint8Array | undefined;
             try {
@@ -2811,47 +2832,6 @@ export class SyncEngine {
                 return 'useRemote';
             case 'Keep Local':
                 return 'useLocal';
-            default:
-                return 'skip';
-        }
-    }
-
-    /**
-     * Ask user how to handle a new file from Overleaf that doesn't exist locally
-     */
-    private async askNewRemoteFileResolution(filePath: string, remoteContent: Uint8Array): Promise<'useRemote' | 'skip'> {
-        if (this.applyToAll && this.conflictResolution !== 'ask') {
-            return this.conflictResolution === 'useRemote' ? 'useRemote' : 'skip';
-        }
-
-        const sizeStr = remoteContent.length < 1024
-            ? `${remoteContent.length} bytes`
-            : `${(remoteContent.length / 1024).toFixed(1)} KB`;
-
-        this.setStatus(
-            'pulling',
-            `Waiting for your choice in VS Code notifications: ${filePath}`,
-            filePath,
-        );
-        const choice = await vscode.window.showInformationMessage(
-            `New file on Overleaf: "${filePath}" (${sizeStr})`,
-            'Download',
-            'Skip',
-            'Download All New',
-            'Skip All New'
-        );
-
-        switch (choice) {
-            case 'Download':
-                return 'useRemote';
-            case 'Download All New':
-                this.conflictResolution = 'useRemote';
-                this.applyToAll = true;
-                return 'useRemote';
-            case 'Skip All New':
-                this.conflictResolution = 'skip';
-                this.applyToAll = true;
-                return 'skip';
             default:
                 return 'skip';
         }
@@ -3418,15 +3398,12 @@ export class SyncEngine {
                 const localUri = this.settings.getFilePath(entry.path);
                 await this.assertNoSymbolicLinks(localUri);
                 const diskContent = await this.readLocalFileIfExists(localUri);
-                const openDocument = entry.type === 'doc'
-                    ? this.getOpenTextDocument(localUri)
-                    : undefined;
+                const openDocument = this.getOpenTextDocument(localUri);
                 const openDocumentVersion = openDocument?.version;
                 const localContent = openDocument
                     ? this.getOpenDocumentContent(openDocument)
                     : diskContent;
                 const hasLocalContent = localContent !== undefined;
-                const wasSynced = this.baseContent.has(entry.path);
 
                 // Check for conflicts or new remote files
                 if (hasLocalContent) {
@@ -3452,9 +3429,7 @@ export class SyncEngine {
                             // Push local content to Overleaf
                             debugLog('pullAll: Using local, pushing to Overleaf', entry.path);
                             this.setStatus('pushing', `Uploading ${entry.path}`, entry.path);
-                            const latestOpenDocument = entry.type === 'doc'
-                                ? this.getOpenTextDocument(localUri)
-                                : undefined;
+                            const latestOpenDocument = this.getOpenTextDocument(localUri);
                             let latestLocalContent = latestOpenDocument
                                 ? this.getOpenDocumentContent(latestOpenDocument)
                                 : await this.readLocalFileIfExists(localUri);
@@ -3478,18 +3453,6 @@ export class SyncEngine {
                         }
                         // resolution === 'useRemote' - continue to download
                     }
-                } else if (!wasSynced) {
-                    // New file on Overleaf that doesn't exist locally - prompt user
-                    conflictCount++;
-                    const resolution = await this.askNewRemoteFileResolution(entry.path, remoteContent);
-                    this.throwIfDisposed();
-
-                    if (resolution === 'skip') {
-                        debugLog('pullAll: Skipped new remote file (user choice)', entry.path);
-                        skippedCount++;
-                        return;
-                    }
-                    // resolution === 'useRemote' - continue to download
                 }
 
                 // Skip write if content is identical
@@ -3502,9 +3465,7 @@ export class SyncEngine {
                 this.setStatus('pulling', `Downloading ${entry.path}`, entry.path);
                 this.throwIfDisposed();
 
-                const currentOpenDocument = entry.type === 'doc'
-                    ? this.getOpenTextDocument(localUri)
-                    : undefined;
+                const currentOpenDocument = this.getOpenTextDocument(localUri);
                 if (currentOpenDocument) {
                     if (
                         openDocumentVersion === undefined

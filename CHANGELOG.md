@@ -2,6 +2,14 @@
 
 All notable changes to LocalLeaf Community will be documented in this file.
 
+## [0.2.10] - 2026-09-11
+
+### Fixed
+
+- Download new and restored remote files automatically when no local copy exists, including the initial pull
+- Accept Overleaf's null parent-folder marker for root-level creation, restoration, and move events
+- Preserve conflicting local copies and unsaved editors, and recheck local changes before applying an incoming file
+
 ## [0.2.9] - 2026-09-11
 
 ### Fixed

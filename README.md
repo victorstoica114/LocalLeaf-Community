@@ -50,7 +50,7 @@ Contributions are welcome, whether they are code, documentation, bug reports, or
 1. Open the folder that should contain your local project.
 2. Run `LocalLeaf: Login`, choose your server and browser, then finish signing in in the isolated browser window.
 3. Choose a project from the LocalLeaf sidebar and link it to the folder.
-4. Review the first synchronization prompts before choosing which copy to keep.
+4. New remote files download automatically. If local and remote copies differ, choose which copy to keep in the conflict prompt.
 
 > [!WARNING]
 > Your Overleaf cookies grant access to your account. Only send them to the real server you intend to use, check the URL carefully, and treat them like a password. LocalLeaf stores them in VS Code Secret Storage rather than inside the workspace. Use `LocalLeaf: Logout` if you suspect they were exposed.

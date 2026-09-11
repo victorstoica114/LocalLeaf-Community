@@ -336,7 +336,6 @@ async function testPullSubscriptionsAndTree(): Promise<void> {
     http.engine.socket = undefined;
     http.project.rootFolder[0].docs.push({ _id: 'new-doc', name: 'new.tex' });
     http.server.set('new-doc', { text: 'new remote content', version: 1 });
-    http.engine.askNewRemoteFileResolution = async () => 'useRemote';
     await http.engine.pullAll();
     assert.equal(http.refreshCount(), 1, 'F5: HTTP pull must fetch the current tree');
     assert.equal(http.read('/new.tex'), 'new remote content');
@@ -377,7 +376,6 @@ async function testAutomaticPullRecovery(): Promise<void> {
     };
     f.put('/main.tex', 'local draft');
     f.engine.askConflictResolution = async () => 'skip';
-    f.engine.askNewRemoteFileResolution = async () => 'useRemote';
     f.socket.joinDoc = async id => {
         if (++reads === 1) {
             f.engine.enqueueRemoteEvent(async (isCurrent: () => boolean) => {
@@ -800,10 +798,94 @@ async function testBinaryMultipartUpload(): Promise<void> {
     }
 }
 
+async function testRestoredRootFiles(): Promise<void> {
+    const f = fixture();
+    const transport = new (require('node:events').EventEmitter)();
+    transport.disconnect = () => {};
+    transport.on('joinProject', (_request: unknown, callback: (...args: unknown[]) => void) => callback(null, f.project));
+    const socket = new SocketIOAPI({ initSocket: () => transport }, { cookies: 'test', csrfToken: 'test' }, 'project');
+    socket.registerHandlers({
+        onFileCreated: (parentId: string, type: string, entity: unknown) => f.engine.enqueueRemoteEvent(
+            (isCurrent: () => boolean) => f.engine.handleRemoteFileCreated(parentId, type, entity, isCurrent),
+        ),
+        onFileRemoved: (id: string) => f.engine.enqueueRemoteEvent(
+            (isCurrent: () => boolean) => f.engine.handleRemoteFileRemoved(id, isCurrent),
+        ),
+    });
+    const joined = socket.joinProject();
+    transport.emit('connect');
+    await joined;
+    f.engine.socket = socket;
+    let downloads = 0;
+    const pdf = Buffer.from([37, 80, 68, 70, 45, 49, 46, 55, 10, 0, 255, 128]);
+    (f.api as any).getFile = async () => { downloads++; return { type: 'success', content: pdf }; };
+    try {
+        transport.emit('reciveNewFile', null, { _id: 'restored', name: 'main-old.pdf' }, 'restore');
+        await f.engine.remoteEventQueue;
+        assert.deepEqual(disk.get(key(f.settings.getFilePath('/main-old.pdf')))?.content, pdf,
+            'a restored root PDF must download automatically with its binary bytes unchanged');
+        assert.equal(downloads, 1);
+        assert.equal(prompts.length, 0, 'a missing local file must not wait for a Download notification');
+        assert.equal(f.engine.fileTreeByPath.get('/main-old.pdf').parentId, 'root');
+        transport.emit('reciveNewFile', null, { _id: 'restored', name: 'main-old.pdf' });
+        await f.engine.remoteEventQueue;
+        assert.equal(downloads, 1, 'a repeated restoration notification must not download twice');
+
+        transport.emit('removeEntity', 'restored', { kind: 'file-restore' });
+        transport.emit('reciveNewFile', null, { _id: 'restored-again', name: 'main-old.pdf' });
+        await f.engine.remoteEventQueue;
+        assert.equal(f.engine.fileTreeByPath.get('/main-old.pdf').id, 'restored-again');
+        assert.deepEqual(disk.get(key(f.settings.getFilePath('/main-old.pdf')))?.content, pdf);
+        assert.equal(downloads, 2, 'a later restoration with a new identity must not be mistaken for an upload echo');
+
+        await f.engine.ignoreParser.save(['/main.pdf']);
+        transport.emit('reciveNewFile', null, { _id: 'compiled', name: 'main.pdf' });
+        await f.engine.remoteEventQueue;
+        assert.equal(f.read('/main.pdf'), undefined, 'explicit PDF ignore rules still apply to restored files');
+        assert.equal(downloads, 2);
+
+        f.put('/conflicting.pdf', 'unsynchronized local content');
+        transport.emit('reciveNewFile', null, { _id: 'conflict', name: 'conflicting.pdf' });
+        await f.engine.remoteEventQueue;
+        assert.equal(f.read('/conflicting.pdf'), 'unsynchronized local content',
+            'restoring a remote file must preserve an existing local file when the conflict is skipped');
+        assert.ok(prompts.length > 0);
+
+        f.put('/racy.pdf', 'local content before choice');
+        promptChoice = 'Replace Local';
+        promptHandler = () => f.put('/racy.pdf', 'newer content while choosing');
+        transport.emit('reciveNewFile', null, { _id: 'racy', name: 'racy.pdf' });
+        await f.engine.remoteEventQueue;
+        assert.equal(f.read('/racy.pdf'), 'newer content while choosing',
+            'an overwrite choice must not discard edits made after the conflict was shown');
+        promptHandler = undefined;
+        promptChoice = undefined;
+
+        vscode.workspace.textDocuments = [{
+            uri: f.settings.getFilePath('/unsaved.pdf'), isDirty: true, version: 1,
+            getText: () => 'unsaved local editor content',
+        } as any];
+        transport.emit('reciveNewFile', null, { _id: 'unsaved', name: 'unsaved.pdf' });
+        await f.engine.remoteEventQueue;
+        assert.equal(f.read('/unsaved.pdf'), undefined, 'a restored attachment must respect an unsaved text editor at its path');
+    } finally {
+        f.engine.disconnect();
+    }
+
+    const initial = fixture();
+    initial.project.rootFolder[0].fileRefs.push({ _id: 'restored-before-connect', name: 'main-old.pdf' });
+    (initial.api as any).getFile = async () => ({ type: 'success', content: pdf });
+    await initial.engine.pullAll();
+    assert.deepEqual(disk.get(key(initial.settings.getFilePath('/main-old.pdf')))?.content, pdf,
+        'the startup pull must recover a file restored before the current socket connection');
+    assert.ok(!prompts.some(args => String(args[0]).startsWith('New file on Overleaf:')));
+    initial.engine.disconnect();
+}
+
 async function run(): Promise<void> {
     const tests = [testVersionedSnapshots, testAutomaticConflicts, testSafeRemoteDeletion,
         testPullSubscriptionsAndTree, testAutomaticPullRecovery, testLargeTextFiles, testIgnoredFoldersAndRemoteCleanup,
-        testUploadRetryAndTransformation, testAppliedConfirmation, testBinaryMultipartUpload];
+        testUploadRetryAndTransformation, testAppliedConfirmation, testBinaryMultipartUpload, testRestoredRootFiles];
     for (const test of tests) {
         await test();
         console.log(`Passed: ${test.name}`);

@@ -2,7 +2,7 @@
   "name": "localleaf-community",
   "displayName": "LocalLeaf Community",
   "description": "Edit Overleaf projects locally in VS Code with two-way synchronization.",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "publisher": "victorstoica114",
   "repository": {
     "type": "git",

@@ -633,35 +633,45 @@ export class SocketIOAPI {
         }
     }
 
+    private resolveEventParentId(value: unknown): string {
+        // Overleaf's file-tree events use null/undefined for the project root,
+        // including files restored through History. Use only the root from the
+        // joined project; malformed non-null values must still be rejected.
+        const parentId = value === null || value === undefined
+            ? this.projectRecord?.rootFolder?.[0]?._id
+            : value;
+        return validateOverleafId(parentId, 'parent folder ID');
+    }
+
     private attachHandlers(socket: SocketIOClient.Socket, handlers: SocketEventHandlers): void {
         // File events
         if (handlers.onFileCreated) {
             socket.on('reciveNewDoc', (parentValue: unknown, docValue: unknown) => {
                 const doc = parseFileEntityEvent(docValue, 'doc');
                 try {
-                    if (doc) handlers.onFileCreated!(validateOverleafId(parentValue, 'parent folder ID'), 'doc', doc);
+                    if (doc) handlers.onFileCreated!(this.resolveEventParentId(parentValue), 'doc', doc);
                 } catch {
-                    // Ignore malformed filesystem events.
+                    log('Ignored invalid remote document creation event.');
                 }
             });
             socket.on('reciveNewFile', (parentValue: unknown, fileValue: unknown) => {
                 const file = parseFileEntityEvent(fileValue, 'file');
                 try {
-                    if (file) handlers.onFileCreated!(validateOverleafId(parentValue, 'parent folder ID'), 'file', file);
+                    if (file) handlers.onFileCreated!(this.resolveEventParentId(parentValue), 'file', file);
                 } catch {
-                    // Ignore malformed filesystem events.
+                    log('Ignored invalid remote file creation event.');
                 }
             });
             socket.on('reciveNewFolder', (parentValue: unknown, folderValue: unknown) => {
                 const folder = parseFileEntityEvent(folderValue, 'folder');
                 try {
                     if (folder) handlers.onFileCreated!(
-                        validateOverleafId(parentValue, 'parent folder ID'),
+                        this.resolveEventParentId(parentValue),
                         'folder',
                         folder,
                     );
                 } catch {
-                    // Ignore malformed filesystem events.
+                    log('Ignored invalid remote folder creation event.');
                 }
             });
         }
@@ -694,7 +704,7 @@ export class SocketIOAPI {
                 try {
                     handlers.onFileMoved!(
                         validateOverleafId(entityValue, 'entity ID'),
-                        validateOverleafId(folderValue, 'parent folder ID'),
+                        this.resolveEventParentId(folderValue),
                     );
                 } catch {
                     // Ignore malformed filesystem events.
