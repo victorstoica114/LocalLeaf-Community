@@ -10,6 +10,8 @@ All notable changes to LocalLeaf Community will be documented in this file.
 - Accept Overleaf's null parent-folder marker for root-level creation, restoration, and move events
 - Preserve conflicting local copies and unsaved editors, and recheck local changes before applying an incoming file
 
+[0.2.10]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.9...v0.2.10
+
 ## [0.2.9] - 2026-09-11
 
 ### Fixed
