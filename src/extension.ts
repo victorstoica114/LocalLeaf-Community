@@ -35,7 +35,8 @@ import {
 } from './utils/syncAuthorization';
 import { BrowserPreference, captureCookiesViaBrowserLogin } from './auth/browserCookieLogin';
 import { createWindowFocusListener, isSyncInitializationSnapshotCurrent } from './utils/syncInitialization';
-import { validateProjectName } from './utils/projectName';
+import { CreateProjectController } from './views/createProjectController';
+import { consumeCreatedProjectSyncAuthorization } from './utils/createdProjectAuthorization';
 
 /**
  * Auth state type
@@ -74,7 +75,8 @@ let activeBrowserLogin: AbortController | undefined;
 let activeBrowserLoginTask: Promise<unknown> | undefined;
 let accountActionInProgress = false;
 let deactivating = false;
-let projectCreationApi: BaseAPI | undefined;
+let projectCreationController: CreateProjectController | undefined;
+const projectCreationLocalFolders = new Set<string>();
 const linkOperationGate = new LinkOperationGate();
 const panelConfirmation = Object.freeze({ source: 'localleaf-panel' });
 const SYNC_AUTHORIZATION_STATE_KEY = 'localleaf.approvedSyncTargets.v1';
@@ -134,6 +136,17 @@ async function ensureSyncAuthorization(
     context: vscode.ExtensionContext,
     settings: SettingsManager,
 ): Promise<boolean> {
+    const target = getSyncAuthorizationTarget(settings);
+    const originalKey = getSyncKey(settings);
+    if (target) {
+        try {
+            await consumeCreatedProjectSyncAuthorization(context.globalState, context.workspaceState,
+                target, SYNC_AUTHORIZATION_STATE_KEY);
+        } catch (error) {
+            log(`Could not transfer created-project authorization: ${errorMessage(error)}`);
+        }
+        if (deactivating || getSyncKey(settings) !== originalKey) return false;
+    }
     if (hasSyncAuthorization(context, settings)) return true;
     const project = settings.getSettings();
     if (!project) return false;
@@ -238,6 +251,7 @@ function configureSettingsWatcher(context: vscode.ExtensionContext, workspaceFol
     });
 
     const handleSettingsChange = async () => {
+        if (projectCreationLocalFolders.has(workspaceFolder.toString())) return;
         const change = ++changeGeneration;
         const current = SettingsManager.getCurrentInstance();
         if (!current || current.getWorkspaceFolder().toString() !== workspaceFolder.toString()) return;
@@ -883,8 +897,8 @@ async function setAccountPanelOperation(
     AccountPanel.updateIfOpen(await getAccountPanelState());
 }
 
-async function cmdShowAccountPanel(context: vscode.ExtensionContext): Promise<void> {
-    accountPanelSelectedServer = undefined;
+async function cmdShowAccountPanel(context: vscode.ExtensionContext, requestedServerUrl?: string): Promise<void> {
+    accountPanelSelectedServer = requestedServerUrl ? validateServerUrl(requestedServerUrl).url : undefined;
     AccountPanel.createOrShow(
         context.extensionUri,
         await getAccountPanelState(),
@@ -895,6 +909,7 @@ async function cmdShowAccountPanel(context: vscode.ExtensionContext): Promise<vo
                 void vscode.window.showErrorMessage(`LocalLeaf: Account action failed - ${errorMessage(error)}`);
             } finally {
                 await refreshGui();
+                await projectCreationController?.refreshAccount();
             }
         },
     );
@@ -1184,91 +1199,28 @@ async function cmdLogoutFromCommand(): Promise<void> {
     }
 }
 
-/**
- * Create once on the captured server. Linking remains a separate user choice.
- */
+/** Open the complete creation form; side effects start only on its Create action. */
 async function cmdCreateProject(context: vscode.ExtensionContext): Promise<void> {
-    if (deactivating || !linkOperationGate.tryEnter()) return;
-    let created: { id: string; name: string; serverUrl: string; linkFolder?: vscode.Uri } | undefined;
-    try {
-        const current = SettingsManager.getCurrentInstance();
-        const serverUrl = validateServerUrl(current?.getSettings()?.serverUrl
-            || credentialManager.getDefaultServer()).url;
-        const folder = current?.getWorkspaceFolder();
-        const linkFolder = folder && !await current!.isLinked() ? folder : undefined;
-        if (!await credentialManager.getCredential(serverUrl)) {
-            void vscode.window.showWarningMessage('LocalLeaf: Sign in before creating an Overleaf project.');
-            await cmdShowAccountPanel(context);
-            return;
-        }
-        if (deactivating) return;
-        const enteredName = await vscode.window.showInputBox({
-            title: 'Create New Project',
-            prompt: `Create a blank Overleaf project on ${serverUrl}`,
-            placeHolder: 'Project name',
-            ignoreFocusOut: true,
-            validateInput: value => {
-                try { validateProjectName(value); return undefined; }
-                catch (error) { return errorMessage(error); }
-            },
-        });
-        if (enteredName === undefined || deactivating) return;
-        const name = validateProjectName(enteredName);
-        // The account can be logged out or replaced while the input is open.
-        const credential = await credentialManager.getCredential(serverUrl);
-        if (deactivating) return;
-        if (!credential) {
-            void vscode.window.showWarningMessage('LocalLeaf: The session was removed. Sign in and create the project again.');
-            return;
-        }
-        const api = new BaseAPI(serverUrl);
-        projectCreationApi = api;
-        api.setIdentity(credential.identity);
-        let result: Awaited<ReturnType<BaseAPI['createProject']>>;
-        try {
-            result = await vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: `LocalLeaf: Creating "${name}"`,
-                cancellable: false,
-            }, () => api.createProject(name));
-        } finally {
-            api.dispose();
-            if (projectCreationApi === api) projectCreationApi = undefined;
-        }
-        if (deactivating) return;
-        if (result.type !== 'success' || !result.projectId) {
-            if (result.authError) await setAuthState('expired', serverUrl);
-            const message = result.creationUncertain
-                ? 'The server may have created the project. Refresh the project list before creating it again.'
-                : result.message || 'The server could not create the project.';
-            void vscode.window.showErrorMessage(`LocalLeaf: ${message}`);
-        } else {
-            created = { id: result.projectId, name, serverUrl, linkFolder };
-        }
-        // A presentation failure must not turn a successful POST into a failed
-        // creation or encourage the user to repeat it.
-        try { await refreshGui(); }
-        catch (error) { log(`Project list refresh failed after creation: ${errorMessage(error)}`); }
-    } catch (error) {
-        if (!deactivating) void vscode.window.showErrorMessage(`LocalLeaf: ${errorMessage(error)}`);
-    } finally {
-        linkOperationGate.leave();
-    }
-    if (!created || deactivating) return;
-    const project = created;
-    const actions = project.linkFolder ? ['Link This Folder', 'Open in Overleaf'] : ['Open in Overleaf'];
-    void vscode.window.showInformationMessage(`LocalLeaf: Created "${project.name}" on ${project.serverUrl}.`, ...actions)
-        .then(async choice => {
-            if (deactivating) return;
-            if (choice === 'Open in Overleaf') {
-                await vscode.env.openExternal(vscode.Uri.parse(`${project.serverUrl}/project/${encodeURIComponent(project.id)}`));
-            } else if (choice === 'Link This Folder' && project.linkFolder) {
-                await cmdLinkFolder(context, { id: project.id }, project.serverUrl, project.linkFolder);
-            }
-        }, error => log(`Project creation notification failed: ${errorMessage(error)}`))
-        .then(undefined, error => {
-            if (!deactivating) void vscode.window.showErrorMessage(`LocalLeaf: Project created, but opening it failed: ${errorMessage(error)}`);
-        });
+    if (deactivating) return;
+    projectCreationController ??= new CreateProjectController(context, credentialManager, {
+        gate: linkOperationGate,
+        log,
+        signIn: serverUrl => cmdShowAccountPanel(context, serverUrl),
+        refreshViews: refreshGui,
+        onLocalSetupStart: folder => { projectCreationLocalFolders.add(folder.toString()); },
+        onLocalSetupFinish: async (folder, settings) => {
+            projectCreationLocalFolders.delete(folder.toString());
+            if (deactivating || !settings) return;
+            const current = SettingsManager.getCurrentInstance();
+            if (current?.getWorkspaceFolder().toString() !== folder.toString()) return;
+            await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', true);
+            if (deactivating || current !== SettingsManager.getCurrentInstance()) return;
+            configureSettingsWatcher(context, folder);
+            statusBarItem.show();
+            await initializeSync(context, settings);
+        },
+    });
+    await projectCreationController.show();
 }
 
 /**
@@ -2029,8 +1981,9 @@ async function waitForBrowserLoginCleanup(task: Promise<unknown>, timeoutMs: num
 
 export async function deactivate(): Promise<void> {
     deactivating = true;
-    projectCreationApi?.dispose();
-    projectCreationApi = undefined;
+    projectCreationController?.dispose();
+    projectCreationController = undefined;
+    projectCreationLocalFolders.clear();
     workspaceChangeGeneration++;
     settingsWatcherGeneration++;
     authPresentationGeneration++;

@@ -23,9 +23,8 @@ function fixture() {
         defaultServer: 'https://default.example', activeServer: undefined, linked: false,
         folder: folder('original'), credential: { identity: { cookies: 'test-session' } },
         requests: [], apis: [], credentialServers: [], notices: [], errors: [], warnings: [],
-        refreshes: 0, accounts: 0, inputs: 0, saves: [], projectLists: 0, links: [], opened: [],
-        input: async () => '  Test Project  ',
-        create: async () => ({ type: 'success', projectId: 'newproject' }),
+        refreshes: 0, accounts: 0, inputs: 0, saves: [], projectLists: 0, opened: [],
+        controllers: [], shows: 0, show: async () => {},
         warning: async () => undefined,
         refresh: async () => {},
     };
@@ -44,12 +43,20 @@ function fixture() {
         setIdentity(identity: unknown) { this.identity = identity; }
         async createProject(name: string) {
             state.requests.push({ server: this.server, name });
-            return state.create(name, this.server);
+            throw new Error('Opening the creation form must not submit a project');
         }
         async getProjects() {
             state.projectLists++;
             return { type: 'success', projects: [{ id: 'newproject', name: 'Test Project', accessLevel: 'owner' }] };
         }
+        dispose() { this.disposed = true; }
+    }
+    class Controller {
+        disposed = false;
+        constructor(readonly context: unknown, readonly credentials: unknown, readonly hooks: any) {
+            state.controllers.push(this);
+        }
+        async show() { state.shows++; await state.show(); }
         dispose() { this.disposed = true; }
     }
     const workspace: any = {
@@ -62,7 +69,7 @@ function fixture() {
         env: { openExternal: async (uri: { toString(): string }) => { state.opened.push(uri.toString()); return true; } },
         commands: { executeCommand: async () => {} },
         window: {
-            showInputBox: async (options: unknown) => { state.inputs++; return state.input(options); },
+            showInputBox: async () => { state.inputs++; throw new Error('Use the create-project webview'); },
             withProgress: async (_options: unknown, task: () => Promise<unknown>) => task(),
             showWarningMessage: async (message: string, ...actions: unknown[]) => {
                 state.warnings.push(message);
@@ -99,7 +106,7 @@ function fixture() {
         const originalLinkCommand = cmdLinkFolder;
         exports.create = () => cmdCreateProject(exports.context);
         exports.link = (project, server, folder) => originalLinkCommand(exports.context, project, server, folder);
-        exports.stubLink = () => { cmdLinkFolder = async (...args) => { exports.state.links.push(args); }; };
+        exports.linkGate = () => linkOperationGate;
         exports.gateActive = () => linkOperationGate.isActive;
     `);
     const moduleLoader = require('node:module');
@@ -112,6 +119,7 @@ function fixture() {
         require: (name: string) => {
             if (name === 'vscode') return vscode;
             if (name === './api/base') return { BaseAPI: API };
+            if (name === './views/createProjectController') return { CreateProjectController: Controller };
             if (name === './utils/settingsManager') return {
                 SettingsManager: {
                     getCurrentInstance: () => state.manager,
@@ -127,129 +135,88 @@ function fixture() {
     return { state, commands: exports };
 }
 
-async function testCancellationAndAuthentication(): Promise<void> {
-    const cancelled = fixture();
-    cancelled.state.input = async () => undefined;
-    await cancelled.commands.create();
-    assert.equal(cancelled.state.requests.length, 0);
-    assert.equal(cancelled.commands.gateActive(), false);
-    const unsigned = fixture();
-    unsigned.state.credential = undefined;
-    await unsigned.commands.create();
-    assert.equal(unsigned.state.inputs, 0);
-    assert.equal(unsigned.state.requests.length, 0);
-    assert.equal(unsigned.state.accounts, 1);
-    const loggedOut = fixture();
-    loggedOut.state.input = async () => { loggedOut.state.credential = undefined; return 'Project'; };
-    await loggedOut.commands.create();
-    assert.equal(loggedOut.state.requests.length, 0, 'credentials must be checked again after the name input');
+async function testControllerIsLazyAndReused(): Promise<void> {
+    const f = fixture();
+    assert.equal(f.state.controllers.length, 0);
+    await f.commands.create();
+    await f.commands.create();
+    assert.equal(f.state.controllers.length, 1, 'reopening the command must reuse its controller');
+    assert.equal(f.state.shows, 2);
+    assert.equal(f.state.inputs, 0, 'creation settings belong in the webview, not an input box');
+    assert.equal(f.state.requests.length, 0, 'opening the form must not create a remote project');
+    assert.equal(f.commands.gateActive(), false, 'opening the form must not hold the create/link gate');
+    const controller = f.state.controllers[0];
+    assert.equal(controller.context, f.commands.context);
+    assert.equal(controller.credentials, f.commands.credentials);
+    assert.equal(controller.hooks.gate, f.commands.linkGate());
+    await controller.hooks.signIn('https://selected.example');
+    assert.equal(f.state.accounts, 1);
+    await controller.hooks.refreshViews();
+    assert.equal(f.state.refreshes, 1);
+    assert.equal(typeof controller.hooks.onLocalSetupStart, 'function');
+    assert.equal(typeof controller.hooks.onLocalSetupFinish, 'function');
+    assert.equal(typeof controller.hooks.log, 'function');
 }
 
-async function testSingleCreationAndServerSelection(): Promise<void> {
-    for (const linked of [false, true]) {
-        const f = fixture();
-        f.state.linked = linked;
-        if (linked) f.state.activeServer = 'https://active.example';
-        await f.commands.create();
-        assert.deepEqual(f.state.requests, [{ server: linked ? 'https://active.example' : 'https://default.example', name: 'Test Project' }]);
-        assert.ok(f.state.apis[0].disposed);
-        assert.equal(f.state.saves.length, 0, 'creating a project must not overwrite a linked folder');
-        assert.equal(f.state.notices[0].actions.includes('Link This Folder'), !linked);
-        assert.equal(f.commands.gateActive(), false, 'an unanswered success notification must not retain the create/link gate');
-        f.state.notices[0].response.resolve('Open in Overleaf');
-        await flush();
-        assert.deepEqual(f.state.opened, [`${linked ? 'https://active.example' : 'https://default.example'}/project/newproject`]);
-    }
-    const concurrent = fixture();
-    const entered = deferred<string | undefined>();
-    concurrent.state.input = () => entered.promise;
-    const first = concurrent.commands.create();
+async function testConcurrentShowAndDeactivation(): Promise<void> {
+    const f = fixture();
+    const shown = deferred<void>();
+    f.state.show = () => shown.promise;
+    const first = f.commands.create();
+    const second = f.commands.create();
     await flush();
-    await concurrent.commands.create();
-    assert.equal(concurrent.state.inputs, 1);
-    entered.resolve('One Project');
-    await first;
-    assert.equal(concurrent.state.requests.length, 1, 'overlapping invocations must send only one creation POST');
-    concurrent.state.input = async () => undefined;
-    await concurrent.commands.create();
-    assert.equal(concurrent.state.inputs, 2, 'a pending success notification must allow a later command');
-    const noWorkspace = fixture();
-    noWorkspace.state.manager = undefined;
-    noWorkspace.state.workspaceFolders = [];
-    await noWorkspace.commands.create();
-    assert.equal(noWorkspace.state.requests[0].server, 'https://default.example');
-    assert.deepEqual(Array.from(noWorkspace.state.notices[0].actions), ['Open in Overleaf']);
+    assert.equal(f.state.controllers.length, 1, 'concurrent reveals must not instantiate multiple controllers');
+    assert.equal(f.state.shows, 2);
+    assert.equal(f.commands.gateActive(), false);
+    await f.commands.deactivate();
+    assert.ok(f.state.controllers[0].disposed, 'deactivation must dispose the controller even while show is pending');
+    shown.resolve();
+    await Promise.all([first, second]);
+    await f.commands.create();
+    assert.equal(f.state.controllers.length, 1);
+    assert.equal(f.state.shows, 2, 'a deactivated extension must not reveal another panel');
+
+    const stopped = fixture();
+    await stopped.commands.deactivate();
+    await stopped.commands.create();
+    assert.equal(stopped.state.controllers.length, 0, 'deactivation before first use must not initialize a controller');
 }
 
-async function testUncertainCreationAndRefreshFailure(): Promise<void> {
-    const uncertain = fixture();
-    uncertain.state.create = async () => ({ type: 'error', creationUncertain: true, message: 'Connection lost' });
-    await uncertain.commands.create();
-    await flush();
-    assert.equal(uncertain.state.requests.length, 1, 'uncertain project creation must never be replayed automatically');
-    assert.match(uncertain.state.errors[0], /may have created.*Refresh the project list/);
-    assert.equal(uncertain.state.notices.length, 0);
-    assert.equal(uncertain.commands.gateActive(), false);
-    const refreshFailed = fixture();
-    refreshFailed.state.refresh = async () => { throw new Error('View unavailable'); };
-    await refreshFailed.commands.create();
-    assert.equal(refreshFailed.state.requests.length, 1);
-    assert.equal(refreshFailed.state.errors.length, 0, 'a presentation failure must not report the successful POST as failed');
-    assert.match(refreshFailed.state.notices[0].message, /Created/);
+async function testFormOpensWithoutCredentialsOrWorkspace(): Promise<void> {
+    const f = fixture();
+    f.state.credential = undefined;
+    f.state.manager = undefined;
+    f.state.workspaceFolders = [];
+    await f.commands.create();
+    assert.equal(f.state.controllers.length, 1, 'the form presents sign-in and folder choices itself');
+    assert.equal(f.state.shows, 1);
+    assert.equal(f.state.inputs, 0);
+    assert.equal(f.state.requests.length, 0);
+    assert.equal(f.state.saves.length, 0);
 }
 
-async function testLateLinkUsesCapturedTarget(): Promise<void> {
+async function testExplicitLinkTargetAndLatePrerequisites(): Promise<void> {
     const captured = fixture();
     const originalFolder = captured.state.folder;
-    captured.commands.stubLink();
-    captured.state.input = async () => {
-        captured.state.defaultServer = 'https://changed-during-input.example';
-        return 'Captured Project';
-    };
-    await captured.commands.create();
-    assert.equal(captured.state.requests[0].server, 'https://default.example',
-        'changing the preferred server during name entry must not redirect the creation');
     captured.state.defaultServer = 'https://different.example';
-    captured.state.folder = folder('different');
-    captured.state.notices[0].response.resolve('Link This Folder');
-    await flush();
-    assert.equal(captured.state.links.length, 1);
-    assert.equal(captured.state.links[0][1].id, 'newproject');
-    assert.equal(captured.state.links[0][2], 'https://default.example');
-    assert.equal(captured.state.links[0][3], originalFolder);
+    await captured.commands.link({ id: 'newproject' }, 'https://original.example', originalFolder);
+    assert.equal(captured.state.apis[0].server, 'https://original.example',
+        'an explicit created-project link must not switch to the current preferred server');
+    assert.ok(captured.state.warnings.some((message: string) => message.startsWith('Link this folder')));
+    assert.equal(captured.state.saves.length, 0, 'cancelling link confirmation must preserve local settings');
 
     const closed = fixture();
-    await closed.commands.create();
+    const closedFolder = closed.state.folder;
     closed.state.workspaceFolders = [];
-    closed.state.notices[0].response.resolve('Link This Folder');
-    await flush();
+    await closed.commands.link({ id: 'newproject' }, 'https://original.example', closedFolder);
     assert.equal(closed.state.projectLists, 0, 'late linking must skip a folder which is no longer open');
     assert.equal(closed.state.saves.length, 0);
 
-    const alreadyLinked = fixture();
-    await alreadyLinked.commands.create();
-    alreadyLinked.state.linked = true;
-    alreadyLinked.state.notices[0].response.resolve('Link This Folder');
-    await flush();
-    assert.equal(alreadyLinked.state.projectLists, 0);
-    assert.equal(alreadyLinked.state.saves.length, 0, 'late linking must not overwrite a newly linked folder');
-}
-
-async function testDeactivationCancelsCreation(): Promise<void> {
-    const f = fixture();
-    const result = deferred<unknown>();
-    f.state.create = () => result.promise;
-    const pending = f.commands.create();
-    await flush();
-    assert.equal(f.state.requests.length, 1);
-    await f.commands.deactivate();
-    assert.ok(f.state.apis[0].disposed, 'deactivation must dispose the in-flight creation API');
-    result.resolve({ type: 'success', projectId: 'newproject' });
-    await pending;
-    assert.equal(f.state.notices.length, 0);
-    assert.equal(f.state.refreshes, 0);
-    await f.commands.create();
-    assert.equal(f.state.requests.length, 1);
+    const linked = fixture();
+    linked.state.linked = true;
+    await linked.commands.link({ id: 'newproject' }, 'https://original.example', linked.state.folder);
+    assert.equal(linked.state.projectLists, 0);
+    assert.equal(linked.state.saves.length, 0, 'linking must not overwrite an existing association');
 }
 
 async function testLinkConfirmationRevalidatesWorkspace(): Promise<void> {
@@ -272,11 +239,10 @@ async function testLinkConfirmationRevalidatesWorkspace(): Promise<void> {
 }
 
 async function run(): Promise<void> {
-    await testCancellationAndAuthentication();
-    await testSingleCreationAndServerSelection();
-    await testUncertainCreationAndRefreshFailure();
-    await testLateLinkUsesCapturedTarget();
-    await testDeactivationCancelsCreation();
+    await testControllerIsLazyAndReused();
+    await testConcurrentShowAndDeactivation();
+    await testFormOpensWithoutCredentialsOrWorkspace();
+    await testExplicitLinkTargetAndLatePrerequisites();
     await testLinkConfirmationRevalidatesWorkspace();
     console.log('Create project command regression tests passed.');
 }

@@ -55,7 +55,7 @@ Contributions are welcome, whether they are code, documentation, bug reports, or
 3. Choose a project from the LocalLeaf sidebar and link it to the folder.
 4. New remote files download automatically. Independent edits to supported text files merge automatically; overlapping changes remain available for review in the conflict prompt.
 
-To start a new project, click **Create New Project** in the Projects header or the linked project's **Tools** tab, or run `LocalLeaf: Create New Project`. Enter its name to create a blank project with `main.tex` on the linked project's server, or the default server when no project is linked. The result appears in the project list. The success notification can open it in Overleaf; if the current folder is unlinked, **Link This Folder** starts the normal linking flow. Creating a project leaves an existing workspace link in place.
+To start a new project, click **Create New Project** in the Projects header or the linked project's **Tools** tab. A dedicated editor page lets you enter the project name, choose the Overleaf server, check your account, and optionally select an empty local folder. **Create project** creates a blank project with `main.tex` and downloads it when a local folder is selected. Progress, errors, and the actions **Open in Overleaf** and **Open local folder** stay in the page. If the local download fails, **Retry local setup** resumes the same project. Opening the new folder starts synchronization without asking again about the connection you just chose.
 
 Automatic text merging supports `.tex`, `.bib`, `.md`, `.sty`, and `.cls`. It needs a previously synchronized ancestor and preserves whitespace. Files above 2 MiB and merges that exceed the processing budget require review. Binary attachments are never merged as text. Unsaved editor changes remain unsaved.
 
@@ -79,7 +79,7 @@ Browser login uses a temporary, isolated Chromium profile and removes it after t
 | `LocalLeaf: Verify Credentials` | Checks whether the current session is still valid |
 | `LocalLeaf: Re-authenticate` | Opens the Account panel to replace an expired session |
 | `LocalLeaf: Link Folder to Overleaf Project` | Links the current folder to a project |
-| `LocalLeaf: Create New Project` | Creates a blank project on the selected server, with optional linking to the current unlinked folder |
+| `LocalLeaf: Create New Project` | Opens the graphical project creation page with account, server, and optional local folder setup |
 | `LocalLeaf: Unlink Folder` | Removes the local project link |
 | `LocalLeaf: Sync Now` | Starts a two-way synchronization |
 | `LocalLeaf: Pull from Overleaf` | Downloads the latest remote state |
