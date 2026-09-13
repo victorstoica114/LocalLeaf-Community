@@ -15,12 +15,16 @@ export async function runSocketTransportTests(): Promise<void> {
     const server = http.createServer((request, response) => respond(request, response));
     const connections = new Set<import('net').Socket>();
     const WebSocket = require('ws') as any;
+    let received: ((connection: any, data: string) => void) | undefined;
+    let latestConnection: any;
     const websocketServer = new WebSocket.Server({ noServer: true });
     server.on('upgrade', (request, socket, head) => {
         websocketServer.handleUpgrade(request, socket, head, (connection: any) => {
+            latestConnection = connection;
             assert.equal(request.headers.cookie, 'test-session=1');
             connection.send('1::');
             connection.on('message', (data: Buffer) => {
+                if (received) { received(connection, String(data)); return; }
                 const packet = /^5:(\d+)\+::(.+)$/.exec(String(data));
                 if (!packet || JSON.parse(packet[2]).name !== 'joinProject') return;
                 setTimeout(() => {
@@ -156,6 +160,71 @@ export async function runSocketTransportTests(): Promise<void> {
         await cancelledRetry;
         await new Promise(resolve => setTimeout(resolve, 30));
         assert.equal(requests, 2, 'closing the workspace must cancel scheduled connection retries');
+
+        // Established sessions: use the actual bundled Socket.IO client and
+        // real TCP/WebSocket connections through repeated outages and silence.
+        let cursorPackets = 0;
+        let heartbeatReplies = 0;
+        let remoteUpdates = 0;
+        let disconnects = 0;
+        respond = (_request, response) => response.end('test-session:0.2:0.2:websocket');
+        received = (connection, data) => {
+            if (data === '2::') { heartbeatReplies++; return; }
+            const eventPacket = /^5:(\d*)\+?::(.+)$/.exec(data);
+            if (!eventPacket) return;
+            const event = JSON.parse(eventPacket[2]);
+            if (event.name === 'clientTracking.updatePosition') {
+                cursorPackets++;
+                assert.equal(eventPacket[1], '', 'cursor packets must not allocate acknowledgement callbacks');
+                return; // Deliberately never acknowledge optional presence.
+            }
+            const response = event.name === 'joinProject' ? [null, { _id: 'test-project', rootFolder: [] }]
+                : event.name === 'joinDoc' ? [null, ['A'], 1]
+                    : [null, []];
+            connection.send(`6:::${eventPacket[1]}+${JSON.stringify(response)}`);
+        };
+        subject = new SocketIOAPI(api, identity, 'test-project');
+        (subject as any).socketEventTimeoutMs = 10;
+        subject.registerHandlers({
+            onDisconnected: () => { disconnects++; },
+            onFileChanged: () => { remoteUpdates++; },
+        });
+        await subject.joinProject();
+        for (let cycle = 0; cycle < 10; cycle++) {
+            await subject.joinDoc('test-doc');
+            await subject.updatePosition('test-doc', cycle, 0);
+            latestConnection.send('2::');
+            await new Promise(resolve => setTimeout(resolve, 25));
+            assert.ok(subject.isConnected, 'unacknowledged cursor updates must not disconnect synchronization');
+            await subject.getConnectedUsers();
+            const updated = remoteUpdates + 1;
+            latestConnection.send('5:::' + JSON.stringify({ name: 'otUpdateApplied', args: [{
+                doc: 'test-doc', v: cycle, op: [{ p: 0, i: 'x' }],
+            }] }));
+            for (let wait = 0; wait < 100 && remoteUpdates < updated; wait++) {
+                await new Promise(resolve => setTimeout(resolve, 5));
+            }
+            assert.equal(remoteUpdates, updated, 'remote listeners must survive each reconnection exactly once');
+            latestConnection.terminate();
+            for (let wait = 0; wait < 100 && subject.isConnected; wait++) {
+                await new Promise(resolve => setTimeout(resolve, 5));
+            }
+            assert.equal(subject.isConnected, false);
+            await subject.reconnect();
+        }
+        assert.equal(cursorPackets, 10);
+        assert.equal(heartbeatReplies, 10);
+        assert.equal(disconnects, 10);
+        // Keep TCP open, but stop sending heartbeats and all application data.
+        for (let wait = 0; wait < 100 && subject.isConnected; wait++) {
+            await new Promise(resolve => setTimeout(resolve, 5));
+        }
+        assert.equal(subject.isConnected, false, 'a silent half-open transport must expire its heartbeat deadline');
+        await subject.reconnect();
+        await subject.joinDoc('test-doc');
+        await subject.getConnectedUsers();
+        assert.ok(subject.isConnected);
+        subject.disconnect();
     } finally {
         subject?.disconnect();
         for (const socket of sockets) socket.disconnect();

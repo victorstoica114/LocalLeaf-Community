@@ -945,6 +945,11 @@ async function sendCookieCommand(
             deadline.signal.removeEventListener('abort', abortListener);
             request.removeAllListeners();
             upgradedSocket?.removeAllListeners();
+            // Destroying a pending HTTP upgrade can emit ECONNRESET on a later
+            // tick. These private transports still need terminal error handlers
+            // after their login callbacks have been detached.
+            request.on('error', () => undefined);
+            upgradedSocket?.on('error', () => undefined);
         };
         const finish = (cookies?: BrowserCookie[], error?: BrowserLoginFailure) => {
             if (settled) return;
@@ -1536,8 +1541,10 @@ function optionalString(value: unknown): string | undefined {
     return typeof value === 'string' ? value : undefined;
 }
 
-/** Pure helpers exported for focused security and parsing tests. */
+/** Helpers exported for focused security, parsing, and transport tests. */
 export const browserCookieLoginInternals = {
+    LoginDeadline,
+    sendCookieCommand,
     buildCookieHeader,
     cookiePathMatches,
     decodeWebSocketFrames,

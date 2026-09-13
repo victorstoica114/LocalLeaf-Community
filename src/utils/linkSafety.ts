@@ -1,5 +1,5 @@
-/** Metadata created by LocalLeaf before a project is synchronized. */
-const LOCALLEAF_METADATA = new Set(['.localleaf', '.leafignore']);
+/** Local metadata excluded from project synchronization. */
+const LOCAL_METADATA = new Set(['.localleaf', '.leafignore', '.git', '.vscode']);
 
 /**
  * A small synchronous gate used to prevent overlapping async link operations.
@@ -25,7 +25,7 @@ export class LinkOperationGate {
 
 /** Return true when linking could affect content not created by LocalLeaf. */
 export function shouldConfirmProjectLink(entryNames: readonly string[]): boolean {
-    return entryNames.some(name => !LOCALLEAF_METADATA.has(name));
+    return entryNames.some(name => !LOCAL_METADATA.has(name));
 }
 
 /**

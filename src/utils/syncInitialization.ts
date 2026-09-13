@@ -17,3 +17,20 @@ export function isSyncInitializationSnapshotCurrent(snapshot: SyncInitialization
         && snapshot.currentSyncKey === snapshot.expectedSyncKey
         && snapshot.activeSyncKey === snapshot.expectedSyncKey;
 }
+
+/** Catch up after a meaningful absence, without polling a healthy connection. */
+export function createWindowFocusListener(
+    onRefocus: () => void,
+    now: () => number = Date.now,
+): (state: { focused: boolean }) => void {
+    let blurredAt: number | undefined;
+    return ({ focused }) => {
+        if (!focused) {
+            blurredAt ??= now();
+            return;
+        }
+        const absentSince = blurredAt;
+        blurredAt = undefined;
+        if (absentSince !== undefined && now() - absentSince >= 30_000) onRefocus();
+    };
+}

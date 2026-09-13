@@ -35,6 +35,7 @@ interface ProjectsViewState {
     workspaceKind?: Exclude<WorkspaceFolderKind, 'linked' | 'unsupported'>;
     message?: string;
     openingProjectId?: string;
+    creatingProject?: boolean;
     serverUrl?: string;
 }
 
@@ -44,6 +45,7 @@ type ProjectsWebviewMessage =
     | { type: 'login' }
     | { type: 'openFolder' }
     | { type: 'openServer' }
+    | { type: 'createProject' }
     | { type: 'openLocalProject'; uri: string }
     | { type: 'openProject'; projectId: string };
 
@@ -60,6 +62,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     private projects: ProjectInfo[] = [];
     private localProjects: DetectedLocalLeafProject[] = [];
     private refreshVersion = 0;
+    private creatingProject = false;
     private state: ProjectsViewState = { status: 'loading', projects: [], localProjects: [] };
 
     constructor(
@@ -117,8 +120,8 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             SettingsManager.inspectFolder(fileFolders[0].uri),
             SettingsManager.findLinkedProjectFolders(),
         ]);
-        this.localProjects = localProjects;
         if (version !== this.refreshVersion) return;
+        this.localProjects = localProjects;
 
         const nestedProjects = this.localProjects.filter(project =>
             project.uri.toString() !== fileFolders[0].uri.toString()
@@ -221,7 +224,8 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     private updateState(state: ProjectsViewState): void {
-        this.state = state;
+        this.state = { ...state, creatingProject: this.creatingProject };
+        state = this.state;
         void this.view?.webview.postMessage({ type: 'state', state }).then(undefined, error => {
             console.error('[LocalLeaf] Failed to update Projects view:', error);
         });
@@ -241,6 +245,21 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
             case 'login':
                 await vscode.commands.executeCommand(COMMANDS.SHOW_ACCOUNT_PANEL);
                 break;
+            case 'createProject': {
+                if (this.creatingProject || this.state.openingProjectId) return;
+                this.creatingProject = true;
+                this.updateState(this.state);
+                try {
+                    await vscode.commands.executeCommand(COMMANDS.CREATE_PROJECT);
+                } finally {
+                    this.creatingProject = false;
+                    this.updateState(this.state);
+                    await this.refresh().catch(error => {
+                        console.error('[LocalLeaf] Failed to refresh projects after creation:', error);
+                    });
+                }
+                break;
+            }
             case 'openServer': {
                 const server = validateServerUrl(this.state.serverUrl || this.credentialManager.getDefaultServer());
                 await vscode.env.openExternal(vscode.Uri.parse(`${server.url}/project`));
@@ -261,7 +280,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                 if (typeof message.projectId !== 'string') return;
                 const project = this.projects.find(candidate => candidate.id === message.projectId);
                 if (project) {
-                    if (this.state.openingProjectId) return;
+                    if (this.creatingProject || this.state.openingProjectId) return;
                     this.updateState({ ...this.state, openingProjectId: project.id });
                     try {
                         await vscode.commands.executeCommand(COMMANDS.OPEN_PROJECT, project);
@@ -306,6 +325,8 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
         .shell { padding: 12px; }
         .menu-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--vscode-panel-border); }
         .menu-bar button { margin: 0; }
+        .menu-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+        .menu-actions button:disabled { opacity: .65; cursor: wait; }
         .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; }
         .brand img { width: 24px; height: 24px; }
         .brand-copy { min-width: 0; }
@@ -367,13 +388,20 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
     </style>
 </head>
 <body>
-    <nav class="menu-bar" aria-label="LocalLeaf menu"><span>LocalLeaf</span><button id="openMenu" type="button" class="primary" aria-label="Open LocalLeaf connection settings">Menu</button></nav>
+    <nav class="menu-bar" aria-label="LocalLeaf menu"><span>LocalLeaf</span><div class="menu-actions"><button id="createProject" type="button" class="primary" aria-label="Create New Project">Create New Project</button><button id="openMenu" type="button" class="primary" aria-label="Open LocalLeaf connection settings">Menu</button></div></nav>
     <main id="root" class="shell">
         <section class="state" role="status" aria-live="polite"><div class="state-card"><div class="spinner" aria-hidden="true"></div><div class="state-title">Loading LocalLeaf…</div></div></section>
     </main>
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
         const root = document.getElementById('root');
+        const createProject = document.getElementById('createProject');
+        createProject.addEventListener('click', () => {
+            if (createProject.disabled) return;
+            createProject.disabled = true;
+            createProject.setAttribute('aria-busy', 'true');
+            vscode.postMessage({ type: 'createProject' });
+        });
         document.getElementById('openMenu').addEventListener('click', () => vscode.postMessage({ type: 'login' }));
         const persisted = vscode.getState() || {};
         let state = null;
@@ -534,7 +562,7 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
                 const rows = visible.map(project => {
                     const row = element('button', 'project');
                     row.type = 'button';
-                    row.disabled = Boolean(state.openingProjectId);
+                    row.disabled = Boolean(state.openingProjectId || state.creatingProject);
                     row.title = 'Link to ' + project.name;
                     row.setAttribute('aria-label', 'Link to ' + project.name + ', access ' + project.accessLevel);
                     row.addEventListener('click', () => vscode.postMessage({ type: 'openProject', projectId: project.id }));
@@ -595,6 +623,9 @@ export class ProjectsWebviewProvider implements vscode.WebviewViewProvider {
 
         function render() {
             if (!state) return;
+            createProject.disabled = Boolean(state.creatingProject || state.openingProjectId);
+            createProject.setAttribute('aria-busy', String(Boolean(state.creatingProject)));
+            createProject.textContent = state.creatingProject ? 'Creating project...' : 'Create New Project';
             if (state.status === 'no-folder') return renderState('📂', 'Open a folder', 'LocalLeaf needs a workspace folder before it can link an Overleaf project.', { label: 'Open Folder', message: { type: 'openFolder' } });
             if (state.status === 'incompatible-folder') return renderState('⚠', 'Unsupported workspace', state.message || 'Open a local file-system folder to use LocalLeaf.', { label: 'Open Folder', message: { type: 'openFolder' } });
             if (state.status === 'local-projects') return renderLocalProjects();

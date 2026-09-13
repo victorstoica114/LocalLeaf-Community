@@ -34,7 +34,8 @@ import {
     SyncAuthorizationTarget,
 } from './utils/syncAuthorization';
 import { BrowserPreference, captureCookiesViaBrowserLogin } from './auth/browserCookieLogin';
-import { isSyncInitializationSnapshotCurrent } from './utils/syncInitialization';
+import { createWindowFocusListener, isSyncInitializationSnapshotCurrent } from './utils/syncInitialization';
+import { validateProjectName } from './utils/projectName';
 
 /**
  * Auth state type
@@ -54,9 +55,13 @@ let outputChannel: vscode.OutputChannel;
 let statusUpdateInterval: NodeJS.Timeout | undefined;
 let authState: AuthState = 'unknown';
 let authStateServerUrl: string | undefined;
+let authPresentationGeneration = 0;
+let loginStatusGeneration = 0;
+const expiredSessionNotifications = new Set<string>();
 let projectsWebviewProvider: ProjectsWebviewProvider;
 let mainWebviewProvider: MainWebviewProvider;
 let settingsWatcher: vscode.Disposable | undefined;
+let settingsWatcherGeneration = 0;
 let syncStatusSubscription: vscode.Disposable | undefined;
 let workspaceChangeGeneration = 0;
 let syncSessionGeneration = 0;
@@ -69,6 +74,7 @@ let activeBrowserLogin: AbortController | undefined;
 let activeBrowserLoginTask: Promise<unknown> | undefined;
 let accountActionInProgress = false;
 let deactivating = false;
+let projectCreationApi: BaseAPI | undefined;
 const linkOperationGate = new LinkOperationGate();
 const panelConfirmation = Object.freeze({ source: 'localleaf-panel' });
 const SYNC_AUTHORIZATION_STATE_KEY = 'localleaf.approvedSyncTargets.v1';
@@ -80,7 +86,7 @@ function errorMessage(error: unknown): string {
 function getSyncKey(settings: SettingsManager): string | undefined {
     const project = settings.getSettings();
     if (!project) return undefined;
-    return `${settings.getWorkspaceFolder().toString()}|${project.serverUrl}|${project.projectId}`;
+    return JSON.stringify([settings.getWorkspaceFolder().toString(), project.serverUrl, project.projectId]);
 }
 
 function getSyncAuthorizationTarget(settings: SettingsManager): SyncAuthorizationTarget | undefined {
@@ -131,6 +137,7 @@ async function ensureSyncAuthorization(
     if (hasSyncAuthorization(context, settings)) return true;
     const project = settings.getSettings();
     if (!project) return false;
+    const approvedSyncKey = getSyncKey(settings);
 
     const approval = await vscode.window.showWarningMessage(
         `Allow LocalLeaf to synchronize this folder with "${project.projectName}"?`,
@@ -151,6 +158,7 @@ async function ensureSyncAuthorization(
         log(`Synchronization not authorized for ${settings.getWorkspaceFolder().fsPath}`);
         return false;
     }
+    if (deactivating || getSyncKey(settings) !== approvedSyncKey) return false;
     await grantSyncAuthorization(context, settings);
     return true;
 }
@@ -197,30 +205,51 @@ function abandonStaleSyncEngine(
     return true;
 }
 
-function listenForSyncStatus(engine: SyncEngine): void {
+function listenForSyncStatus(engine: SyncEngine, serverUrl: string): void {
     syncStatusSubscription?.dispose();
-    syncStatusSubscription = engine.onStatusChange(async event => {
+    syncStatusSubscription = engine.onStatusChange(event => {
         if (syncEngine !== engine) return;
         updateStatusBar(event.status, event.message);
         if (event.authError) {
-            await setAuthState('expired');
-            await showSessionExpiredNotification();
+            void (async () => {
+                await setAuthState('expired', serverUrl);
+                if (syncEngine === engine && !deactivating) {
+                    await showSessionExpiredNotification(serverUrl);
+                }
+            })().catch(error => log(`Failed to present session status: ${errorMessage(error)}`));
         }
     });
 }
 
 function configureSettingsWatcher(context: vscode.ExtensionContext, workspaceFolder?: vscode.Uri): void {
+    const watcherGeneration = ++settingsWatcherGeneration;
+    let changeGeneration = 0;
     settingsWatcher?.dispose();
     settingsWatcher = undefined;
     if (!workspaceFolder) return;
 
+    const watchedManager = SettingsManager.getInstance(workspaceFolder);
+    const targetSubscription = watchedManager.onWillChangeSyncTarget(() => {
+        // The engine shares this manager. Invalidate it before load/save can
+        // publish another target, including between awaiting microtasks.
+        if (!deactivating && activeSyncKey && watchedManager === SettingsManager.getCurrentInstance()) {
+            disposeCurrentSyncSession();
+        }
+    });
+
     const handleSettingsChange = async () => {
+        const change = ++changeGeneration;
         const current = SettingsManager.getCurrentInstance();
         if (!current || current.getWorkspaceFolder().toString() !== workspaceFolder.toString()) return;
+        const isCurrent = () => !deactivating
+            && watcherGeneration === settingsWatcherGeneration
+            && change === changeGeneration
+            && current === SettingsManager.getCurrentInstance();
 
-        await current.load();
-        const linked = await current.isLinked();
+        const linked = Boolean(await current.load());
+        if (!isCurrent()) return;
         await vscode.commands.executeCommand('setContext', 'localleaf.isLinked', linked);
+        if (!isCurrent()) return;
         if (!linked) {
             disposeCurrentSyncSession();
             statusBarItem.hide();
@@ -232,17 +261,19 @@ function configureSettingsWatcher(context: vscode.ExtensionContext, workspaceFol
                 await initializeSync(context, current);
             }
         }
-        await refreshGui();
+        if (isCurrent()) await refreshGui();
     };
-    settingsWatcher = createSettingsWatcher(workspaceFolder, () => {
+    const fileWatcher = createSettingsWatcher(workspaceFolder, () => {
         void handleSettingsChange().catch(error => {
             log(`Failed to reload LocalLeaf settings: ${errorMessage(error)}`);
         });
     });
+    settingsWatcher = { dispose: () => { targetSubscription.dispose(); fileWatcher.dispose(); } };
 }
 
 async function handleWorkspaceFoldersChanged(context: vscode.ExtensionContext): Promise<void> {
     const generation = ++workspaceChangeGeneration;
+    settingsWatcherGeneration++;
     disposeCurrentSyncSession();
     settingsWatcher?.dispose();
     settingsWatcher = undefined;
@@ -370,6 +401,15 @@ export async function activate(context: vscode.ExtensionContext) {
                 log(`Failed to switch LocalLeaf workspace: ${errorMessage(error)}`);
             });
         }),
+        vscode.window.onDidChangeWindowState(createWindowFocusListener(() => {
+            const engine = syncEngine;
+            if (!engine || deactivating) return;
+            void engine.reconcileOnWindowFocus().catch(error => {
+                if (syncEngine === engine && !deactivating) {
+                    log(`Could not catch up after returning to VS Code: ${errorMessage(error)}`);
+                }
+            });
+        })),
     );
 
     await refreshGui();
@@ -387,7 +427,6 @@ function startInitialSync(context: vscode.ExtensionContext, settings: SettingsMa
         const message = errorMessage(error);
         log(`Failed to initialize sync: ${message}`);
         updateStatusBar('error', message);
-        void vscode.window.showErrorMessage(`LocalLeaf: Failed to initialize synchronization - ${message}`);
     });
 }
 
@@ -400,6 +439,7 @@ function registerCommands(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand(COMMANDS.LOGOUT, cmdLogoutFromCommand),
         vscode.commands.registerCommand(COMMANDS.SHOW_ACCOUNT_PANEL, () => cmdShowAccountPanel(context)),
         vscode.commands.registerCommand(COMMANDS.OPEN_PROJECT, (project: unknown) => cmdLinkFolder(context, project)),
+        vscode.commands.registerCommand(COMMANDS.CREATE_PROJECT, () => cmdCreateProject(context)),
         vscode.commands.registerCommand(COMMANDS.LINK_FOLDER, () => cmdLinkFolder(context)),
         vscode.commands.registerCommand(COMMANDS.UNLINK_FOLDER, cmdUnlinkFolder),
         vscode.commands.registerCommand(COMMANDS.SYNC_NOW, cmdSyncNow),
@@ -457,11 +497,11 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
     api.setIdentity(credential.identity);
 
     // Create sync engine
-    const engine = new SyncEngine(api, settings, log);
+    const engine = new SyncEngine(api, settings, log, context.globalStorageUri);
     syncEngine = engine;
 
     // Listen to status changes
-    listenForSyncStatus(engine);
+    listenForSyncStatus(engine, projectSettings.serverUrl);
 
     // Connect
     try {
@@ -473,7 +513,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         // Initialize cursor tracker
         const socket = engine.getSocket();
         if (socket) {
-            const tracker = new CursorTracker(socket, settings);
+            const tracker = new CursorTracker(socket, settings, engine.getFileTree());
             cursorTracker = tracker;
             await tracker.initialize();
             if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) {
@@ -496,7 +536,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         // Overleaf; it does not disable safe incoming synchronization.
         try {
             log('Auto-pulling files from Overleaf...');
-            await engine.pullAll();
+            await engine.pullAll(false);
             log('Auto-pull complete');
             if (abandonStaleSyncEngine(engine, initializationGeneration, settings, initializationSyncKey)) return;
 
@@ -514,7 +554,7 @@ async function initializeSync(context: vscode.ExtensionContext, settings: Settin
         if (syncEngine !== engine) return;
         log(`Failed to connect: ${error}`);
         disposeCurrentSyncSession();
-        void vscode.window.showErrorMessage(`LocalLeaf: Failed to connect - ${error}`);
+        updateStatusBar('error', `Failed to connect: ${errorMessage(error)}`);
     }
 }
 
@@ -600,12 +640,17 @@ function createCredentialTooltip(
 
 /** Update account/status UI without recursively refreshing the Projects view. */
 async function updateAuthStatePresentation(state: AuthState, serverUrl?: string): Promise<void> {
+    const generation = ++authPresentationGeneration;
+    const resolvedServer = serverUrl ? validateServerUrl(serverUrl).url : await resolveActiveServerUrl();
+    if (deactivating || generation !== authPresentationGeneration) return;
     authState = state;
-    authStateServerUrl = state === 'none'
-        ? undefined
-        : await resolveActiveServerUrl(serverUrl);
+    authStateServerUrl = state === 'none' ? undefined : resolvedServer;
+    if (state === 'valid' || state === 'none') expiredSessionNotifications.delete(resolvedServer);
     await updateLoginStatus();
-    if (credentialManager) AccountPanel.updateIfOpen(await getAccountPanelState());
+    if (credentialManager) {
+        const accountState = await getAccountPanelState();
+        if (!deactivating && generation === authPresentationGeneration) AccountPanel.updateIfOpen(accountState);
+    }
 }
 
 function getAuthStateForServer(serverUrl: string, hasCredential: boolean): AuthState {
@@ -617,19 +662,27 @@ function getAuthStateForServer(serverUrl: string, hasCredential: boolean): AuthS
  * Update login status bar
  */
 async function updateLoginStatus() {
+    if (!loginStatusItem) return;
+    const generation = ++loginStatusGeneration;
     // Only show login status if folder is linked
     const settingsManager = SettingsManager.getCurrentInstance();
-    if (!settingsManager || !(await settingsManager.isLinked())) {
+    const linked = Boolean(settingsManager && await settingsManager.isLinked());
+    const isCurrent = () => !deactivating && generation === loginStatusGeneration
+        && settingsManager === SettingsManager.getCurrentInstance();
+    if (!isCurrent()) return;
+    if (!settingsManager || !linked) {
         loginStatusItem.hide();
         return;
     }
 
     const settings = settingsManager.getSettings() ?? await settingsManager.load();
+    if (!isCurrent()) return;
     if (!settings) {
         loginStatusItem.hide();
         return;
     }
     const credential = await credentialManager.getCredential(settings.serverUrl);
+    if (!isCurrent()) return;
     const serverAuthState = getAuthStateForServer(settings.serverUrl, Boolean(credential));
 
     if (credential && serverAuthState === 'valid') {
@@ -666,7 +719,10 @@ async function updateLoginStatus() {
 /**
  * Show session expired notification with action buttons
  */
-async function showSessionExpiredNotification(): Promise<void> {
+async function showSessionExpiredNotification(serverUrl?: string, force = false): Promise<void> {
+    const server = await resolveActiveServerUrl(serverUrl);
+    if (deactivating || (!force && expiredSessionNotifications.has(server))) return;
+    expiredSessionNotifications.add(server);
     const action = await vscode.window.showWarningMessage(
         'LocalLeaf: Your Overleaf session has expired.',
         'Open Account',
@@ -1088,11 +1144,16 @@ async function cmdLogout(requestedServerUrl: string): Promise<void> {
 
     if (confirm !== 'Logout') return;
 
-    // Cancel all local/remote work before removing the stored session.
-    disposeCurrentSyncSession();
+    // Removing a secondary server's account must not interrupt synchronization
+    // with the server selected by the active workspace.
+    const activeServer = SettingsManager.getCurrentInstance()?.getSettings()?.serverUrl;
+    if (activeServer === serverUrl) disposeCurrentSyncSession();
     await credentialManager.deleteCredential(serverUrl);
-    updateStatusBar('disconnected', 'Logged out');
-    await setAuthState('none', serverUrl);
+    if (!syncEngine && SettingsManager.getCurrentInstance()?.getSettings()?.serverUrl === serverUrl) {
+        updateStatusBar('disconnected', 'Logged out');
+    }
+    if (authStateServerUrl === serverUrl) await setAuthState('none', serverUrl);
+    else await refreshGui();
     void vscode.window.showInformationMessage('LocalLeaf: Logged out');
 }
 
@@ -1124,16 +1185,109 @@ async function cmdLogoutFromCommand(): Promise<void> {
 }
 
 /**
+ * Create once on the captured server. Linking remains a separate user choice.
+ */
+async function cmdCreateProject(context: vscode.ExtensionContext): Promise<void> {
+    if (deactivating || !linkOperationGate.tryEnter()) return;
+    let created: { id: string; name: string; serverUrl: string; linkFolder?: vscode.Uri } | undefined;
+    try {
+        const current = SettingsManager.getCurrentInstance();
+        const serverUrl = validateServerUrl(current?.getSettings()?.serverUrl
+            || credentialManager.getDefaultServer()).url;
+        const folder = current?.getWorkspaceFolder();
+        const linkFolder = folder && !await current!.isLinked() ? folder : undefined;
+        if (!await credentialManager.getCredential(serverUrl)) {
+            void vscode.window.showWarningMessage('LocalLeaf: Sign in before creating an Overleaf project.');
+            await cmdShowAccountPanel(context);
+            return;
+        }
+        if (deactivating) return;
+        const enteredName = await vscode.window.showInputBox({
+            title: 'Create New Project',
+            prompt: `Create a blank Overleaf project on ${serverUrl}`,
+            placeHolder: 'Project name',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                try { validateProjectName(value); return undefined; }
+                catch (error) { return errorMessage(error); }
+            },
+        });
+        if (enteredName === undefined || deactivating) return;
+        const name = validateProjectName(enteredName);
+        // The account can be logged out or replaced while the input is open.
+        const credential = await credentialManager.getCredential(serverUrl);
+        if (deactivating) return;
+        if (!credential) {
+            void vscode.window.showWarningMessage('LocalLeaf: The session was removed. Sign in and create the project again.');
+            return;
+        }
+        const api = new BaseAPI(serverUrl);
+        projectCreationApi = api;
+        api.setIdentity(credential.identity);
+        let result: Awaited<ReturnType<BaseAPI['createProject']>>;
+        try {
+            result = await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: `LocalLeaf: Creating "${name}"`,
+                cancellable: false,
+            }, () => api.createProject(name));
+        } finally {
+            api.dispose();
+            if (projectCreationApi === api) projectCreationApi = undefined;
+        }
+        if (deactivating) return;
+        if (result.type !== 'success' || !result.projectId) {
+            if (result.authError) await setAuthState('expired', serverUrl);
+            const message = result.creationUncertain
+                ? 'The server may have created the project. Refresh the project list before creating it again.'
+                : result.message || 'The server could not create the project.';
+            void vscode.window.showErrorMessage(`LocalLeaf: ${message}`);
+        } else {
+            created = { id: result.projectId, name, serverUrl, linkFolder };
+        }
+        // A presentation failure must not turn a successful POST into a failed
+        // creation or encourage the user to repeat it.
+        try { await refreshGui(); }
+        catch (error) { log(`Project list refresh failed after creation: ${errorMessage(error)}`); }
+    } catch (error) {
+        if (!deactivating) void vscode.window.showErrorMessage(`LocalLeaf: ${errorMessage(error)}`);
+    } finally {
+        linkOperationGate.leave();
+    }
+    if (!created || deactivating) return;
+    const project = created;
+    const actions = project.linkFolder ? ['Link This Folder', 'Open in Overleaf'] : ['Open in Overleaf'];
+    void vscode.window.showInformationMessage(`LocalLeaf: Created "${project.name}" on ${project.serverUrl}.`, ...actions)
+        .then(async choice => {
+            if (deactivating) return;
+            if (choice === 'Open in Overleaf') {
+                await vscode.env.openExternal(vscode.Uri.parse(`${project.serverUrl}/project/${encodeURIComponent(project.id)}`));
+            } else if (choice === 'Link This Folder' && project.linkFolder) {
+                await cmdLinkFolder(context, { id: project.id }, project.serverUrl, project.linkFolder);
+            }
+        }, error => log(`Project creation notification failed: ${errorMessage(error)}`))
+        .then(undefined, error => {
+            if (!deactivating) void vscode.window.showErrorMessage(`LocalLeaf: Project created, but opening it failed: ${errorMessage(error)}`);
+        });
+}
+
+/**
  * Link current folder to an Overleaf project
  */
-async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?: unknown) {
+async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?: unknown,
+    requestedServerUrl?: string, requestedWorkspaceFolder?: vscode.Uri) {
     if (!linkOperationGate.tryEnter()) {
         void vscode.window.showInformationMessage('LocalLeaf: A project link is already in progress');
         return;
     }
 
     try {
-        const workspaceFolder = await chooseWorkspaceFolder();
+        if (requestedWorkspaceFolder && !vscode.workspace.workspaceFolders?.some(folder =>
+            folder.uri.toString() === requestedWorkspaceFolder.toString())) {
+            void vscode.window.showInformationMessage('LocalLeaf: The original folder is no longer open. Link the created project from its folder.');
+            return;
+        }
+        const workspaceFolder = requestedWorkspaceFolder ?? await chooseWorkspaceFolder();
         if (!workspaceFolder) {
             void vscode.window.showErrorMessage('LocalLeaf: No workspace folder open');
             return;
@@ -1148,7 +1302,7 @@ async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?
         }
 
         // Get server URL
-        const serverUrl = credentialManager.getDefaultServer();
+        const serverUrl = requestedServerUrl ? validateServerUrl(requestedServerUrl).url : credentialManager.getDefaultServer();
 
         // Check if logged in
         const credential = await credentialManager.getCredential(serverUrl);
@@ -1221,9 +1375,20 @@ async function cmdLinkFolder(context: vscode.ExtensionContext, requestedProject?
         );
         if (confirmation !== 'Link and Synchronize') return;
 
+        // A confirmation may outlive the original workspace or another link.
+        if (deactivating || !vscode.workspace.workspaceFolders?.some(folder =>
+            folder.uri.toString() === workspaceFolder.toString())) return;
+        if (await settingsManager.isLinked()) {
+            void vscode.window.showWarningMessage('LocalLeaf: This folder was linked while the dialog was open. Its project was kept.');
+            return;
+        }
+        if (deactivating || !vscode.workspace.workspaceFolders?.some(folder =>
+            folder.uri.toString() === workspaceFolder.toString())) return;
+
         // Create settings
         const settings = SettingsManager.createDefaultSettings(serverUrl, project.id, project.name);
         await settingsManager.save(settings);
+        SettingsManager.setCurrentWorkspaceFolder(workspaceFolder);
         await grantSyncAuthorization(context, settingsManager);
 
         // Create default .leafignore
@@ -1258,6 +1423,7 @@ async function cmdUnlinkFolder(confirmation?: object) {
         void vscode.window.showInformationMessage('LocalLeaf: This folder is not linked');
         return;
     }
+    const unlinkSyncKey = getSyncKey(settingsManager);
 
     if (confirmation !== panelConfirmation) {
         const confirm = await vscode.window.showWarningMessage(
@@ -1268,6 +1434,11 @@ async function cmdUnlinkFolder(confirmation?: object) {
 
         if (confirm !== 'Unlink') return;
     }
+
+    if (
+        deactivating || settingsManager !== SettingsManager.getCurrentInstance()
+        || getSyncKey(settingsManager) !== unlinkSyncKey
+    ) return;
 
     disposeCurrentSyncSession();
 
@@ -1288,7 +1459,7 @@ async function cmdUnlinkFolder(confirmation?: object) {
  * Sync now (bidirectional)
  */
 async function cmdSyncNow() {
-    // For now, just pull
+    // pullAll reconciles both sides against the saved common revision.
     await cmdPullFromOverleaf();
 }
 
@@ -1803,7 +1974,7 @@ async function verifyCredentialsForServer(requestedServerUrl?: string): Promise<
         return true;
     } else if (result.authError === 'session_expired' || result.authError === 'invalid_credentials') {
         await setAuthState('expired', serverUrl);
-        void showSessionExpiredNotification().catch(error => {
+        void showSessionExpiredNotification(serverUrl, true).catch(error => {
             log(`Could not show the expired-session notification: ${errorMessage(error)}`);
         });
         return false;
@@ -1858,7 +2029,12 @@ async function waitForBrowserLoginCleanup(task: Promise<unknown>, timeoutMs: num
 
 export async function deactivate(): Promise<void> {
     deactivating = true;
+    projectCreationApi?.dispose();
+    projectCreationApi = undefined;
     workspaceChangeGeneration++;
+    settingsWatcherGeneration++;
+    authPresentationGeneration++;
+    loginStatusGeneration++;
     activeBrowserLogin?.abort();
     activeBrowserLogin = undefined;
     settingsWatcher?.dispose();

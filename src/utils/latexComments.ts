@@ -83,7 +83,9 @@ export function removeStandaloneLatexComments(content: string): LatexCommentRemo
     // An unterminated comment environment may be ordinary text in a document
     // that does not load the `comment` package. Preserve it rather than
     // deleting the remainder of the file.
-    if (pendingCommentBlock) output.push(...pendingCommentBlock);
+    if (pendingCommentBlock) {
+        for (const line of pendingCommentBlock) output.push(line);
+    }
 
     return {
         content: output.map(line => line.text + line.ending).join(''),

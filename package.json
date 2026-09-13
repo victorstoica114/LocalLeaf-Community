@@ -2,7 +2,7 @@
   "name": "localleaf-community",
   "displayName": "LocalLeaf Community",
   "description": "Edit Overleaf projects locally in VS Code with two-way synchronization.",
-  "version": "0.2.10",
+  "version": "0.2.14",
   "publisher": "victorstoica114",
   "repository": {
     "type": "git",
@@ -83,6 +83,10 @@
       {
         "command": "localleaf.showAccountPanel",
         "title": "LocalLeaf: Account"
+      },
+      {
+        "command": "localleaf.createProject",
+        "title": "LocalLeaf: Create New Project"
       },
       {
         "command": "localleaf.linkFolder",
@@ -166,14 +170,13 @@
     "package": "npm run check-types && node esbuild.js --production",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js && node ./out/test/syncAuditTest.js",
+    "test": "node ./out/test/buildOutputTest.js && node ./out/test/runTest.js && node ./out/test/syncAuditTest.js && node ./out/test/twoClientSyncTest.js && node ./out/test/apiLifecycleAuditTest.js && node ./out/test/uiUtilsAuditTest.js && node ./out/test/syncStorageAuditTest.js && node ./out/test/syncRefreshAuditTest.js && node ./out/test/syncChoiceAuditTest.js && node ./out/test/projectCreationApiTest.js && node ./out/test/createProjectUiTest.js && node ./out/test/createProjectCommandTest.js",
     "postinstall": "patch-package",
     "website:dev": "npm run dev --prefix docs/website",
     "website:build": "npm run build --prefix docs/website"
   },
   "devDependencies": {
     "@types/mime-types": "^2.1.4",
-    "@types/minimatch": "^5.1.2",
     "@types/node": "^20.10.0",
     "@types/node-fetch": "^2.6.9",
     "@types/socket.io-client": "^1.4.36",
@@ -186,9 +189,11 @@
     "typescript": "^5.3.0"
   },
   "dependencies": {
+    "diff": "8.0.4",
     "form-data": "^4.0.6",
     "mime-types": "^2.1.35",
     "minimatch": "^9.0.9",
+    "node-diff3": "3.2.1",
     "node-fetch": "^2.7.0",
     "socket.io-client": "https://codeload.github.com/overleaf/socket.io-client/tar.gz/805a73d2a2e2408982597d5986a401088b7aa588"
   },
@@ -197,7 +202,7 @@
     "brace-expansion@1.1.12": "1.1.18",
     "brace-expansion@2.0.2": "2.1.4",
     "flatted": "3.4.4",
-    "js-yaml": "4.3.1",
+    "js-yaml": "4.3.2",
     "minimatch@3.1.2": "3.1.5",
     "@typescript-eslint/typescript-estree": {
       "minimatch": "9.0.9"

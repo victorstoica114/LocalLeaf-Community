@@ -39,6 +39,7 @@ interface MainViewState {
     onlineUsers: SidebarOnlineUser[];
     signedIn: boolean;
     mainDocumentSelected: boolean;
+    creatingProject?: boolean;
     notice?: SidebarNotice;
 }
 
@@ -50,6 +51,7 @@ type MainWebviewMessage =
     | { type: 'jumpToUser'; clientId: string };
 
 const ALLOWED_COMMANDS = new Set<string>([
+    COMMANDS.CREATE_PROJECT,
     COMMANDS.SYNC_NOW,
     COMMANDS.PULL_FROM_OVERLEAF,
     COMMANDS.EDIT_IGNORE_PATTERNS,
@@ -80,6 +82,8 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
     private onlineUsers: SidebarOnlineUser[] = [];
     private state?: MainViewState;
     private refreshPromise?: Promise<void>;
+    private refreshRequested = false;
+    private creatingProject = false;
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -135,19 +139,29 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     async refresh(): Promise<void> {
+        this.refreshRequested = true;
         if (!this.refreshPromise) {
-            const pending = this.buildState()
-                .then(state => this.publishState(state))
-                .finally(() => {
-                    if (this.refreshPromise === pending) this.refreshPromise = undefined;
-                });
+            const pending = this.refreshUntilCurrent().finally(() => {
+                if (this.refreshPromise === pending) this.refreshPromise = undefined;
+            });
             this.refreshPromise = pending;
         }
         await this.refreshPromise;
     }
 
+    private async refreshUntilCurrent(): Promise<void> {
+        while (this.refreshRequested) {
+            this.refreshRequested = false;
+            const state = await this.buildState();
+            // A workspace, login, or settings change during SecretStorage/disk
+            // reads needs a fresh snapshot before it can be shown.
+            if (!this.refreshRequested) this.publishState(state);
+        }
+    }
+
     private publishState(state: MainViewState): void {
-        this.state = state;
+        this.state = { ...state, creatingProject: this.creatingProject };
+        state = this.state;
         void this.view?.webview.postMessage({ type: 'state', state }).then(undefined, error => {
             console.error('[LocalLeaf] Failed to update LocalLeaf sidebar:', error);
         });
@@ -228,7 +242,22 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
         }
         if (message.type === 'runCommand' && typeof message.command === 'string') {
             if (ALLOWED_COMMANDS.has(message.command)) {
-                await vscode.commands.executeCommand(message.command);
+                if (message.command === COMMANDS.CREATE_PROJECT) {
+                    if (this.creatingProject) return;
+                    this.creatingProject = true;
+                    if (this.state) this.publishState(this.state);
+                    try {
+                        await vscode.commands.executeCommand(COMMANDS.CREATE_PROJECT);
+                    } finally {
+                        this.creatingProject = false;
+                        if (this.state) this.publishState(this.state);
+                        await this.refresh().catch(error => {
+                            console.error('[LocalLeaf] Failed to refresh sidebar after project creation:', error);
+                        });
+                    }
+                } else {
+                    await vscode.commands.executeCommand(message.command);
+                }
             }
             return;
         }
@@ -303,6 +332,7 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
             padding: 8px; border: 1px solid transparent; border-radius: 6px; color: inherit; background: transparent; text-align: left; cursor: pointer;
         }
         .tool:hover { border-color: var(--vscode-panel-border); background: var(--vscode-list-hoverBackground); }
+        .tool:disabled { opacity: .65; cursor: wait; }
         .tool.danger:hover { color: var(--vscode-errorForeground); }
         .tool-icon { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 6px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
         .tool-label, .detail-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
@@ -341,6 +371,7 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
         let restoreFocus = null;
 
         const tools = [
+            { icon: '+', label: 'Create New Project', copy: 'Create a blank project on Overleaf', command: '${COMMANDS.CREATE_PROJECT}' },
             { icon: '↻', label: 'Sync now', copy: 'Pull the latest Overleaf state', command: '${COMMANDS.SYNC_NOW}' },
             { icon: '↓', label: 'Pull from Overleaf', copy: 'Refresh all project files', command: '${COMMANDS.PULL_FROM_OVERLEAF}' },
             { icon: '≡', label: 'Edit ignore patterns', copy: 'Open .leafignore', command: '${COMMANDS.EDIT_IGNORE_PATTERNS}' },
@@ -512,8 +543,16 @@ export class MainWebviewProvider implements vscode.WebviewViewProvider {
                 const button = element('button', 'tool' + (tool.danger ? ' danger' : ''));
                 button.type = 'button';
                 button.setAttribute('aria-label', tool.label + '. ' + tool.copy);
+                const isCreateProject = tool.command === '${COMMANDS.CREATE_PROJECT}';
+                button.disabled = isCreateProject && Boolean(state.creatingProject);
+                if (isCreateProject) button.setAttribute('aria-busy', String(Boolean(state.creatingProject)));
                 button.addEventListener('click', () => {
+                    if (button.disabled) return;
                     if (tool.confirm) return showConfirmation(tool);
+                    if (isCreateProject) {
+                        button.disabled = true;
+                        button.setAttribute('aria-busy', 'true');
+                    }
                     vscode.postMessage({ type: 'runCommand', command: tool.command });
                 });
                 const copy = element('span');

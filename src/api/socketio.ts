@@ -76,6 +76,7 @@ export interface DocumentUpdate {
     v: number; // version number
     lastV?: number;
     hash?: string;
+    dupIfSource?: string[];
     meta?: {
         source: string; // socketio client id
         ts: number; // timestamp
@@ -101,7 +102,6 @@ export interface SocketEventHandlers {
     onUserDisconnected?: (clientId: string) => void;
     // Project events
     onRootDocUpdated?: (rootDocId: string) => void;
-    onCompilerUpdated?: (compiler: string) => void;
 }
 
 type ConnectionMode = 'legacy' | 'query';
@@ -203,6 +203,9 @@ function parseDocumentUpdate(value: unknown): DocumentUpdate | undefined {
     if (record.lastV !== undefined && lastVersion === undefined) return undefined;
     const hash = record.hash === undefined ? undefined : boundedString(record.hash, 1024);
     if (record.hash !== undefined && hash === undefined) return undefined;
+    const duplicateSources = record.dupIfSource;
+    if (duplicateSources !== undefined && (!Array.isArray(duplicateSources) || duplicateSources.length > 32
+        || duplicateSources.some(source => typeof source !== 'string' || source.length === 0 || source.length > 1024))) return undefined;
 
     let meta: DocumentUpdate['meta'];
     if (record.meta !== undefined) {
@@ -222,6 +225,7 @@ function parseDocumentUpdate(value: unknown): DocumentUpdate | undefined {
         ...(operations !== undefined ? { op: operations } : {}),
         ...(lastVersion !== undefined ? { lastV: lastVersion } : {}),
         ...(hash !== undefined ? { hash } : {}),
+        ...(duplicateSources !== undefined ? { dupIfSource: duplicateSources as string[] } : {}),
         ...(meta !== undefined ? { meta } : {}),
     };
 }
@@ -319,6 +323,7 @@ function parseFileEntityEvent(
 export class SocketIOAPI {
     private socket?: SocketIOClient.Socket;
     private connectionMode: ConnectionMode = 'legacy';
+    private preferredConnectionMode?: ConnectionMode;
     private projectRecord?: ProjectEntity;
     private projectRecordPromise?: Promise<ProjectEntity>;
     private projectRecordResolve?: (project: ProjectEntity) => void;
@@ -339,7 +344,8 @@ export class SocketIOAPI {
     private initialRetryDelaysMs = [1000, 2000];
     private cancelConnectionRetry?: () => void;
     private reconnectPromise?: Promise<ProjectEntity>;
-    private pendingSocketEventCount = 0;
+    private projectRefreshPromise?: Promise<ProjectEntity>;
+    private projectSnapshot?: SocketIOAPI;
     private readonly pendingSocketEvents = new Set<(error: Error) => void>();
     private maxPendingSocketEvents = MAX_PENDING_SOCKET_EVENTS;
     private disposed = false;
@@ -348,9 +354,10 @@ export class SocketIOAPI {
     constructor(
         private readonly api: BaseAPI,
         private readonly identity: Identity,
-        private readonly projectId: string
+        private readonly projectId: string,
+        mode: ConnectionMode = 'legacy',
     ) {
-        this.init();
+        this.init(mode);
     }
 
     /**
@@ -381,7 +388,6 @@ export class SocketIOAPI {
         this.projectRecordPromise = undefined;
         this.projectRecordResolve = undefined;
         this.projectRecord = undefined;
-        this._connected = false;
         const query = mode === 'query'
             ? `?projectId=${encodeURIComponent(this.projectId)}&t=${Date.now()}`
             : undefined;
@@ -394,6 +400,8 @@ export class SocketIOAPI {
     }
 
     private teardownSocket(): void {
+        this.projectSnapshot?.disconnect();
+        this.projectSnapshot = undefined;
         const error = new Error('Socket connection was disposed.');
         this._connectionFailureResolve?.(error);
         this.cancelPendingSocketEvents(error);
@@ -474,14 +482,13 @@ export class SocketIOAPI {
         if (!socket) {
             return Promise.reject(new Error('Socket is not initialized'));
         }
-        if (this.pendingSocketEventCount >= this.maxPendingSocketEvents) {
+        if (this.pendingSocketEvents.size >= this.maxPendingSocketEvents) {
             this.abortTimedOutSocket(socket);
             return Promise.reject(new Error(
                 'Too many pending Socket.IO events; the stalled connection was closed.'
             ));
         }
 
-        this.pendingSocketEventCount++;
         let cancel!: (error: Error) => void;
         const response = new Promise<unknown[]>((resolve, reject) => {
             cancel = reject;
@@ -501,7 +508,6 @@ export class SocketIOAPI {
             () => this.abortTimedOutSocket(socket),
         ).finally(() => {
             this.pendingSocketEvents.delete(cancel);
-            this.pendingSocketEventCount = Math.max(0, this.pendingSocketEventCount - 1);
         });
     }
 
@@ -555,9 +561,9 @@ export class SocketIOAPI {
             ));
         });
 
-        socket.on('disconnect', () => {
+        socket.on('disconnect', (reason: unknown) => {
             if (this.socket !== socket) return;
-            log('Disconnected from Overleaf');
+            log(`Disconnected from Overleaf: ${conciseErrorMessage(reason, 'transport closed')}`);
             const wasConnected = this._connected;
             this._connected = false;
             this.failConnection(socket, new Error('Socket disconnected before the operation completed'));
@@ -748,12 +754,6 @@ export class SocketIOAPI {
             });
         }
 
-        if (handlers.onCompilerUpdated) {
-            socket.on('compilerUpdated', (value: unknown) => {
-                const compiler = boundedString(value, 255);
-                if (compiler) handlers.onCompilerUpdated!(compiler);
-            });
-        }
     }
 
     /**
@@ -794,41 +794,47 @@ export class SocketIOAPI {
                     };
                 });
                 if (this.disposed) throw new Error('Socket connection has been disposed.');
-                this.init();
+                this.init(this.preferredConnectionMode ?? 'legacy');
             }
         }
     }
 
     private async joinProjectOnce(): Promise<ProjectEntity> {
         if (this.disposed) throw new Error('Socket connection has been disposed.');
-        let legacyError: unknown;
+        const firstMode = this.connectionMode;
+        let firstError: unknown;
         try {
-            const project = await this.joinProjectLegacy();
-            this.markProjectJoined(project);
-            log('Connected to project (real-time, legacy protocol)');
-            return project;
+            return await this.joinProjectInMode(firstMode);
         } catch (error) {
             if (this.disposed || this.isAuthRelatedMessage(errorMessage(error))) throw error;
-            legacyError = error;
-            log(`Legacy Socket.IO project join failed: ${errorMessage(error)}`);
+            firstError = error;
+            log(`${firstMode === 'legacy' ? 'Legacy' : 'Query'} Socket.IO project join failed: ${errorMessage(error)}`);
         }
 
-        this.init('query');
+        const secondMode = firstMode === 'legacy' ? 'query' : 'legacy';
+        this.init(secondMode);
         try {
-            const project = await this.joinProjectFromHandshake();
-            this.markProjectJoined(project);
-            log('Connected to project (real-time, query protocol)');
-            return project;
-        } catch (queryError) {
+            return await this.joinProjectInMode(secondMode);
+        } catch (secondError) {
             this.teardownSocket();
-            if (this.disposed || this.isAuthRelatedMessage(errorMessage(queryError))) throw queryError;
+            if (this.disposed || this.isAuthRelatedMessage(errorMessage(secondError))) throw secondError;
+            const legacyError = firstMode === 'legacy' ? firstError : secondError;
+            const queryError = firstMode === 'query' ? firstError : secondError;
             throw new ProjectJoinError(
                 `Unable to join the Overleaf project using either Socket.IO protocol. `
                 + `Legacy protocol: ${errorMessage(legacyError)}. Project-query protocol: ${errorMessage(queryError)}.`,
-                legacyError,
-                isTemporaryConnectionFailure(queryError),
+                firstError,
+                isTemporaryConnectionFailure(secondError),
             );
         }
+    }
+
+    private async joinProjectInMode(mode: ConnectionMode): Promise<ProjectEntity> {
+        const project = mode === 'legacy'
+            ? await this.joinProjectLegacy() : await this.joinProjectFromHandshake();
+        this.markProjectJoined(project);
+        log(`Connected to project (real-time, ${mode} protocol)`);
+        return project;
     }
 
     private async joinProjectLegacy(): Promise<ProjectEntity> {
@@ -844,11 +850,47 @@ export class SocketIOAPI {
         return projectFromResponse(response[0]);
     }
 
+    /** Refresh the tree without leaving documents on the live transport. */
+    refreshProject(): Promise<ProjectEntity> {
+        if (!this.isConnected) return Promise.reject(new Error('Socket disconnected'));
+        if (this.projectRefreshPromise) return this.projectRefreshPromise;
+        const operation = this.refreshProjectOnce();
+        this.projectRefreshPromise = operation;
+        void operation.then(
+            () => { if (this.projectRefreshPromise === operation) this.projectRefreshPromise = undefined; },
+            () => { if (this.projectRefreshPromise === operation) this.projectRefreshPromise = undefined; },
+        );
+        return operation;
+    }
+
+    private async refreshProjectOnce(): Promise<ProjectEntity> {
+        const liveSocket = this.socket;
+        let project: ProjectEntity;
+        if (this.connectionMode === 'legacy') {
+            project = await this.joinProjectLegacy();
+        } else {
+            // Query-protocol servers only send the file tree during connection.
+            // Read it through a temporary socket; replacing the live connection
+            // would lose document rooms and presence on every reconciliation.
+            const snapshot = new SocketIOAPI(this.api, this.identity, this.projectId, 'query');
+            this.projectSnapshot = snapshot;
+            try {
+                project = await snapshot.joinProjectFromHandshake();
+            } finally {
+                if (this.projectSnapshot === snapshot) this.projectSnapshot = undefined;
+                snapshot.disconnect();
+            }
+        }
+        if (!this.isConnected || this.socket !== liveSocket) throw new Error('Socket disconnected during project refresh');
+        this.projectRecord = project;
+        return project;
+    }
+
     /** Reuse this API object so cursor and sync handlers survive reconnection. */
     reconnect(): Promise<ProjectEntity> {
         if (this.disposed) return Promise.reject(new Error('Socket connection has been disposed.'));
         if (this.reconnectPromise) return this.reconnectPromise;
-        this.init();
+        this.init(this.preferredConnectionMode ?? 'legacy');
         // SyncEngine already owns the retry budget when recovering a live sync.
         const operation = this.joinProjectOnce();
         this.reconnectPromise = operation;
@@ -873,6 +915,7 @@ export class SocketIOAPI {
 
     private markProjectJoined(project: ProjectEntity): void {
         this.projectRecord = project;
+        this.preferredConnectionMode = this.connectionMode;
         this._connected = true;
         this.handlers.forEach(handler => handler.onConnected?.(this._publicId || ''));
     }
@@ -961,7 +1004,7 @@ export class SocketIOAPI {
      * Get connected users
      */
     async getConnectedUsers(): Promise<OnlineUser[]> {
-        const [value] = await this.emit('clientTracking.getConnectedUsers');
+        const [value] = await this.emitWithTimeout(30_000, 'clientTracking.getConnectedUsers');
         if (!Array.isArray(value) || value.length > MAX_CONNECTED_USER_RESPONSE_ITEMS) {
             throw new Error('Overleaf returned an invalid connected-user list.');
         }
@@ -984,11 +1027,20 @@ export class SocketIOAPI {
         if (safeRow === undefined || safeColumn === undefined) {
             throw new Error('Refusing to send an invalid cursor position.');
         }
-        await this.emit('clientTracking.updatePosition', {
+        const safeDocId = validateOverleafId(docId, 'document ID');
+        // Overleaf's editor sends cursor updates without an acknowledgement.
+        // Presence must neither block edits nor accumulate packets while offline.
+        if (!this._connected || !this.socket) return;
+        this.socket.emit('clientTracking.updatePosition', {
             row: safeRow,
             column: safeColumn,
-            doc_id: validateOverleafId(docId, 'document ID'),
+            doc_id: safeDocId,
         });
+    }
+
+    /** Drop an unhealthy transport while retaining handlers for recovery. */
+    resetConnection(): void {
+        if (this.socket) this.abortTimedOutSocket(this.socket);
     }
 
     /**

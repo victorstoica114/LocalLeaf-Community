@@ -4,6 +4,7 @@ import * as http from 'http';
 import * as path from 'path';
 import * as vm from 'vm';
 import * as esbuild from 'esbuild';
+import { runStandaloneTest } from './standaloneRunner';
 import { removeStandaloneLatexComments } from '../utils/latexComments';
 import {
     approveSyncTarget,
@@ -862,14 +863,12 @@ async function run(): Promise<void> {
         decoration: { dispose: () => { disposedCursorDecoration++; } },
     }]]);
     cursorQueue.userIdToColor = new Map([['user', '#fff']]);
-    cursorQueue.docIdToPath = new Map([['doc', '/main.tex']]);
     cursorQueue.disposables = [];
     cursorQueue.handleUserDisconnected('client');
     assert.equal(cursorQueue.userIdToColor.size, 0,
         'disconnected user colors must not accumulate for the lifetime of the extension');
     cursorQueue.dispose();
     assert.equal(disposedCursorDecoration, 1);
-    assert.equal(cursorQueue.docIdToPath.size, 0);
 
     let finishDisposedCursorInitialization: ((users: unknown[]) => void) | undefined;
     const disposedCursorInitialization = Object.create(CursorTracker.prototype) as any;
@@ -880,7 +879,6 @@ async function run(): Promise<void> {
     };
     disposedCursorInitialization.users = new Map();
     disposedCursorInitialization.userIdToColor = new Map();
-    disposedCursorInitialization.docIdToPath = new Map();
     disposedCursorInitialization.disposables = [];
     disposedCursorInitialization.initialized = false;
     disposedCursorInitialization.disposed = false;
@@ -1116,7 +1114,7 @@ async function run(): Promise<void> {
     assert.equal(overloadedSocket.disconnectCount, 1,
         'exceeding the pending ACK limit must close the stalled transport');
     await assert.rejects(() => firstPendingEvent, /disposed/);
-    assert.equal((overloadedClient as any).pendingSocketEventCount, 0);
+    assert.equal((overloadedClient as any).pendingSocketEvents.size, 0);
 
     const forcedSocket = new FakeSocket();
     const forcedClient = new SocketIOAPI({
@@ -1881,6 +1879,7 @@ async function run(): Promise<void> {
         return Object.assign(Object.create(SyncEngine.prototype), {
             documentSnapshots: new Map(), pendingLocalCreates: new Set(), joinedDocs: new Set(),
             syncLock: new Set(), pendingWaits: new Map(), fileTree: new Map(), fileTreeByPath: new Map(),
+            removedSnapshotEntries: new Map(),
             baseContent: new Map(), fileCache: new Map(), remoteEventQueue: Promise.resolve(),
         });
     }
@@ -2762,6 +2761,7 @@ async function run(): Promise<void> {
         engine.settings = {
             getFilePath: () => uri,
             getSettings: () => ({ projectId: 'project' }),
+            getWorkspaceFolder: () => mockFileUri('D:\\dirty-ot-workspace'),
         };
         engine.documentSnapshots.set('doc', {content: Buffer.from('server'), version: 2});
         engine.api = {};
@@ -2781,6 +2781,20 @@ async function run(): Promise<void> {
         meta: { source: 'other-client', ts: Date.now(), user_id: 'other' },
     };
 
+    const dirtyMerge = createDirtyRemoteOt(async () => { throw new Error('Independent editor edits must merge'); });
+    const dirtyBase = 'first\nunchanged\nlast\n';
+    dirtyMerge.document.applyText('FIRST\nunchanged\nlast\n');
+    dirtyMerge.engine.baseContent.set('/chapter.tex', Buffer.from(dirtyBase));
+    dirtyMerge.engine.documentSnapshots.set('doc', { content: Buffer.from(dirtyBase), version: 2 });
+    await dirtyMerge.engine.handleRemoteFileChanged({ ...remoteEdit,
+        op: [{ p: dirtyBase.indexOf('last'), d: 'last' }, { p: dirtyBase.indexOf('last'), i: 'LAST' }] });
+    assert.equal(dirtyMerge.document.getText(), 'FIRST\nunchanged\nLAST\n');
+    assert.equal(dirtyMerge.document.isDirty, true, 'automatic merging must not save the editor');
+    assert.equal(mockFileWrites.length, 0, 'automatic merging of a dirty buffer must not write or upload the draft');
+    assert.equal(mockAppliedWorkspaceEdits.length, 1, 'editor merges must remain undoable');
+    assert.equal(Buffer.from(dirtyMerge.engine.baseContent.get('/chapter.tex')).toString(), dirtyBase,
+        'an unsaved merged buffer is not a newly synchronized ancestor');
+
     let conflictPrompts = 0;
     const skippedDirtyRemote = createDirtyRemoteOt(async () => {
         conflictPrompts++;
@@ -2798,8 +2812,8 @@ async function run(): Promise<void> {
     );
     assert.equal(
         skippedDirtyRemote.engine.shouldPropagate('/chapter.tex', new TextEncoder().encode('server')),
-        false,
-        'the cache must continue to represent disk after retaining a dirty editor',
+        true,
+        'skipping a conflict must not mark an unconfirmed disk revision as synchronized',
     );
     assert.equal(
         skippedDirtyRemote.engine.shouldPropagate('/chapter.tex', new TextEncoder().encode('local edit')),
@@ -3072,7 +3086,7 @@ async function run(): Promise<void> {
     let floodedQueueStatus: string | undefined;
     floodedRemoteQueue.setStatus = (status: string) => { floodedQueueStatus = status; };
     let floodedSocketDisconnected = false;
-    floodedRemoteQueue.socket = { disconnect: () => { floodedSocketDisconnected = true; } };
+    floodedRemoteQueue.socket = { resetConnection: () => { floodedSocketDisconnected = true; } };
     floodedRemoteQueue.enqueueRemoteEvent(async () => undefined);
     assert.equal(floodedQueueStatus, 'error');
     assert.equal(floodedSocketDisconnected, true,
@@ -3462,7 +3476,7 @@ async function run(): Promise<void> {
     const refreshProvider = Object.create(MainWebviewProvider.prototype) as any;
     refreshProvider.buildState = async () => {
         stateBuilds++;
-        await new Promise<void>(resolve => { finishStateBuild = resolve; });
+        if (stateBuilds === 1) await new Promise<void>(resolve => { finishStateBuild = resolve; });
         return {
             linked: true,
             syncStatus: 'idle',
@@ -3477,6 +3491,7 @@ async function run(): Promise<void> {
     assert.equal(stateBuilds, 1, 'overlapping full refreshes must share one state build');
     finishStateBuild?.();
     await Promise.all([firstRefresh, duplicateRefresh]);
+    assert.equal(stateBuilds, 2, 'a refresh during an outstanding snapshot must rebuild the current state');
 
     const accountSource = fs.readFileSync(path.join(viewsDirectory, 'accountPanel.js'), 'utf8');
     const { AccountPanel } = require('../views/accountPanel') as { AccountPanel: any };
@@ -3529,7 +3544,7 @@ async function run(): Promise<void> {
         path.join(__dirname, '..', '..', 'src', 'sync', 'syncEngine.ts'),
         'utf8',
     );
-    assert.match(syncEngineSource, /Waiting for your choice in VS Code notifications/,
+    assert.match(syncEngineSource, /Some files need your choice in notifications; other files continue syncing/,
         'interactive pulls must identify a required choice even when VS Code hides notifications');
     const cookieLoginStart = extensionSource.indexOf('async function loginWithCookies');
     const cookieLoginEnd = extensionSource.indexOf('// === Command Implementations ===', cookieLoginStart);
@@ -3549,7 +3564,7 @@ async function run(): Promise<void> {
     assert.match(extensionSource, /async function cmdRefreshCookie[\s\S]*COMMANDS\.SHOW_ACCOUNT_PANEL/,
         're-authentication commands must return users to the unified Account panel');
     const activationStart = extensionSource.indexOf('export async function activate');
-    const activationEnd = extensionSource.indexOf('/**\n * Register all commands', activationStart);
+    const activationEnd = extensionSource.indexOf(' * Register all commands', activationStart);
     const activationSource = extensionSource.slice(activationStart, activationEnd);
     assert.ok(activationStart >= 0 && activationEnd > activationStart);
     assert.match(activationSource, /startInitialSync\(context, settingsManager\);/,
@@ -3687,6 +3702,7 @@ async function run(): Promise<void> {
     linkGate.leave();
     assert.equal(linkGate.tryEnter(), true, 'the project link gate must release in a finally block');
     assert.equal(shouldConfirmProjectLink(['.localleaf', '.leafignore']), false);
+    assert.equal(shouldConfirmProjectLink(['.git', '.vscode', '.localleaf', '.leafignore']), false);
     assert.equal(shouldConfirmProjectLink(['.localleaf', 'chapter.tex']), true,
         'folders containing user files must require confirmation');
     const canonicalProject = { id: 'project-1', name: 'Canonical project' };
@@ -4354,8 +4370,6 @@ async function run(): Promise<void> {
     console.log('LocalLeaf synchronization and UI contract regression tests passed.');
 }
 
-run().catch(error => {
-    Module._load = originalLoad;
-    console.error(error);
-    process.exitCode = 1;
+runStandaloneTest(async () => {
+    try { await run(); } finally { Module._load = originalLoad; }
 });

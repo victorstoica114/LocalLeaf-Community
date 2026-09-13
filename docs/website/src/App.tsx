@@ -1,5 +1,3 @@
-import './index.css'
-
 const RELEASES_URL = 'https://github.com/victorstoica114/LocalLeaf-Community/releases'
 const MARKETPLACE_URL = 'https://marketplace.visualstudio.com/items?itemName=victorstoica114.localleaf-community'
 const GITHUB_URL = 'https://github.com/victorstoica114/LocalLeaf-Community'

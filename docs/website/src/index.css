@@ -5,12 +5,8 @@
   --mc-grass: #5B9A2C;
   --mc-grass-dark: #3D6B1E;
   --mc-dirt: #6B4226;
-  --mc-dirt-light: #8B5A2B;
   --mc-stone: #7F7F7F;
   --mc-stone-dark: #5F5F5F;
-  --mc-leaf: #4CAF50;
-  --mc-leaf-light: #81C784;
-  --mc-leaf-dark: #2E7D32;
   --mc-sky: #87CEEB;
   --mc-sky-dark: #1E3A5F;
 }
@@ -62,17 +58,6 @@ body,
   font-family: 'Press Start 2P', cursive;
 }
 
-.font-minecraft-body {
-  font-family: 'VT323', monospace;
-}
-
-/* Pixelated box shadow for Minecraft feel */
-.mc-shadow {
-  box-shadow:
-    4px 4px 0px rgba(0, 0, 0, 0.3),
-    -2px -2px 0px rgba(255, 255, 255, 0.1) inset;
-}
-
 /* Minecraft button style */
 .mc-btn {
   background: linear-gradient(180deg, #7B7B7B 0%, #5A5A5A 50%, #4A4A4A 100%);
@@ -106,41 +91,6 @@ body,
   background: linear-gradient(180deg, #7BBA4C 0%, #6A9C43 50%, #5D8B3E 100%);
 }
 
-/* Dirt pattern background */
-.bg-dirt {
-  background-color: var(--mc-dirt);
-  background-image:
-    repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 8px,
-      rgba(0,0,0,0.1) 8px,
-      rgba(0,0,0,0.1) 16px
-    ),
-    repeating-linear-gradient(
-      90deg,
-      transparent,
-      transparent 8px,
-      rgba(0,0,0,0.05) 8px,
-      rgba(0,0,0,0.05) 16px
-    );
-}
-
-/* Grass top border */
-.grass-top {
-  position: relative;
-}
-
-.grass-top::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 16px;
-  background: linear-gradient(180deg, var(--mc-grass) 0%, var(--mc-grass-dark) 100%);
-}
-
 /* Floating animation */
 @keyframes float {
   0%, 100% { transform: translateY(0px); }
@@ -171,7 +121,6 @@ body,
 .animate-delay-1 { animation-delay: 0.1s; }
 .animate-delay-2 { animation-delay: 0.2s; }
 .animate-delay-3 { animation-delay: 0.3s; }
-.animate-delay-4 { animation-delay: 0.4s; }
 
 /* Bounce animation for steps */
 @keyframes bounce-subtle {
@@ -234,16 +183,6 @@ body,
   border: 4px solid #333;
   font-family: 'VT323', monospace;
   color: #4EC9B0;
-}
-
-/* Pixelated corners */
-.pixel-corners {
-  clip-path: polygon(
-    0 8px, 8px 8px, 8px 0,
-    calc(100% - 8px) 0, calc(100% - 8px) 8px, 100% 8px,
-    100% calc(100% - 8px), calc(100% - 8px) calc(100% - 8px), calc(100% - 8px) 100%,
-    8px 100%, 8px calc(100% - 8px), 0 calc(100% - 8px)
-  );
 }
 
 /* Scrollbar styling */

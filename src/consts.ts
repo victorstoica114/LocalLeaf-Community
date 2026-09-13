@@ -2,7 +2,6 @@
  * LocalLeaf Constants
  */
 
-export const EXTENSION_ID = 'victorstoica114.localleaf-community';
 export const EXTENSION_NAME = 'LocalLeaf Community';
 
 // Configuration paths
@@ -17,7 +16,6 @@ export const CREDENTIAL_KEY_PREFIX = 'localleaf.credential.';
 export const DEFAULT_SERVER = 'https://www.overleaf.com';
 
 // Sync settings
-export const DEFAULT_SYNC_INTERVAL = 5000;
 export const DEBOUNCE_DELAY = 500;
 
 // Special variables for .leafignore
@@ -58,6 +56,7 @@ export const COMMANDS = {
     LOGOUT: 'localleaf.logout',
     SHOW_ACCOUNT_PANEL: 'localleaf.showAccountPanel',
     OPEN_PROJECT: 'localleaf.openProject',
+    CREATE_PROJECT: 'localleaf.createProject',
     LINK_FOLDER: 'localleaf.linkFolder',
     UNLINK_FOLDER: 'localleaf.unlinkFolder',
     SYNC_NOW: 'localleaf.syncNow',

@@ -177,7 +177,7 @@ export async function runSocketIOProtocolTests(): Promise<void> {
     let fileEvents = 0;
     let negotiationDisconnects = 0;
     const queryApi = new FakeApi((socket, attempt, query) => {
-        if (attempt % 2 === 0) {
+        if (attempt === 0) {
             assert.equal(query, undefined);
             socket.trigger('connect');
             socket.trigger('connectionRejected', { message: 'project query required' });
@@ -222,12 +222,12 @@ export async function runSocketIOProtocolTests(): Promise<void> {
     const recovering = querySocket.reconnect();
     assert.equal(querySocket.reconnect(), recovering, 'concurrent recovery requests must share one negotiation');
     assert.equal(await recovering, project);
-    assert.equal(queryApi.sockets.length, 4);
+    assert.equal(queryApi.sockets.length, 3, 'recovery must reuse the working query protocol');
     assert.equal(fileEvents, 2, 'existing event handlers must remain attached after automatic recovery');
     assert.equal(negotiationDisconnects, 1, 'recovery negotiation must not trigger additional recovery loops');
     querySocket.disconnect();
     await assert.rejects(querySocket.reconnect(), /disposed/);
-    assert.equal(queryApi.sockets.length, 4, 'a disposed workspace must not open another socket');
+    assert.equal(queryApi.sockets.length, 3, 'a disposed workspace must not open another socket');
 
     for (const authMessage of ['not logged in', 'Not authenticated', 'invalid session', '401 Unauthorized']) {
         const authApi = new FakeApi((socket, _attempt, query) => {

@@ -2,6 +2,83 @@
 
 All notable changes to LocalLeaf Community will be documented in this file.
 
+## [0.2.14] - Unreleased
+
+### Added
+
+- Create New Project in the Projects header, linked project's Tools tab, and Command Palette
+- Create a blank Overleaf project with a validated name, then open it on the server or link the current unlinked folder through the existing synchronization flow
+- Prevent duplicate creation requests from repeated clicks and report uncertain server outcomes without automatically repeating the POST
+- Test creation payloads, authentication and failures, sidebar actions, command lifecycle, and creation on a real Overleaf server
+
+### Fixed
+
+- Recheck the selected folder and its linkage before accepting a delayed link confirmation
+
+## [0.2.13] - Unreleased
+
+### Fixed
+
+- Replace periodic health probes and project reconciliation with transport-driven recovery and a throttled check when returning to the VS Code window
+- Read query-protocol project snapshots through a temporary connection while preserving the primary connection and its document subscriptions
+- Preserve primary events across failed or concurrent snapshots, scope file lookups to their locked paths, and make duplicate structure events idempotent
+- Reuse the last successful connection protocol after an outage, while retaining the legacy-to-query fallback on an initial connection
+- Keep saved local edits when an incoming change has no known ancestor, and retain attachment replacement journals and the previous baseline after a failed replacement
+- Serialize settings writes, save them atomically, and discard stale asynchronous UI and initialization results
+- Deduplicate expired-session notifications and keep transient startup failures in the synchronization status and log
+- Remember dismissed or ignored unchanged local-only/orphaned file prompts for the session; reoffer them after content changes or an explicit Sync Now, and preserve the ancestor when a deletion prompt is dismissed
+- Reject inconsistent ranged downloads and stop requests or browser-login upgrades after disposal
+- Emit the merge worker at its packaged runtime path in a clean build
+
+### Maintenance
+
+- Remove unused API helpers, credential/settings methods, duplicate collaborator mappings, the periodic synchronization scheduler, obsolete test code, and unused website styles
+- Avoid repeated content hashing and unchanged state-file writes; preserve UTF-8 BOMs during merging
+- Handle very large unterminated LaTeX comment blocks without overflowing the call stack
+- Make standalone test runners fail if an unresolved promise would otherwise let Node exit successfully before completing the tests
+- Add clean-build, API lifecycle, settings/UI concurrency, persistence, and event-driven recovery regressions; clean generated test directories after each run
+- Remove unused minimatch type stubs and update vulnerable website development dependencies
+
+## [0.2.12] - Unreleased
+
+### Changed
+
+- Merge independent `.tex`, `.bib`, `.md`, `.sty`, and `.cls` edits against their common ancestor in a worker with bounded time and memory; preserve overlapping changes for review
+- Persist per-workspace document ancestors, hashes, remote identities, versions, and pending writes/deletions/attachment replacements through atomic state-file replacement
+- Recover uncertain document writes using Overleaf's original-source duplicate detection and re-read the committed snapshot before processing newer saves
+- Send granular UTF-16 document operations and preserve saves or unsaved editor changes made while an upload is running
+- Classify and coalesce filesystem events before reading content; wait for generated-file writes to settle and recognize atomic file replacement
+- Reconcile the authoritative project tree periodically, recover missed moves and unchanged remote deletions, and protect concurrent attachment edits
+- Keep individual file failures visible until those files recover
+- Restore document subscriptions and reconcile missed edits after a query-protocol project-tree refresh
+- Honor directory-only ignore rules for local folder creation and deletion
+- Preserve pending local deletions during background reconciliation and avoid reconnecting for filesystem echoes of remote removals
+
+### Validation
+
+- Add worker, merge, persistence, journal, filesystem, and per-file status regression coverage
+- Exercise two independent engines with native filesystem watchers and real HTTP/WebSocket connections: simultaneous edits, restart, lost confirmation after commit, and repeated reconnects
+- Add a reproducible VS Code development-host runner for an explicitly selected test project, using normal SecretStorage authentication
+- Validate two clients against the self-hosted Overleaf project `proba`, including a 2.55 MB file and synchronization across periodic reconciliation; see `docs/SYNC_IMPLEMENTATION_2026-09-12.md`
+- Update jsdiff and the js-yaml override; `npm audit` reports no known vulnerabilities
+
+## [0.2.11] - 2026-09-11
+
+### Fixed
+
+- Keep recovering established sessions after prolonged outages, with increasing delays capped at 30 seconds and cancellation on workspace close or expired credentials
+- Check connection health every 30 seconds and reconcile document subscriptions every two minutes to recover silently missed document updates
+- Send optional cursor updates without acknowledgements so delayed presence cannot disconnect file synchronization
+- Let other files continue syncing while conflict, remote-deletion, or local-only-file notifications await a choice; revalidate revisions and identities before applying it
+- Resolve changes to just one copy automatically using the last synchronized hashes, including attachments, and recognize equivalent CRLF/LF document text
+- Treat Git and VS Code metadata as an empty workspace when linking; automatically download missing remote files without a Local/Remote choice
+- Preserve a recoverable socket after remote queue overflow, refresh cursor mappings on reconnect, and log disconnect reasons and periodic checks
+
+### Validation
+
+- Exercise ten disconnect/reconnect cycles and silent heartbeat expiry against real HTTP/WebSocket transports using the bundled Socket.IO client
+- Cover prolonged outages, missed subscriptions, unattended notifications, late conflict choices, empty Git folders, and Windows line endings with synchronization regression tests
+
 ## [0.2.10] - 2026-09-11
 
 ### Fixed

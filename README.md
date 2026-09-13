@@ -17,10 +17,13 @@ The idea is deliberately simple: write with the local tools you already like, an
 
 - Synchronize files in both directions with Overleaf and self-hosted Overleaf instances
 - Show and link remote projects from the VS Code sidebar
+- Create blank Overleaf projects directly from the sidebar or Command Palette
 - Sign in through an isolated Chrome or Edge window, with manual cookies as a fallback
 - Keep documents updated in real time
 - Show collaborators and jump to their cursor positions
 - Help resolve local and remote conflicts with a visual diff
+- Automatically merge independent edits in LaTeX, bibliography, and Markdown files
+- Recover synchronization baselines and pending document writes after restarting VS Code
 - Ignore build output and other generated files through `.leafignore`
 - Preview and remove ignored folders or files that exist only on Overleaf, while keeping local files
 - Work alongside LaTeX Workshop for local compilation and PDF preview
@@ -50,7 +53,17 @@ Contributions are welcome, whether they are code, documentation, bug reports, or
 1. Open the folder that should contain your local project.
 2. Run `LocalLeaf: Login`, choose your server and browser, then finish signing in in the isolated browser window.
 3. Choose a project from the LocalLeaf sidebar and link it to the folder.
-4. New remote files download automatically. If local and remote copies differ, choose which copy to keep in the conflict prompt.
+4. New remote files download automatically. Independent edits to supported text files merge automatically; overlapping changes remain available for review in the conflict prompt.
+
+To start a new project, click **Create New Project** in the Projects header or the linked project's **Tools** tab, or run `LocalLeaf: Create New Project`. Enter its name to create a blank project with `main.tex` on the linked project's server, or the default server when no project is linked. The result appears in the project list. The success notification can open it in Overleaf; if the current folder is unlinked, **Link This Folder** starts the normal linking flow. Creating a project leaves an existing workspace link in place.
+
+Automatic text merging supports `.tex`, `.bib`, `.md`, `.sty`, and `.cls`. It needs a previously synchronized ancestor and preserves whitespace. Files above 2 MiB and merges that exceed the processing budget require review. Binary attachments are never merged as text. Unsaved editor changes remain unsaved.
+
+Synchronization history is stored locally in VS Code's extension storage, separately for each server, project, and workspace. A copied or empty workspace starts by downloading the remote files. Connection interruptions recover automatically; a file conflict can remain pending while other files synchronize.
+
+Healthy sessions stay connected without periodic project refreshes or reconnections. Socket.IO's heartbeat detects a lost connection and starts recovery with increasing delays. Returning to VS Code after at least 30 seconds away also checks for missed changes, at most once per minute. `LocalLeaf: Sync Now` starts that reconciliation on demand. If a server silently omits an event while the connection remains healthy, returning to the window or running Sync Now catches it up.
+
+Dismissed or ignored prompts for unchanged local-only files stay quiet during that session's background checks. Changing those files or running `Sync Now` allows review again.
 
 > [!WARNING]
 > Your Overleaf cookies grant access to your account. Only send them to the real server you intend to use, check the URL carefully, and treat them like a password. LocalLeaf stores them in VS Code Secret Storage rather than inside the workspace. Use `LocalLeaf: Logout` if you suspect they were exposed.
@@ -66,6 +79,7 @@ Browser login uses a temporary, isolated Chromium profile and removes it after t
 | `LocalLeaf: Verify Credentials` | Checks whether the current session is still valid |
 | `LocalLeaf: Re-authenticate` | Opens the Account panel to replace an expired session |
 | `LocalLeaf: Link Folder to Overleaf Project` | Links the current folder to a project |
+| `LocalLeaf: Create New Project` | Creates a blank project on the selected server, with optional linking to the current unlinked folder |
 | `LocalLeaf: Unlink Folder` | Removes the local project link |
 | `LocalLeaf: Sync Now` | Starts a two-way synchronization |
 | `LocalLeaf: Pull from Overleaf` | Downloads the latest remote state |

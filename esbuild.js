@@ -3,20 +3,25 @@ const esbuild = require('esbuild');
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
 
-async function main() {
-    const context = await esbuild.context({
-        entryPoints: ['src/extension.ts'],
+function getBuildOptions() {
+    return {
+        absWorkingDir: __dirname,
+        entryPoints: { extension: 'src/extension.ts', textMergeWorker: 'src/sync/textMergeWorker.ts' },
         bundle: true,
         external: ['vscode'],
         format: 'cjs',
         platform: 'node',
         target: 'node18',
-        outfile: 'dist/extension.js',
+        outdir: 'dist',
         minify: production,
         sourcemap: !production,
         sourcesContent: false,
         logLevel: 'info',
-    });
+    };
+}
+
+async function main() {
+    const context = await esbuild.context(getBuildOptions());
 
     if (watch) {
         await context.watch();
@@ -28,7 +33,10 @@ async function main() {
     await context.dispose();
 }
 
-main().catch(error => {
-    console.error(error);
-    process.exit(1);
-});
+module.exports = { getBuildOptions };
+if (require.main === module) {
+    main().catch(error => {
+        console.error(error);
+        process.exitCode = 1;
+    });
+}

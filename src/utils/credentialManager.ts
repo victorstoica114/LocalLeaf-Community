@@ -138,14 +138,6 @@ export class CredentialManager {
     }
 
     /**
-     * Check if credentials exist for a server
-     */
-    async hasCredential(serverUrl: string): Promise<boolean> {
-        const credential = await this.getCredential(serverUrl);
-        return credential !== undefined;
-    }
-
-    /**
      * Get the default server URL
      */
     getDefaultServer(): string {
@@ -157,17 +149,4 @@ export class CredentialManager {
         }
     }
 
-    /**
-     * List all stored server URLs
-     */
-    async listServers(): Promise<string[]> {
-        // Note: VS Code SecretStorage doesn't provide a way to list all keys
-        // We'll need to maintain a separate list in globalState if needed
-        // For now, we'll just check the default server
-        const servers: string[] = [];
-        if (await this.hasCredential(DEFAULT_SERVER)) {
-            servers.push(DEFAULT_SERVER);
-        }
-        return servers;
-    }
 }

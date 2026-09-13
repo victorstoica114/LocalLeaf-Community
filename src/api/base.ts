@@ -10,12 +10,13 @@ import type { RequestInit, Response } from 'node-fetch';
 import { Identity } from '../utils/credentialManager';
 import { validateServerUrl } from '../utils/serverUrl';
 import { validateProjectEntityName } from '../utils/pathSafety';
+import { validateProjectName } from '../utils/projectName';
 import {
     MAX_REMOTE_FILE_BYTES,
     validateOverleafId,
     validateRemoteDocumentLines,
 } from '../utils/remoteValidation';
-import { httpErrorMessage } from '../utils/errorMessages';
+import { conciseErrorMessage, httpErrorMessage } from '../utils/errorMessages';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_API_RESPONSE_BYTES = 10 * 1024 * 1024;
@@ -464,8 +465,8 @@ export interface ResponseSchema {
 }
 
 export class BaseAPI {
-    private url: string;
-    private agent: http.Agent | https.Agent;
+    private readonly url: string;
+    private readonly agent: http.Agent | https.Agent;
     private identity?: Identity;
     private readonly activeRequests = new Set<AbortController>();
     private disposed = false;
@@ -488,6 +489,11 @@ export class BaseAPI {
         }
 
         const fetch = (await import('node-fetch')).default;
+        // Loading the HTTP module yields to disposal (for example when the user
+        // switches projects). Do not start a new request after that boundary.
+        if (this.disposed) {
+            throw new Error('Overleaf request cancelled because the sync session was closed.');
+        }
         const controller = new AbortController();
         this.activeRequests.add(controller);
         const timeout = setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS);
@@ -682,6 +688,11 @@ export class BaseAPI {
         location: string,
         currentRoute: 'project' | 'project/',
     ): 'project' | 'project/' | undefined {
+        const route = this.getProjectRedirectRoute(location);
+        return route !== currentRoute ? route : undefined;
+    }
+
+    private getProjectRedirectRoute(location: string): 'project' | 'project/' | undefined {
         try {
             const destination = new URL(location, this.url);
             const server = new URL(this.url);
@@ -695,9 +706,10 @@ export class BaseAPI {
                 return undefined;
             }
 
-            const canonicalRoute = currentRoute === 'project' ? 'project/' : 'project';
-            const canonicalPath = new URL(canonicalRoute, this.url).pathname;
-            return destination.pathname === canonicalPath ? canonicalRoute : undefined;
+            for (const route of ['project', 'project/'] as const) {
+                if (destination.pathname === new URL(route, this.url).pathname) return route;
+            }
+            return undefined;
         } catch {
             return undefined;
         }
@@ -799,17 +811,17 @@ export class BaseAPI {
             body: JSON.stringify({ _csrf: identity.csrfToken, email, password }),
         });
 
-        if (res.status === 302) {
-            const text = await res.text();
-            const redirect = boundedMessage(text.match(/Found. Redirecting to (.*)/)?.[1]);
-            if (redirect === '/project') {
+        if (isRedirectStatus(res.status)) {
+            const redirect = res.headers.get('location');
+            this.discardResponseBody(res);
+            if (redirect && this.getProjectRedirectRoute(redirect)) {
                 const newCookies = mergeCookieHeaders(identity.cookies, this.getResponseCookies(res));
                 if (!newCookies) return { type: 'error', message: 'Login returned no session cookie.' };
                 return this.cookiesLogin(newCookies);
             }
             return {
                 type: 'error',
-                message: redirect ? `Redirecting to ${redirect}` : 'Login returned an invalid redirect.',
+                message: 'Login did not redirect to the configured Overleaf project page.',
             };
         } else if (res.status === 200) {
             const json = asJsonObject(await res.json());
@@ -843,67 +855,29 @@ export class BaseAPI {
      * Reference: Overleaf-Workshop base.ts _initSocketV0
      */
     initSocket(identity: Identity, query?: string): SocketIOClient.Socket {
+        if (this.disposed) throw new Error('Overleaf sync session was closed.');
         const safeIdentity = validatedIdentity(identity);
-        const socketUrl = new URL(this.url).origin + (query ?? '');
+        const server = new URL(this.url);
+        const socketUrl = server.origin + (query ?? '');
 
         const io: SocketIOClientStatic = require('socket.io-client');
         const options: SocketIOClient.ConnectOpts & {
             reconnect: boolean;
             'force new connection': boolean;
+            resource: string;
             extraHeaders: Record<string, string>;
         } = {
             reconnect: false,
             'force new connection': true,
+            resource: `${server.pathname.replace(/^\/+|\/+$/g, '')}/socket.io`.replace(/^\//, ''),
             extraHeaders: {
-                'Origin': new URL(this.url).origin,
+                'Origin': server.origin,
                 'Cookie': safeIdentity.cookies,
             },
         };
         const socket = io.connect(socketUrl, options);
 
         return socket;
-    }
-
-    /**
-     * Generic HTTP request
-     */
-    private async request(
-        method: 'GET' | 'POST' | 'DELETE',
-        route: string,
-        body?: object,
-        extraHeaders?: object
-    ): Promise<ResponseSchema> {
-        if (!this.identity) {
-            return { type: 'error', message: 'Not authenticated' };
-        }
-
-        const headers: Record<string, string> = {
-            'Connection': 'keep-alive',
-            'Cookie': this.identity.cookies,
-            ...extraHeaders,
-        };
-
-        const fetchOptions: RequestInit = {
-            method,
-            headers,
-        };
-
-        if (method === 'POST' && body) {
-            headers['Content-Type'] = 'application/json';
-            fetchOptions.body = JSON.stringify({ _csrf: this.identity.csrfToken, ...body });
-        }
-
-        if (method === 'DELETE') {
-            headers['X-Csrf-Token'] = this.identity.csrfToken;
-        }
-
-        const res = await this.fetchRoute(route, fetchOptions);
-
-        if (res.status === 200 || res.status === 204) {
-            this.discardResponseBody(res);
-            return { type: 'success' };
-        }
-        return this.responseError(res);
     }
 
     /**
@@ -916,6 +890,9 @@ export class BaseAPI {
 
         const content: Buffer[] = [];
         let offset = 0;
+        let expectedTotal: number | undefined;
+        let expectedEtag: string | null = null;
+        let expectedLastModified: string | null = null;
 
         for (let requestCount = 0; requestCount < MAX_PARTIAL_DOWNLOADS; requestCount++) {
             const headers: Record<string, string> = {
@@ -924,6 +901,13 @@ export class BaseAPI {
             };
             if (offset > 0) {
                 headers.Range = `bytes=${offset}-`;
+                // A changed file must produce a fresh response, never bytes
+                // appended to a prefix downloaded from an older revision.
+                if (expectedEtag && !expectedEtag.startsWith('W/')) {
+                    headers['If-Range'] = expectedEtag;
+                } else if (expectedLastModified) {
+                    headers['If-Range'] = expectedLastModified;
+                }
             }
 
             const res = await this.fetchRoute(route, {
@@ -998,6 +982,20 @@ export class BaseAPI {
                 this.discardResponseBody(res);
                 throw new ApiHttpError('The Overleaf server returned an unsafe partial download range.');
             }
+
+            const etag = res.headers.get('etag');
+            const lastModified = res.headers.get('last-modified');
+            if (expectedTotal !== undefined && (
+                total !== expectedTotal
+                || (expectedEtag !== null && etag !== expectedEtag)
+                || (expectedLastModified !== null && lastModified !== expectedLastModified)
+            )) {
+                this.discardResponseBody(res);
+                throw new ApiHttpError('The remote file changed during its partial download.');
+            }
+            expectedTotal = total;
+            expectedEtag = etag;
+            expectedLastModified = lastModified;
 
             const chunk = await res.buffer();
             if (chunk.length !== end - start + 1) {
@@ -1091,6 +1089,70 @@ export class BaseAPI {
             return { type: 'success', projects };
         }
         return this.responseError(res);
+    }
+
+    /** Create one basic Overleaf project. An ambiguous POST must never be replayed. */
+    async createProject(projectName: string): Promise<ResponseSchema & {
+        projectId?: string;
+        creationUncertain?: boolean;
+    }> {
+        let name: string;
+        try {
+            name = validateProjectName(projectName);
+        } catch (error) {
+            return { type: 'error', message: conciseErrorMessage(error, 'Invalid project name.') };
+        }
+        if (this.disposed) return { type: 'error', message: 'Overleaf sync session was closed.' };
+        if (!this.identity) {
+            return { type: 'error', message: 'Not authenticated', authError: 'invalid_credentials' };
+        }
+        const uncertain = (message: string, httpStatus?: number) => ({
+            type: 'error' as const,
+            creationUncertain: true,
+            httpStatus,
+            message: `${message} Refresh the project list before creating another project.`,
+        });
+        let res: Response;
+        try {
+            res = await this.fetchRoute('project/new', {
+                method: 'POST',
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'Cookie': this.identity.cookies,
+                    'X-Csrf-Token': this.identity.csrfToken,
+                },
+                body: JSON.stringify({ projectName: name, template: 'blank', _csrf: this.identity.csrfToken }),
+            });
+        } catch (error) {
+            return uncertain(conciseErrorMessage(error, 'The project creation request did not complete.'));
+        }
+        if (!res.ok) {
+            const failure = await this.responseError(res);
+            return res.status === 408 || res.status >= 500
+                ? { ...failure, ...uncertain(failure.message || 'The server could not confirm project creation.', res.status) }
+                : failure;
+        }
+        let body: string;
+        try {
+            body = await res.text();
+        } catch {
+            return uncertain('The project creation response was interrupted.', res.status);
+        }
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(body) as unknown;
+        } catch {
+            if (looksLikeLoginPage(body)) {
+                return { type: 'error', message: 'Session expired', authError: 'session_expired', httpStatus: res.status };
+            }
+            return uncertain('Overleaf returned an invalid project creation response.', res.status);
+        }
+        const projectId = firstValidOverleafId('project ID', asJsonObject(parsed)?.project_id);
+        if (!projectId || /[\s\\/?#]/.test(projectId)) {
+            return uncertain('Overleaf did not confirm a valid ID for the new project.', res.status);
+        }
+        return { type: 'success', projectId };
     }
 
     /**
@@ -1289,10 +1351,25 @@ export class BaseAPI {
      * Delete an entity (doc, file, or folder)
      */
     async deleteEntity(projectId: string, entityType: string, entityId: string): Promise<ResponseSchema> {
-        return this.request(
-            'DELETE',
-            `project/${routeSegment(projectId, 'project ID')}/${entityRouteSegment(entityType)}/${routeSegment(entityId, 'entity ID')}`
+        if (!this.identity) {
+            return { type: 'error', message: 'Not authenticated' };
+        }
+        const res = await this.fetchRoute(
+            `project/${routeSegment(projectId, 'project ID')}/${entityRouteSegment(entityType)}/${routeSegment(entityId, 'entity ID')}`,
+            {
+                method: 'DELETE',
+                headers: {
+                    'Connection': 'keep-alive',
+                    'Cookie': this.identity.cookies,
+                    'X-Csrf-Token': this.identity.csrfToken,
+                },
+            },
         );
+        if (res.status === 200 || res.status === 204) {
+            this.discardResponseBody(res);
+            return { type: 'success' };
+        }
+        return this.responseError(res);
     }
 
     /**
@@ -1321,42 +1398,6 @@ export class BaseAPI {
             body: JSON.stringify({
                 _csrf: this.identity.csrfToken,
                 name: newName,
-            }),
-            });
-
-        if (res.status === 200 || res.status === 204) {
-            this.discardResponseBody(res);
-            return { type: 'success' };
-        }
-        return this.responseError(res);
-    }
-
-    /**
-     * Move an entity to another folder
-     */
-    async moveEntity(
-        projectId: string,
-        entityType: string,
-        entityId: string,
-        newParentFolderId: string
-    ): Promise<ResponseSchema> {
-        if (!this.identity) {
-            return { type: 'error', message: 'Not authenticated' };
-        }
-
-        validateOverleafId(newParentFolderId, 'parent folder ID');
-        const res = await this.fetchRoute(
-            `project/${routeSegment(projectId, 'project ID')}/${entityRouteSegment(entityType)}/${routeSegment(entityId, 'entity ID')}/move`, {
-            method: 'POST',
-            headers: {
-                'Connection': 'keep-alive',
-                'Cookie': this.identity.cookies,
-                'Content-Type': 'application/json',
-                'X-Csrf-Token': this.identity.csrfToken,
-            },
-            body: JSON.stringify({
-                _csrf: this.identity.csrfToken,
-                folder_id: newParentFolderId,
             }),
             });
 

@@ -4,10 +4,9 @@
  */
 
 import * as vscode from 'vscode';
-import { FolderEntity } from '../api/base';
 import { SocketIOAPI, OnlineUser, UserCursorUpdate } from '../api/socketio';
 import { SettingsManager } from '../utils/settingsManager';
-import { assertSafeWorkspacePath, joinProjectPath } from '../utils/pathSafety';
+import { assertSafeWorkspacePath } from '../utils/pathSafety';
 
 /**
  * User cursor colors - matches Overleaf's color palette
@@ -78,7 +77,6 @@ export class CursorTracker {
     private userIdToColor: Map<string, string> = new Map(); // Consistent colors per user ID
     private disposables: vscode.Disposable[] = [];
     private _publicId?: string;
-    private docIdToPath: Map<string, string> = new Map();
     private pendingLocalPosition?: { docId: string; row: number; column: number };
     private publishingLocalPosition = false;
     private initialized = false;
@@ -86,39 +84,16 @@ export class CursorTracker {
 
     constructor(
         private readonly socket: SocketIOAPI,
-        private readonly settings: SettingsManager
+        private readonly settings: SettingsManager,
+        private readonly fileTree: ReadonlyMap<string, { type: string; path: string }>,
     ) {
         this._publicId = socket.publicId;
-        this.buildDocIdToPathMap();
         this.registerHandlers();
     }
 
-    /**
-     * Build mapping from doc IDs to file paths
-     */
-    private buildDocIdToPathMap(): void {
-        // This will be populated by the sync engine
-        // For now, we'll get paths from the project tree
-        const project = this.socket.project;
-        if (project?.rootFolder?.[0]) {
-            this.traverseProject(project.rootFolder[0], '', true);
-        }
-    }
-
-    /**
-     * Traverse project tree to build doc ID to path mapping
-     */
-    private traverseProject(folder: FolderEntity, parentPath: string, isRoot: boolean = false): void {
-        // Root folder contents go directly to /, subfolders include their name
-        const folderPath = isRoot ? '/' : joinProjectPath(parentPath, folder.name, true);
-
-        for (const doc of folder.docs || []) {
-            this.docIdToPath.set(doc._id, joinProjectPath(folderPath, doc.name, false));
-        }
-
-        for (const subfolder of folder.folders || []) {
-            this.traverseProject(subfolder, folderPath, false);
-        }
+    private getDocumentPath(docId: string): string | undefined {
+        const entry = this.fileTree.get(docId);
+        return entry?.type === 'doc' ? entry.path : undefined;
     }
 
     /**
@@ -127,7 +102,16 @@ export class CursorTracker {
     private registerHandlers(): void {
         this.socket.registerHandlers({
             onConnected: (publicId) => {
+                if (this.disposed) return;
                 this._publicId = publicId;
+                // Presence identifiers belong to one socket session. Users
+                // who left while offline will not send us a disconnect event.
+                for (const user of this.users.values()) user.decoration.dispose();
+                this.users.clear();
+                this.userIdToColor.clear();
+                void this.loadConnectedUsers().catch(error => {
+                    if (!this.disposed) console.error('[LocalLeaf] Failed to refresh collaborators:', error);
+                });
             },
             onUserCursorUpdated: (update) => this.handleCursorUpdate(update),
             onUserDisconnected: (clientId) => this.handleUserDisconnected(clientId),
@@ -140,13 +124,7 @@ export class CursorTracker {
     async initialize(): Promise<void> {
         if (this.disposed || this.initialized) return;
         try {
-            const users = await this.socket.getConnectedUsers();
-            if (this.disposed || this.initialized) return;
-            for (const user of users) {
-                if (user.clientId !== this._publicId) {
-                    this.addOrUpdateUser(user);
-                }
-            }
+            await this.loadConnectedUsers();
         } catch (error) {
             if (!this.disposed) {
                 console.error('[LocalLeaf] Failed to get connected users:', error);
@@ -165,6 +143,15 @@ export class CursorTracker {
             vscode.window.onDidChangeVisibleTextEditors(() => this.refreshDecorations())
         );
         this.initialized = true;
+    }
+
+    private async loadConnectedUsers(): Promise<void> {
+        const publicId = this._publicId;
+        const users = await this.socket.getConnectedUsers();
+        if (this.disposed || this._publicId !== publicId) return;
+        for (const user of users) {
+            if (user.clientId !== publicId) this.addOrUpdateUser(user);
+        }
     }
 
     /**
@@ -217,7 +204,7 @@ export class CursorTracker {
             // Update existing user
             const oldDocPath = existing.docPath;
             existing.docId = user.docId;
-            existing.docPath = this.docIdToPath.get(user.docId);
+            existing.docPath = this.getDocumentPath(user.docId);
             existing.row = row;
             existing.column = column;
             existing.lastUpdated = lastUpdated;
@@ -257,7 +244,7 @@ export class CursorTracker {
                 name: user.name,
                 email: user.email,
                 docId: user.docId,
-                docPath: this.docIdToPath.get(user.docId),
+                docPath: this.getDocumentPath(user.docId),
                 row,
                 column,
                 lastUpdated,
@@ -275,6 +262,9 @@ export class CursorTracker {
      * Update decoration for a user
      */
     private updateDecoration(user: TrackedUser): void {
+        const currentPath = this.getDocumentPath(user.docId);
+        if (user.docPath && user.docPath !== currentPath) this.clearDecoration(user, user.docPath);
+        user.docPath = currentPath;
         if (!user.docPath) return;
 
         let uri: vscode.Uri;
@@ -292,7 +282,10 @@ export class CursorTracker {
             if (!Number.isSafeInteger(user.row) || !Number.isSafeInteger(user.column) || user.row < 0 || user.column < 0) {
                 return;
             }
-            if (user.row >= editor.document.lineCount) return;
+            if (user.row >= editor.document.lineCount) {
+                editor.setDecorations(user.decoration, []);
+                return;
+            }
             const lineLength = editor.document.lineAt(user.row).text.length;
             const column = Math.min(user.column, lineLength);
             const endColumn = Math.min(column + 1, lineLength);
@@ -397,8 +390,8 @@ export class CursorTracker {
 
         // Find doc ID for this path
         let docId: string | undefined;
-        for (const [id, path] of this.docIdToPath.entries()) {
-            if (path === relativePath) {
+        for (const [id, entry] of this.fileTree) {
+            if (entry.type === 'doc' && entry.path === relativePath) {
                 docId = id;
                 break;
             }
@@ -406,6 +399,7 @@ export class CursorTracker {
 
         if (docId) {
             const selection = event.selections[0];
+            if (!selection) return;
             try {
                 await this.queueLocalPosition(
                     docId,
@@ -419,17 +413,12 @@ export class CursorTracker {
     }
 
     /**
-     * Update doc ID to path mapping
-     */
-    updateDocMapping(docId: string, path: string): void {
-        if (this.disposed) return;
-        this.docIdToPath.set(docId, path);
-    }
-
-    /**
      * Get online users
      */
     getOnlineUsers(): TrackedUser[] {
+        for (const user of this.users.values()) {
+            if (user.docPath !== this.getDocumentPath(user.docId)) this.updateDecoration(user);
+        }
         return Array.from(this.users.values());
     }
 
@@ -444,6 +433,8 @@ export class CursorTracker {
      * Jump to a user's cursor position
      */
     async jumpToUser(clientId?: string): Promise<void> {
+        if (this.disposed) return;
+        this.refreshDecorations();
         let user: TrackedUser | undefined;
 
         if (clientId) {
@@ -468,6 +459,8 @@ export class CursorTracker {
             return;
         }
 
+        if (this.disposed) return;
+        if (user) user.docPath = this.getDocumentPath(user.docId);
         if (user && user.docPath) {
             try {
                 const uri = this.settings.getFilePath(user.docPath);
@@ -505,7 +498,6 @@ export class CursorTracker {
         }
         this.users.clear();
         this.userIdToColor.clear();
-        this.docIdToPath.clear();
         this.disposables.forEach(d => d.dispose());
         this.disposables = [];
     }

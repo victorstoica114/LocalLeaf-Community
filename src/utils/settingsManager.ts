@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
 import { CONFIG_DIR, SETTINGS_FILE, DEFAULT_SERVER, IGNORE_FILE } from '../consts';
 import {
     assertSafeWorkspacePath,
@@ -94,6 +95,8 @@ export class SettingsManager {
     private static instances: Map<string, SettingsManager> = new Map();
     private static currentWorkspaceFolder?: vscode.Uri;
     private settings?: ProjectSettings;
+    private mutationQueue: Promise<void> = Promise.resolve();
+    private readonly syncTargetChangeListeners = new Set<() => void>();
     private readonly configDir: vscode.Uri;
     private readonly settingsFile: vscode.Uri;
 
@@ -158,7 +161,8 @@ export class SettingsManager {
             await assertSafeWorkspacePath(workspaceFolder, settingsFile);
             const stat = await vscode.workspace.fs.stat(settingsFile);
             if (
-                !Number.isSafeInteger(stat.size)
+                (stat.type & vscode.FileType.File) === 0
+                || !Number.isSafeInteger(stat.size)
                 || stat.size < 0
                 || stat.size > MAX_PROJECT_SETTINGS_BYTES
             ) return undefined;
@@ -251,14 +255,21 @@ export class SettingsManager {
      * Load settings from disk
      */
     async load(): Promise<ProjectSettings | undefined> {
-        this.settings = await SettingsManager.loadSettings(this.workspaceFolder);
-        return this.settings;
+        return this.enqueueMutation(async () => {
+            this.replaceCachedSettings(await SettingsManager.loadSettings(this.workspaceFolder));
+            return this.settings;
+        });
     }
 
     /**
      * Save settings to disk
      */
     async save(settings: ProjectSettings): Promise<void> {
+        const snapshot = { ...settings };
+        await this.enqueueMutation(() => this.saveSettings(snapshot));
+    }
+
+    private async saveSettings(settings: ProjectSettings): Promise<void> {
         const canonicalSettings: ProjectSettings = {
             ...settings,
             serverUrl: validateServerUrl(settings.serverUrl).url,
@@ -272,32 +283,55 @@ export class SettingsManager {
 
         await assertSafeWorkspacePath(this.workspaceFolder, this.settingsFile);
         const content = new TextEncoder().encode(JSON.stringify(canonicalSettings, null, 2));
-        await vscode.workspace.fs.writeFile(this.settingsFile, content);
-        this.settings = canonicalSettings;
-        SettingsManager.setCurrentWorkspaceFolder(this.workspaceFolder);
+        if (content.byteLength > MAX_PROJECT_SETTINGS_BYTES) {
+            throw new Error('LocalLeaf project settings exceed the size limit.');
+        }
+        // Publish complete JSON in one rename so the watcher never observes a
+        // partially written configuration and tears down a healthy session.
+        const temporaryFile = vscode.Uri.joinPath(
+            this.configDir, `${SETTINGS_FILE}.${randomBytes(12).toString('hex')}.tmp`,
+        );
+        try {
+            await assertSafeWorkspacePath(this.workspaceFolder, temporaryFile);
+            await vscode.workspace.fs.writeFile(temporaryFile, content);
+            await assertSafeWorkspacePath(this.workspaceFolder, this.settingsFile);
+            await vscode.workspace.fs.rename(temporaryFile, this.settingsFile, { overwrite: true });
+        } finally {
+            try {
+                await vscode.workspace.fs.delete(temporaryFile, { recursive: false });
+            } catch (error) {
+                if (!isFileNotFoundError(error)) throw error;
+            }
+        }
+        this.replaceCachedSettings(canonicalSettings);
     }
 
     /**
      * Update partial settings
      */
     async update(partial: Partial<ProjectSettings>): Promise<void> {
-        const current = await this.load();
-        if (current) {
-            await this.save({ ...current, ...partial });
-        }
+        const snapshot = { ...partial };
+        await this.enqueueMutation(async () => {
+            const current = await SettingsManager.loadSettings(this.workspaceFolder);
+            if (current) await this.saveSettings({ ...current, ...snapshot });
+        });
     }
 
     /**
      * Delete settings (unlink folder)
      */
     async delete(): Promise<void> {
+        await this.enqueueMutation(() => this.deleteSettings());
+    }
+
+    private async deleteSettings(): Promise<void> {
         try {
             await assertSafeWorkspacePath(this.workspaceFolder, this.settingsFile);
             await vscode.workspace.fs.delete(this.settingsFile, { recursive: false });
         } catch (error) {
             if (!isFileNotFoundError(error)) throw error;
         }
-        this.settings = undefined;
+        this.replaceCachedSettings(undefined);
 
         // `.localleaf` may contain state created by an older release or files
         // owned by the user. Unlinking removes only this extension's settings;
@@ -320,6 +354,22 @@ export class SettingsManager {
         return this.settings;
     }
 
+    /** Stop sessions synchronously before a different server/project becomes visible. */
+    onWillChangeSyncTarget(listener: () => void): vscode.Disposable {
+        this.syncTargetChangeListeners.add(listener);
+        return { dispose: () => { this.syncTargetChangeListeners.delete(listener); } };
+    }
+
+    private replaceCachedSettings(settings: ProjectSettings | undefined): void {
+        if (
+            this.settings?.serverUrl !== settings?.serverUrl
+            || this.settings?.projectId !== settings?.projectId
+        ) {
+            for (const listener of this.syncTargetChangeListeners) listener();
+        }
+        this.settings = settings;
+    }
+
     /**
      * Get the workspace folder URI
      */
@@ -327,11 +377,11 @@ export class SettingsManager {
         return this.workspaceFolder;
     }
 
-    /**
-     * Get the config directory URI
-     */
-    getConfigDir(): vscode.Uri {
-        return this.configDir;
+    private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+        const pending = this.mutationQueue.then(operation);
+        // A failed save must not prevent subsequent reload, repair, or unlink.
+        this.mutationQueue = pending.then(() => undefined, () => undefined);
+        return pending;
     }
 
     /**

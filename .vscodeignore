@@ -4,6 +4,7 @@
 .github/**
 .localleaf/**
 .leafignore
+main.tex
 .mailmap
 docs/**
 !docs/CONTRIBUTOR_INTEGRATION.md
@@ -13,6 +14,7 @@ out/**
 node_modules/**
 dist/**
 !dist/extension.js
+!dist/textMergeWorker.js
 images/*.svg
 !images/icon.svg
 images/status-bar.png

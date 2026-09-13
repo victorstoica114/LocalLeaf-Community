@@ -1,5 +1,7 @@
+import { runStandaloneTest } from './standaloneRunner';
 /** Regression tests for the seven 2026-09-06 audit findings. Runs in its own process. */
 export {};
+import { createTemporaryWorkspace, cleanTemporaryWorkspaces } from './temporaryWorkspace';
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const Module = require('node:module');
@@ -61,10 +63,11 @@ const memoryFs = {
 const vscode = {
     EventEmitter, FileSystemError, FileType: { File: 1, Directory: 2, SymbolicLink: 64 },
     Uri: { joinPath: (base: ReturnType<typeof uri>, ...parts: string[]) => uri(path.win32.join(base.fsPath, ...parts)) },
-    workspace: { fs: memoryFs, textDocuments: [] as Array<{ uri: ReturnType<typeof uri>; isDirty: boolean }> },
+    workspace: { fs: memoryFs, textDocuments: [] as Array<{ uri: ReturnType<typeof uri>; isDirty: boolean }>,
+        getConfiguration: () => ({ get: () => true }) },
     window: {
         async showWarningMessage(...args: unknown[]) { prompts.push(args); promptHandler?.(); return promptChoice; },
-        async showInformationMessage(...args: unknown[]) { prompts.push(args); return undefined; },
+        async showInformationMessage(...args: unknown[]): Promise<string | undefined> { prompts.push(args); return undefined; },
     },
 };
 const originalLoad = Module._load;
@@ -75,6 +78,8 @@ const { SyncEngine } = require('../sync/syncEngine');
 const { BaseAPI } = require('../api/base');
 const { SocketIOAPI } = require('../api/socketio');
 Module._load = originalLoad;
+const createdEngines = new Set<any>();
+const createdStores = new Set<any>();
 
 function fixture(documentName = 'main.tex') {
     disk = new Map([[key(uri(rootPath)), { type: 2 }]]);
@@ -113,6 +118,8 @@ function fixture(documentName = 'main.tex') {
             return project;
         },
         disconnect() { socket.isConnected = false; subscriptions.clear(); },
+        resetConnection() { socket.isConnected = false; subscriptions.clear(); },
+        async checkConnection() { if (!socket.isConnected) throw new Error('Disconnected'); },
         async joinDoc(id: string) {
             subscriptions.add(id);
             return { lines: server.get(id)!.text.split('\n'), version: server.get(id)!.version };
@@ -132,6 +139,16 @@ function fixture(documentName = 'main.tex') {
         },
     };
     const engine: any = new SyncEngine(api, settings);
+    createdEngines.add(engine);
+    const scheduled: Array<() => Promise<void>> = [];
+    engine.scheduleOperation = (operation: () => Promise<void>) => scheduled.push(operation);
+    const flushScheduled = async () => {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        for (let count = 0; scheduled.length; count++) {
+            assert.ok(count < 20, 'background work must converge');
+            await scheduled.shift()!();
+        }
+    };
     engine.project = project;
     engine.buildFileTree(project);
     engine.socket = socket;
@@ -144,7 +161,7 @@ function fixture(documentName = 'main.tex') {
     };
     baseline('/' + documentName, 'A');
     engine.setDocumentSnapshot('doc', { content: bytes('A'), version: 1 });
-    return { engine, server, project, settings, api, socket, subscriptions, put, read, baseline, refreshCount: () => refreshCount };
+    return { engine, server, project, settings, api, socket, subscriptions, put, read, baseline, scheduled, flushScheduled, refreshCount: () => refreshCount };
 }
 
 const remoteUpdate = (version: number, position: number, insert: string) => ({
@@ -230,6 +247,7 @@ async function testAutomaticConflicts(): Promise<void> {
         f.engine.applyToAll = true;
         f.engine.conflictResolution = 'useLocal';
         await f.engine.handleLocalFileChange(f.settings.getFilePath('/main.tex'));
+        await f.flushScheduled();
         assert.equal(prompts.length, 1, 'F2: concurrent changes require a conflict decision');
         assert.equal(f.server.get('doc')!.text, choice === 'Local' ? 'A-local' : 'A-remote');
         assert.equal(f.read('/main.tex'), choice === 'Remote' ? 'A-remote' : 'A-local');
@@ -283,6 +301,7 @@ async function testSafeRemoteDeletion(): Promise<void> {
         const f = deletionFixture();
         promptChoice = choice;
         await f.engine.handleRemoteFileRemoved('folder');
+        await f.flushScheduled();
         assert.equal(f.read('/chapter/chapter.tex'), choice ? undefined : 'unsynchronized local work');
         assert.equal(f.read('/chapter/private-notes.txt'), 'only local', 'F3: never delete local-only files');
         assert.equal(f.read('/chapter/generated.aux'), 'ignored file', 'F3: never delete excluded descendants');
@@ -293,6 +312,7 @@ async function testSafeRemoteDeletion(): Promise<void> {
     promptChoice = 'Delete Modified Copies';
     promptHandler = () => race.put('/chapter/chapter.tex', 'saved during the prompt');
     await race.engine.handleRemoteFileRemoved('folder');
+    await race.flushScheduled();
     assert.equal(race.read('/chapter/chapter.tex'), 'saved during the prompt');
 
     const dirty = fixture();
@@ -317,6 +337,7 @@ async function testSafeRemoteDeletion(): Promise<void> {
         }
         assert.equal(f.read('/chapter/private-notes.txt'), 'only local', `${operation} into an excluded path must preserve local-only files`);
         assert.equal(f.read('/chapter/chapter.tex'), 'unsynchronized local work');
+        await f.flushScheduled();
         assert.equal(f.engine.status, 'idle');
     }
 }
@@ -343,8 +364,8 @@ async function testPullSubscriptionsAndTree(): Promise<void> {
     let orphaned: string[] = [];
     http.engine.handleOrphanedLocalFiles = async (paths: string[]) => { orphaned = paths; };
     await http.engine.pullAll();
-    assert.deepEqual(orphaned, ['/new.tex'], 'preserve the old baseline to detect remote deletions');
-    assert.equal(http.read('/new.tex'), 'new remote content', 'remote deletions in HTTP mode still require a choice');
+    assert.deepEqual(orphaned, [], 'unchanged local copies can follow an authoritative remote deletion');
+    assert.equal(http.read('/new.tex'), undefined, 'the common baseline authorizes deleting the unchanged local copy');
 
     const unavailable = fixture();
     unavailable.engine.api = { getProjectDetails: async () => ({ type: 'success', projectData: {} }) };
@@ -355,6 +376,24 @@ async function testPullSubscriptionsAndTree(): Promise<void> {
     unavailable.engine.socket = undefined;
     await assert.rejects(() => unavailable.engine.pullAll(), /no folder tree/,
         'an HTTP session cannot claim success using an unrefreshable tree');
+
+    const refreshed = fixture();
+    refreshed.engine.api = { ...refreshed.api, getProjectDetails: async () => ({ type: 'success', projectData: {} }) };
+    await refreshed.engine.joinAllDocsForWatching();
+    (refreshed.socket as any).refreshProject = async () => {
+        refreshed.server.set('doc', { text: 'Edited during tree refresh', version: 2 });
+        return refreshed.project;
+    };
+    await refreshed.engine.refreshProjectFileTree();
+    assert.equal(refreshed.engine.joinedDocs.has('doc'), true, 'isolated tree snapshots must preserve the primary document rooms');
+    refreshed.engine.lastFocusReconciliation = 0;
+    await refreshed.engine.reconcileOnWindowFocus();
+    assert(refreshed.subscriptions.has('doc'), 'focus catch-up keeps document subscriptions active');
+    assert.equal(refreshed.read('/main.tex'), 'Edited during tree refresh', 'edits missed during a tree refresh must also be applied');
+    refreshed.server.set('doc', { text: 'Edited during tree refresh!', version: 3 });
+    await refreshed.engine.handleRemoteFileChanged(remoteUpdate(2, 'Edited during tree refresh'.length, '!'));
+    assert.equal(refreshed.read('/main.tex'), 'Edited during tree refresh!', 'later live events still converge');
+    refreshed.engine.disconnect();
 }
 
 async function suppressExpectedError(operation: () => Promise<void>): Promise<void> {
@@ -376,6 +415,7 @@ async function testAutomaticPullRecovery(): Promise<void> {
     };
     f.put('/main.tex', 'local draft');
     f.engine.askConflictResolution = async () => 'skip';
+    f.server.set('doc', { text: 'remote draft', version: 2 });
     f.socket.joinDoc = async id => {
         if (++reads === 1) {
             f.engine.enqueueRemoteEvent(async (isCurrent: () => boolean) => {
@@ -703,7 +743,8 @@ async function testUploadRetryAndTransformation(): Promise<void> {
         };
         await transformed.engine.handleLocalFileChange(transformed.settings.getFilePath('/main.tex'));
         assert.equal(transformed.read('/main.tex'), newerLocalSave ? 'A-newer-local' : 'A-local-remote');
-        assert.equal(Buffer.from(transformed.engine.baseContent.get('/main.tex')).toString(), newerLocalSave ? 'A-local' : 'A-local-remote');
+        assert.equal(Buffer.from(transformed.engine.baseContent.get('/main.tex')).toString(), newerLocalSave ? 'A' : 'A-local-remote',
+            'an overlapping newer save must keep the previous common ancestor until the conflict is resolved');
     }
 }
 
@@ -882,14 +923,577 @@ async function testRestoredRootFiles(): Promise<void> {
     initial.engine.disconnect();
 }
 
+async function within<T>(operation: Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout;
+    try {
+        return await Promise.race([operation, new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Synchronization remained blocked')), 2000);
+        })]);
+    } finally { clearTimeout(timer!); }
+}
+
+async function testPersistentRecovery(): Promise<void> {
+    const f = fixture();
+    const delays: number[] = [];
+    f.engine.waitForRetry = async (delay: number) => { delays.push(delay); return !f.engine.disposed; };
+    f.socket.isConnected = false;
+    let attempts = 0;
+    const reconnect = f.socket.reconnect.bind(f.socket);
+    f.socket.reconnect = async () => {
+        if (++attempts <= 8) throw new Error('HTTP 503: gateway temporarily unavailable');
+        return reconnect();
+    };
+    f.server.set('doc', { text: 'changed during outage', version: 2 });
+    f.engine.scheduleAutomaticRecovery();
+    f.engine.scheduleAutomaticRecovery();
+    assert.equal(f.scheduled.length, 1);
+    await within(f.flushScheduled());
+    assert.equal(attempts, 9, 'recovery must continue beyond the old three-attempt limit');
+    assert.ok(delays.includes(5000) && delays.includes(10000));
+    assert.ok(delays.every(delay => delay <= 30_000));
+    assert.equal(f.read('/main.tex'), 'changed during outage');
+    assert.ok(f.subscriptions.has('doc'));
+    assert.equal(prompts.length, 0, 'remote-only changes after an outage need no Local/Remote choice');
+
+    for (let cycle = 0; cycle < 5; cycle++) {
+        f.put('/main.tex', `local edit ${cycle}`);
+        f.socket.isConnected = false;
+        f.engine.scheduleAutomaticRecovery();
+        await within(f.flushScheduled());
+        assert.equal(f.server.get('doc')!.text, `local edit ${cycle}`);
+        const doc = f.server.get('doc')!;
+        doc.text += '!';
+        doc.version++;
+        await f.engine.handleRemoteFileChanged(remoteUpdate(doc.version - 1, doc.text.length - 1, '!'));
+        assert.equal(f.read('/main.tex'), `local edit ${cycle}!`);
+    }
+    assert.equal(f.engine.status, 'idle');
+    f.engine.disconnect();
+
+    const auth = fixture();
+    auth.socket.isConnected = false;
+    let authAttempts = 0;
+    auth.socket.reconnect = async () => { authAttempts++; throw new Error('Session expired'); };
+    auth.engine.scheduleAutomaticRecovery();
+    await auth.flushScheduled();
+    auth.engine.scheduleAutomaticRecovery();
+    assert.equal(authAttempts, 1);
+    assert.equal(auth.scheduled.length, 0, 'expired credentials must stop unattended recovery');
+    auth.engine.disconnect();
+
+    const closed = fixture();
+    closed.socket.isConnected = false;
+    closed.socket.reconnect = async () => { throw new Error('HTTP 503'); };
+    closed.engine.waitForRetry = async (delay: number) => {
+        if (delay >= 5000) closed.engine.disconnect();
+        return !closed.engine.disposed;
+    };
+    closed.engine.scheduleAutomaticRecovery();
+    await within(closed.flushScheduled());
+    assert.equal(closed.engine.automaticRecoveryScheduled, false);
+    assert.equal(closed.engine.status, 'disconnected');
+}
+
+async function testUnattendedConflicts(): Promise<void> {
+    const showWarning = vscode.window.showWarningMessage;
+    const f = fixture();
+    let resolveChoice!: (value: string | undefined) => void;
+    vscode.window.showWarningMessage = async (...args) => {
+        prompts.push(args);
+        return new Promise<string | undefined>(resolve => { resolveChoice = resolve; });
+    };
+    try {
+        f.put('/main.tex', 'local work');
+        f.server.set('doc', { text: 'remote work', version: 2 });
+        f.project.rootFolder[0].docs.push({ _id: 'other', name: 'other.tex' });
+        f.server.set('other', { text: 'other remote work', version: 2 });
+        f.baseline('/other.tex', 'other');
+        await within(f.engine.pullAll());
+        assert.equal(f.read('/main.tex'), 'local work');
+        assert.equal(f.read('/other.tex'), 'other remote work');
+        assert.equal(f.engine.status, 'error', 'unresolved conflicts must not appear Up to date');
+        assert.equal(f.engine.syncLock.size, 0, 'a notification must not retain the workspace lock');
+
+        f.server.set('other', { text: 'other remote work!', version: 3 });
+        f.engine.enqueueRemoteEvent(() => f.engine.handleRemoteFileChanged({
+            doc: 'other', v: 2, op: [{ p: 17, i: '!' }],
+        }));
+        await within(f.engine.remoteEventQueue);
+        assert.equal(f.read('/other.tex'), 'other remote work!');
+        f.put('/other.tex', 'local change while a notification is open');
+        await within(f.engine.handleLocalFileChange(f.settings.getFilePath('/other.tex')));
+        assert.equal(f.server.get('other')!.text, 'local change while a notification is open');
+        resolveChoice('Remote');
+        await within(f.flushScheduled());
+        assert.equal(f.read('/main.tex'), 'remote work', 'the choice must be applied automatically after the earlier pull');
+        assert.equal(f.engine.status, 'idle');
+
+        f.put('/main.tex', 'second local draft');
+        f.server.set('doc', { text: 'second remote draft', version: 3 });
+        await within(f.engine.pullAll());
+        f.put('/main.tex', 'newer local edits after notification');
+        resolveChoice('Remote');
+        await within(f.flushScheduled());
+        assert.equal(f.read('/main.tex'), 'newer local edits after notification',
+            'an earlier approval must not overwrite a newer local revision');
+        resolveChoice(undefined);
+    } finally {
+        f.engine.disconnect();
+        vscode.window.showWarningMessage = showWarning;
+    }
+}
+
+async function testInitialAndUnilateralSync(): Promise<void> {
+    const empty = fixture();
+    disk.delete(key(empty.settings.getFilePath('/main.tex')));
+    empty.engine.clearBaseContent();
+    empty.engine.fileCache.clear();
+    disk.set(key(empty.settings.getFilePath('/.git')), { type: 2 });
+    empty.put('/.git/config', 'git metadata');
+    await empty.engine.pullAll();
+    assert.equal(empty.read('/main.tex'), 'A');
+    assert.equal(prompts.length, 0, 'an empty Git repository must download automatically');
+    empty.engine.disconnect();
+
+    const windows = fixture();
+    windows.engine.clearBaseContent();
+    windows.put('/main.tex', 'line one\r\nline two\r\n');
+    windows.server.set('doc', { text: 'line one\nline two\n', version: 1 });
+    await windows.engine.pullAll();
+    assert.equal(prompts.length, 0, 'CRLF/LF differences are not conflicting edits');
+    assert.equal(windows.read('/main.tex'), 'line one\nline two\n');
+    windows.engine.disconnect();
+
+    const attachment = fixture();
+    attachment.project.rootFolder[0].fileRefs.push({ _id: 'pdf', name: 'figure.pdf' });
+    let remote = bytes('PDF before change');
+    (attachment.api as any).getFile = async () => ({ type: 'success', content: remote });
+    await attachment.engine.pullAll();
+    remote = bytes('PDF after change');
+    await attachment.engine.pullAll();
+    assert.equal(attachment.read('/figure.pdf'), 'PDF after change');
+    assert.equal(prompts.length, 0, 'unchanged local attachments must accept remote changes without a conflict');
+    attachment.engine.disconnect();
+}
+
+async function testUnattendedFileChoices(): Promise<void> {
+    const warning = vscode.window.showWarningMessage;
+    const information = vscode.window.showInformationMessage;
+    let resolveChoice!: (choice: string | undefined) => void;
+    const prompt = async (...args: unknown[]) => {
+        prompts.push(args);
+        return new Promise<string | undefined>(resolve => { resolveChoice = resolve; });
+    };
+    try {
+        vscode.window.showWarningMessage = prompt;
+        const removed = deletionFixture();
+        await within(removed.engine.handleRemoteFileRemoved('folder'));
+        assert.equal(removed.read('/chapter/safe.tex'), undefined);
+        assert.equal(removed.engine.syncLock.size, 0);
+        removed.put('/main.tex', 'save during a deletion notification');
+        await within(removed.engine.handleLocalFileChange(removed.settings.getFilePath('/main.tex')));
+        assert.equal(removed.server.get('doc')!.text, 'save during a deletion notification');
+        removed.put('/chapter/chapter.tex', 'new edits after notification');
+        resolveChoice('Delete Modified Copies');
+        await removed.flushScheduled();
+        assert.equal(removed.read('/chapter/chapter.tex'), 'new edits after notification');
+        removed.engine.disconnect();
+
+        const orphan = fixture();
+        orphan.baseline('/orphan.tex', 'common ancestor');
+        orphan.put('/orphan.tex', 'local orphan');
+        await within(orphan.engine.pullAll());
+        assert.equal(orphan.engine.syncLock.size, 0);
+        // A restore arriving before the deletion choice must invalidate it.
+        orphan.project.rootFolder[0].docs.push({ _id: 'restored', name: 'orphan.tex' });
+        orphan.server.set('restored', { text: 'local orphan', version: 1 });
+        orphan.engine.buildFileTree(orphan.project);
+        resolveChoice('Delete Locally');
+        await orphan.flushScheduled();
+        assert.equal(orphan.read('/orphan.tex'), 'local orphan');
+        orphan.engine.disconnect();
+
+        vscode.window.showInformationMessage = prompt;
+        const localOnly = fixture();
+        localOnly.put('/new.tex', 'local only');
+        await within(localOnly.engine.pullAll());
+        assert.equal(localOnly.engine.syncLock.size, 0);
+        localOnly.server.set('doc', { text: 'A!', version: 2 });
+        localOnly.engine.enqueueRemoteEvent(() => localOnly.engine.handleRemoteFileChanged(remoteUpdate(1, 1, '!')));
+        await within(localOnly.engine.remoteEventQueue);
+        assert.equal(localOnly.read('/main.tex'), 'A!');
+        resolveChoice('Ignore');
+        await localOnly.flushScheduled();
+        localOnly.engine.disconnect();
+    } finally {
+        vscode.window.showWarningMessage = warning;
+        vscode.window.showInformationMessage = information;
+    }
+}
+
+async function testEventDrivenRecovery(): Promise<void> {
+    const f = fixture();
+    let healthProbes = 0;
+    f.socket.checkConnection = async () => { healthProbes++; };
+    f.engine.lastFocusReconciliation = 0;
+    f.server.set('doc', { text: 'edit missed while the window was inactive', version: 2 });
+    f.project.rootFolder[0].docs.push({ _id: 'restored', name: 'restored.tex' });
+    f.server.set('restored', { text: 'restored on the server', version: 1 });
+    await f.engine.reconcileOnWindowFocus();
+    assert.equal(f.read('/main.tex'), 'edit missed while the window was inactive');
+    assert.equal(f.read('/restored.tex'), 'restored on the server');
+    assert.ok(f.subscriptions.has('doc'));
+    const refreshes = f.refreshCount();
+    await f.engine.reconcileOnWindowFocus();
+    assert.equal(f.refreshCount(), refreshes, 'repeated focus events must share the catch-up cooldown');
+    assert.equal(healthProbes, 0, 'normal operation uses transport heartbeat, not recurring liveness RPCs');
+    assert.equal(f.engine.pendingWaits.size, 0, 'healthy sessions must not install a periodic retry loop');
+    f.socket.isConnected = false;
+    f.engine.lastFocusReconciliation = 0;
+    await f.engine.reconcileOnWindowFocus();
+    await f.flushScheduled();
+    assert.ok(f.socket.isConnected && f.subscriptions.has('doc'), 'an actual lost connection still recovers');
+    f.engine.disconnect();
+
+    const failedFile = fixture();
+    let attempts = 0;
+    failedFile.engine.pullAll = async () => { attempts++; throw new Error('Local disk is read-only'); };
+    failedFile.engine.scheduleAutomaticRecovery();
+    await failedFile.flushScheduled();
+    assert.equal(attempts, 1, 'a file error cannot be repaired by repeatedly retrying a healthy connection');
+    assert.equal(failedFile.engine.recoveryRequired, false);
+    failedFile.engine.disconnect();
+
+    const missed = fixture();
+    missed.engine.joinedDocs.add('doc');
+    missed.subscriptions.clear();
+    missed.server.set('doc', { text: 'remote edit with no delivered event', version: 2 });
+    await missed.engine.checkDocumentSubscriptions();
+    assert.equal(missed.read('/main.tex'), 'remote edit with no delivered event');
+    assert.ok(missed.subscriptions.has('doc'), 'event-triggered reconciliation renews a lost document room');
+    missed.put('/main.tex', 'local draft while the server has no new change');
+    await missed.engine.checkDocumentSubscriptions();
+    assert.equal(missed.read('/main.tex'), 'local draft while the server has no new change');
+    assert.equal(prompts.length, 0, 'an unchanged snapshot must not conflict with a local draft');
+    missed.engine.disconnect();
+}
+
+async function testThreeWayMerge(): Promise<void> {
+    const { mergeText, textOperations } = require('../sync/textMerge');
+    const ancestor = 'first\nunchanged\nlast\n';
+    const unknown = fixture();
+    unknown.engine.deleteBaseContent('/main.tex');
+    unknown.engine.fileCache.delete('/main.tex');
+    unknown.put('/main.tex', 'Saved local content without an ancestor');
+    unknown.server.set('doc', { text: 'Different remote content', version: 2 });
+    unknown.engine.askConflictResolution = async () => 'skip';
+    await unknown.engine.handleRemoteFileChanged({ doc: 'doc', v: 2 });
+    assert.equal(unknown.read('/main.tex'), 'Saved local content without an ancestor');
+    assert.equal(unknown.engine.getBaseHashes().has('/main.tex'), false, 'skipping an unknown ancestor conflict cannot grant overwrite authority');
+    unknown.engine.disconnect();
+    const unchangedSave = fixture();
+    unchangedSave.server.set('doc', { text: 'Remote change only', version: 2 });
+    unchangedSave.engine.fileCache.delete('/main.tex'); // a repeated filesystem hint
+    await unchangedSave.engine.handleLocalFileChange(unchangedSave.settings.getFilePath('/main.tex'));
+    assert.equal(unchangedSave.read('/main.tex'), 'Remote change only');
+    assert.equal(unchangedSave.server.get('doc')!.text, 'Remote change only');
+    unchangedSave.engine.disconnect();
+    for (const trigger of ['push', 'pull', 'event']) {
+        const f = fixture();
+        f.baseline('/main.tex', ancestor);
+        f.put('/main.tex', 'FIRST\nunchanged\nlast\n');
+        f.server.set('doc', { text: 'first\nunchanged\nLAST\n', version: 2 });
+        if (trigger === 'push') await f.engine.handleLocalFileChange(f.settings.getFilePath('/main.tex'));
+        if (trigger === 'pull') await f.engine.pullAll(false);
+        if (trigger === 'event') await f.engine.handleRemoteFileChanged({ doc: 'doc', v: 1 });
+        assert.equal(f.read('/main.tex'), 'FIRST\nunchanged\nLAST\n', trigger);
+        assert.equal(f.server.get('doc')!.text, f.read('/main.tex'), trigger + ' must converge');
+        assert.equal(prompts.length, 0, 'independent edits need no prompt');
+        f.engine.disconnect();
+    }
+    const cases = [
+        ['\uFEFFa\nkeep\nz', '\uFEFFA\nkeep\nz', '\uFEFFa\nkeep\nZ', '\uFEFFA\nkeep\nZ'],
+        ['a\r\nkeep\r\nz', 'A\r\nkeep\r\nz', 'a\r\nkeep\r\nZ', 'A\r\nkeep\r\nZ'],
+        ['🙂\n\tkeep  \nlast\n', '🚀\n\tkeep  \nlast\n', '🙂\n\tkeep  \nLAST\n', '🚀\n\tkeep  \nLAST\n'],
+        ['a\nb\nc\n', 'A\nb\nc\n', 'A\nb\nc\n', 'A\nb\nc\n'],
+    ];
+    for (const [base, local, remote, expected] of cases) {
+        const result = await mergeText(bytes(base), bytes(local), bytes(remote));
+        assert.equal(result.clean, true);
+        assert.equal(Buffer.from(result.content).toString(), expected);
+    }
+    assert.equal((await mergeText(undefined, bytes('local'), bytes('remote'))).clean, false);
+    assert.equal((await mergeText(bytes(''), bytes('local'), bytes('remote'))).clean, false);
+    assert.equal((await mergeText(bytes('a\n'), bytes(''), bytes('A\n'))).clean, false, 'delete versus edit is a conflict');
+    assert.equal((await mergeText(bytes('same\n'.repeat(10000)), bytes('X\n' + 'same\n'.repeat(10000)),
+        bytes('same\n'.repeat(10000) + 'Y\n'), 20)).clean, false, 'repeated lines have a hard worker deadline');
+    const original = '🙂 start\nkeep this middle intact\nlast\n';
+    const wanted = '🙂 START\nkeep this middle intact\nLAST\n';
+    let value = original;
+    const ops = textOperations(original, wanted);
+    assert.ok(ops.length >= 4, 'separate edits should not delete the unchanged middle');
+    for (const op of ops) {
+        if (op.d) {
+            assert.equal(value.slice(op.p, op.p + op.d.length), op.d);
+            assert.ok(!op.d.includes('keep this middle'));
+            value = value.slice(0, op.p) + value.slice(op.p + op.d.length);
+        }
+        if (op.i) value = value.slice(0, op.p) + op.i + value.slice(op.p);
+    }
+    assert.equal(value, wanted, 'positions must use UTF-16 offsets');
+    assert.deepEqual(textOperations('', 'x'.repeat(20000)), [{ p: 0, i: 'x'.repeat(20000) }]);
+
+    const pending = fixture();
+    const pendingBase = 'first\nseparator\nmiddle\nseparator\nlast\n';
+    pending.baseline('/main.tex', pendingBase);
+    pending.server.set('doc', { text: pendingBase, version: 1 });
+    pending.put('/main.tex', 'FIRST\nseparator\nmiddle\nseparator\nlast\n');
+    const apply = pending.socket.applyOtUpdate.bind(pending.socket);
+    pending.socket.applyOtUpdate = async (...args) => {
+        await apply(...args);
+        pending.server.set('doc', { text: 'FIRST\nseparator\nmiddle\nseparator\nLAST\n', version: 3 });
+        pending.put('/main.tex', 'FIRST\nseparator\nnew save\nseparator\nlast\n');
+    };
+    await pending.engine.handleLocalFileChange(pending.settings.getFilePath('/main.tex'));
+    assert.equal(pending.read('/main.tex'), 'FIRST\nseparator\nnew save\nseparator\nLAST\n');
+    pending.socket.applyOtUpdate = apply;
+    await pending.flushScheduled();
+    assert.equal(pending.server.get('doc')!.text, pending.read('/main.tex'));
+    assert.equal(prompts.length, 0, 'new saves during an upload must converge too');
+    pending.engine.disconnect();
+}
+
+async function testPersistentStateAndUnknownWrites(): Promise<void> {
+    const { SyncStateStore } = require('../sync/syncStateStore');
+    const directory = await createTemporaryWorkspace('sync-state');
+    const errors: Error[] = [];
+    const makeStore = (identity = 'test-project-client-A') => {
+        const created = new SyncStateStore(directory, identity, (error: Error) => errors.push(error));
+        createdStores.add(created);
+        return created;
+    };
+    const store = makeStore();
+    await store.load();
+    store.put({ path: '/empty.tex', id: 'empty', type: 'doc', content: '', hash: hash(bytes('')) });
+    store.put({ path: '/binary.pdf', id: 'binary', type: 'file', hash: hash(bytes('binary')) });
+    await store.flush();
+    const reloaded = makeStore();
+    await reloaded.load();
+    assert.equal(reloaded.entries.get('/empty.tex').content, '', 'an empty ancestor survives a restart');
+    assert.equal(reloaded.entries.get('/binary.pdf').content, undefined, 'an opaque hash must not become an empty ancestor');
+    const otherClient = makeStore('test-project-client-B');
+    await otherClient.load();
+    assert.equal(otherClient.entries.size, 0, 'another workspace cannot inherit deletion authority');
+
+    const f = fixture();
+    f.engine.stateStore = store;
+    f.engine.recordSynchronizedContent(f.engine.fileTree.get('doc'), bytes('A'));
+    await store.flush();
+    f.put('/main.tex', 'A-local');
+    const apply = f.socket.applyOtUpdate.bind(f.socket);
+    let applied = 0;
+    f.socket.applyOtUpdate = async (...args) => {
+        applied++;
+        await apply(...args);
+        f.socket.isConnected = false;
+        throw new Error('Connection lost after commit, before confirmation');
+    };
+    await suppressExpectedError(() => f.engine.handleLocalFileChange(f.settings.getFilePath('/main.tex')));
+    await store.flush();
+    const restarted = makeStore();
+    await restarted.load();
+    assert.equal(restarted.entries.get('/main.tex').intent.kind, 'write');
+    assert.equal(restarted.entries.get('/main.tex').content, bytes('A').toString('base64'));
+    f.engine.stateStore = restarted;
+    f.socket.isConnected = true;
+    f.socket.applyOtUpdate = apply;
+    await f.engine.pullAll(false);
+    assert.equal(f.server.get('doc')!.text, 'A-local');
+    assert.equal(applied, 1, 'a committed write with a lost ACK must not be applied twice');
+    assert.equal(restarted.entries.get('/main.tex').intent, undefined);
+
+    // The old packet can still be queued when joinDoc returns. Recovery must
+    // send the original operation with its old connection ID for server dedup.
+    restarted.put({ path: '/main.tex', id: 'doc', type: 'doc', content: bytes('A-local').toString('base64'),
+        hash: hash(bytes('A-local')), intent: { kind: 'write', before: bytes('A-local').toString('base64'),
+            desired: bytes('A-local-next').toString('base64'), local: bytes('A-local-next').toString('base64'),
+            version: 2, sources: ['old-connection'] } });
+    await restarted.flush();
+    f.put('/main.tex', 'A-local-next');
+    f.socket.applyOtUpdate = async (_id, update) => {
+        assert.deepEqual(update.dupIfSource, ['old-connection']);
+        f.server.set('doc', { text: 'A-local-next', version: 3 });
+    };
+    await f.engine.pullAll(false);
+    assert.equal(f.read('/main.tex'), 'A-local-next');
+    assert.equal(restarted.entries.get('/main.tex').intent, undefined);
+    const oldBase = 'first\nseparator\nlast\n';
+    const oldDesired = 'FIRST\nseparator\nlast\n';
+    restarted.put({ path: '/main.tex', id: 'doc', type: 'doc', hash: hash(bytes(oldBase)),
+        content: bytes(oldBase).toString('base64'), intent: { kind: 'write', before: bytes(oldBase).toString('base64'),
+            desired: bytes(oldDesired).toString('base64'), local: bytes(oldDesired).toString('base64'),
+            version: 1, sources: ['previous-session'] } });
+    f.put('/main.tex', oldDesired);
+    f.server.set('doc', { text: 'first\nseparator\nLAST\n', version: 100 });
+    f.socket.applyOtUpdate = async (id, update) => {
+        if (update.v === 1) throw new Error('Overleaf rejected the document update: Op too old');
+        await apply(id, update);
+    };
+    await f.engine.pullAll(false);
+    assert.equal(f.read('/main.tex'), 'FIRST\nseparator\nLAST\n', 'obsolete OT history falls back to three-way merging');
+    assert.equal(f.server.get('doc')!.text, f.read('/main.tex'));
+    assert.equal(restarted.entries.get('/main.tex').intent, undefined);
+    assert.deepEqual(errors, []);
+    f.engine.disconnect();
+
+    for (const rollbackFails of [false, true]) {
+        const failed = fixture('data.csv');
+        const failedStore = makeStore('failed-attachment-' + rollbackFails);
+        await failedStore.load();
+        failed.engine.stateStore = failedStore;
+        const entry = failed.engine.fileTree.get('doc');
+        failed.engine.recordSynchronizedContent(entry, bytes('A'));
+        await failedStore.flush();
+        let renames = 0;
+        (failed.api as any).renameEntity = async () => {
+            if (++renames === 2 && rollbackFails) throw new Error('Rollback unavailable');
+            return { type: 'success' };
+        };
+        (failed.api as any).uploadFile = async () => { throw new Error('Upload failed'); };
+        await assert.rejects(() => failed.engine.replaceRemoteFile(entry, bytes('replacement')), /Upload failed/);
+        await failedStore.flush();
+        assert.equal(failed.engine.getBaseHashes().get('/data.csv'), hash(bytes('A')));
+        const pending = makeStore('failed-attachment-' + rollbackFails);
+        await pending.load();
+        assert.equal(pending.entries.get('/data.csv').hash, hash(bytes('A')));
+        assert.equal(pending.entries.get('/data.csv').intent.kind, 'replace', 'failure cannot discard the durable replacement intent');
+        failed.engine.disconnect();
+    }
+
+    for (const uploaded of [false, true]) {
+        const replacement = fixture('data.csv');
+        const replacementStore = makeStore('replacement-' + uploaded);
+        await replacementStore.load();
+        replacement.engine.stateStore = replacementStore;
+        replacement.put('/data.csv', 'new attachment');
+        replacement.project.rootFolder[0].docs[0].name = 'data.csv.localleaf-backup';
+        if (uploaded) {
+            replacement.project.rootFolder[0].docs.push({ _id: 'new-id', name: 'data.csv' });
+            replacement.server.set('new-id', { text: 'new attachment', version: 1 });
+        }
+        replacement.engine.buildFileTree(replacement.project);
+        replacementStore.put({ path: '/data.csv', id: 'doc', type: 'doc', hash: hash(bytes('A')),
+            intent: { kind: 'replace', desiredHash: hash(bytes('new attachment')), backupPath: '/data.csv.localleaf-backup' } });
+        await replacementStore.flush();
+        const deleted: string[] = [];
+        (replacement.api as any).deleteEntity = async (_project: string, _type: string, id: string) => {
+            deleted.push(id); return { type: 'success' };
+        };
+        (replacement.api as any).renameEntity = async (_project: string, _type: string, id: string, name: string) => {
+            assert.equal(id, 'doc'); assert.equal(name, 'data.csv'); return { type: 'success' };
+        };
+        await replacement.engine.recoverReplacementIntents();
+        assert.equal(replacement.read('/data.csv'), 'new attachment', 'interrupted replacements preserve the local revision');
+        assert.equal(replacementStore.entries.get('/data.csv').intent, undefined);
+        assert.equal(replacement.engine.fileTreeByPath.get('/data.csv').id, uploaded ? 'new-id' : 'doc');
+        assert.deepEqual(deleted, uploaded ? ['doc'] : [], 'remove a backup only after verifying the replacement');
+        replacement.engine.disconnect();
+    }
+}
+
+async function testFilesystemReconciliation(): Promise<void> {
+    const f = fixture();
+    disk.set(key(f.settings.getFilePath('/data')), { type: 2 });
+    await f.engine.handleLocalFileChange(f.settings.getFilePath('/data'));
+    assert.notEqual(f.engine.status, 'error', 'directory changes must not be routed to readFile');
+    const runner = (operation: () => Promise<void>) => { void operation(); };
+    const original = f.socket.applyOtUpdate.bind(f.socket);
+    let uploads = 0;
+    f.socket.applyOtUpdate = async (...args) => { uploads++; return original(...args); };
+    f.put('/main.tex', 'staged write');
+    f.engine.queueLocalEvent(f.settings.getFilePath('/main.tex'), runner);
+    f.put('/main.tex', 'finished write');
+    f.engine.queueLocalEvent(f.settings.getFilePath('/main.tex'), runner);
+    await within((async () => {
+        while (f.server.get('doc')!.text !== 'finished write') await new Promise(resolve => setTimeout(resolve, 20));
+    })());
+    assert.equal(uploads, 1, 'rapid changes must coalesce into one saved revision');
+    f.engine.setStatus('error', 'Attachment failed', '/broken.pdf');
+    f.engine.recordSynchronizedContent(f.engine.fileTree.get('doc'), bytes('finished write'));
+    f.engine.setStatus('idle');
+    assert.equal(f.engine.status, 'error', 'a successful file must not hide another file failure');
+    f.engine.disconnect();
+    assert.equal(f.engine.localEventTimers.size, 0);
+
+    const ignored = fixture();
+    await ignored.engine.ignoreParser.save(['/analysis/']);
+    disk.set(key(ignored.settings.getFilePath('/analysis')), { type: 2 });
+    let folderRequests = 0;
+    (ignored.api as any).addFolder = async () => { folderRequests++; return { type: 'success' }; };
+    await ignored.engine.handleLocalFileCreate(ignored.settings.getFilePath('/analysis'));
+    assert.equal(folderRequests, 0, 'directory-only ignore rules must also exclude the directory creation itself');
+    assert.notEqual(ignored.engine.status, 'error');
+    const previouslySynced = { id: 'analysis', type: 'folder', path: '/analysis/', name: 'analysis', parentId: 'root' };
+    ignored.engine.fileTree.set(previouslySynced.id, previouslySynced);
+    ignored.engine.fileTreeByPath.set(previouslySynced.path, previouslySynced);
+    ignored.engine.setBaseContent(previouslySynced.path, bytes(''));
+    disk.delete(key(ignored.settings.getFilePath('/analysis')));
+    let deleteRequests = 0;
+    (ignored.api as any).deleteEntity = async () => { deleteRequests++; return { type: 'success' }; };
+    await ignored.engine.handleLocalFileDelete(ignored.settings.getFilePath('/analysis'));
+    assert.equal(deleteRequests, 0, 'new directory-only ignore rules also protect previously synchronized folders from deletion');
+    ignored.engine.disconnect();
+
+    for (const trigger of ['event', 'pull']) {
+        const removed = fixture();
+        disk.delete(key(removed.settings.getFilePath('/main.tex')));
+        const deletions: string[] = [];
+        (removed.api as any).deleteEntity = async (_project: string, _type: string, id: string) => {
+            deletions.push(id); return { type: 'success' };
+        };
+        if (trigger === 'event') await removed.engine.handleRemoteFileChanged({ doc: 'doc', v: 1 });
+        else await removed.engine.pullAll(false);
+        assert.equal(removed.read('/main.tex'), undefined, 'background reconciliation must not resurrect a local deletion');
+        await removed.flushScheduled();
+        assert.deepEqual(deletions, ['doc'], 'a known local deletion is eventually sent to the unchanged remote copy');
+        removed.engine.disconnect();
+    }
+
+    const concurrentlyEdited = fixture();
+    disk.delete(key(concurrentlyEdited.settings.getFilePath('/main.tex')));
+    concurrentlyEdited.server.set('doc', { text: 'New remote edit', version: 2 });
+    let unsafeDeletions = 0;
+    (concurrentlyEdited.api as any).deleteEntity = async () => { unsafeDeletions++; return { type: 'success' }; };
+    await concurrentlyEdited.engine.handleRemoteFileChanged({ doc: 'doc', v: 2 });
+    await suppressExpectedError(() => concurrentlyEdited.flushScheduled());
+    assert.equal(unsafeDeletions, 0, 'deletion reconciliation must preserve a remotely edited document');
+    assert.equal(concurrentlyEdited.read('/main.tex'), undefined);
+    assert.equal(concurrentlyEdited.engine.status, 'error', 'delete/edit conflicts remain visible for review');
+    concurrentlyEdited.engine.disconnect();
+}
+
 async function run(): Promise<void> {
     const tests = [testVersionedSnapshots, testAutomaticConflicts, testSafeRemoteDeletion,
         testPullSubscriptionsAndTree, testAutomaticPullRecovery, testLargeTextFiles, testIgnoredFoldersAndRemoteCleanup,
-        testUploadRetryAndTransformation, testAppliedConfirmation, testBinaryMultipartUpload, testRestoredRootFiles];
+        testUploadRetryAndTransformation, testAppliedConfirmation, testBinaryMultipartUpload, testRestoredRootFiles,
+        testPersistentRecovery, testUnattendedConflicts, testInitialAndUnilateralSync, testEventDrivenRecovery, testUnattendedFileChoices,
+        testThreeWayMerge, testPersistentStateAndUnknownWrites, testFilesystemReconciliation];
     for (const test of tests) {
         await test();
         console.log(`Passed: ${test.name}`);
     }
-    console.log('All seven audit findings are covered by passing regression tests.');
+    console.log('Synchronization audit regression tests passed.');
 }
-void run().catch(error => { console.error(error); process.exitCode = 1; });
+async function main(): Promise<void> {
+    try { await run(); }
+    finally {
+        for (const engine of createdEngines) {
+            // Some narrow tests replace the API with just their request stub.
+            engine.api.dispose ??= () => {};
+            engine.disconnect();
+        }
+        try { await Promise.all([...createdStores].map(store => store.flush())); }
+        finally { await cleanTemporaryWorkspaces(); }
+    }
+}
+runStandaloneTest(main);
