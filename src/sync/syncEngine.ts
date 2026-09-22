@@ -1909,7 +1909,7 @@ export class SyncEngine {
     }
 
     /**
-     * Calculate granular OT updates with UTF-16 offsets and a bounded diff budget.
+     * Calculate UTF-16 OT updates with deterministic fallback for large revisions.
      */
     private calculateOps(oldText: string, newText: string): Array<{ p: number; i?: string; d?: string }> {
         return textOperations(oldText, newText);

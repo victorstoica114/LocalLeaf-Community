@@ -2,7 +2,7 @@
   "name": "localleaf-community",
   "displayName": "LocalLeaf Community",
   "description": "Edit Overleaf projects locally in VS Code with two-way synchronization.",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "publisher": "victorstoica114",
   "repository": {
     "type": "git",
@@ -170,7 +170,7 @@
     "package": "npm run check-types && node esbuild.js --production",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/buildOutputTest.js && node ./out/test/runTest.js && node ./out/test/syncAuditTest.js && node ./out/test/twoClientSyncTest.js && node ./out/test/apiLifecycleAuditTest.js && node ./out/test/uiUtilsAuditTest.js && node ./out/test/syncStorageAuditTest.js && node ./out/test/syncRefreshAuditTest.js && node ./out/test/syncChoiceAuditTest.js && node ./out/test/projectCreationApiTest.js && node ./out/test/createProjectUiTest.js && node ./out/test/createProjectCommandTest.js && node ./out/test/createdProjectAuthorizationTest.js && node ./out/test/projectCreationFolderTest.js && node ./out/test/createProjectPanelTest.js && node ./out/test/createProjectControllerTest.js",
+    "test": "node ./out/test/buildOutputTest.js && node ./out/test/runTest.js && node ./out/test/syncAuditTest.js && node ./out/test/twoClientSyncTest.js && node ./out/test/apiLifecycleAuditTest.js && node ./out/test/uiUtilsAuditTest.js && node ./out/test/syncStorageAuditTest.js && node ./out/test/syncRefreshAuditTest.js && node ./out/test/syncChoiceAuditTest.js && node ./out/test/projectCreationApiTest.js && node ./out/test/createProjectUiTest.js && node ./out/test/createProjectCommandTest.js && node ./out/test/createdProjectAuthorizationTest.js && node ./out/test/projectCreationFolderTest.js && node ./out/test/createProjectPanelTest.js && node ./out/test/createProjectControllerTest.js && node ./out/test/documentDiffBudgetTest.js",
     "postinstall": "patch-package",
     "website:dev": "npm run dev --prefix docs/website",
     "website:build": "npm run build --prefix docs/website"

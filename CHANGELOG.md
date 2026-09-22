@@ -2,6 +2,21 @@
 
 All notable changes to LocalLeaf Community will be documented in this file.
 
+## [0.2.16] - 2026-09-22
+
+### Fixed
+
+- Synchronize large saved document revisions without failing when fine-grained diff calculation exceeds its budget
+- Preserve common boundaries and ordered unchanged line blocks, then replace only unresolved gaps; compact highly fragmented edits to fit LocalLeaf's transport validation limit
+- Retain unchanged text between sparse edits in long single-line documents within the deterministic work allowance
+- Use deterministic diff work bounds so retrying a journaled document update produces the same operations, and keep UTF-16 surrogate pairs intact
+
+### Validation
+
+- Add regressions for 17,000 rewritten lines, large replacements/deletions, repeated lines, Unicode, concurrent edits in unchanged spans, operation count, and interrupted journaled uploads
+
+[0.2.16]: https://github.com/victorstoica114/LocalLeaf-Community/compare/v0.2.15...v0.2.16
+
 ## [0.2.15] - 2026-09-13
 
 This release includes the changes developed in versions 0.2.11 through 0.2.15.
